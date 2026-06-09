@@ -1,0 +1,9 @@
+mne 
+yasa 
+antropy 
+pyriemann 
+tensorpac
+numpy
+pandas
+matplotlib
+scipy
