@@ -101,7 +101,7 @@ matplotlib
 Install dependencies:
 
 ```bash
-pip install mne yasa numpy pandas scipy matplotlib
+pip install -r requirements.txt
 ```
 
 ---
