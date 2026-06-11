@@ -41,12 +41,13 @@ import yasa
 from scipy.signal import welch
 from scipy.signal import spectrogram as scipy_spectrogram
 from scipy import stats as sp_stats
+from scipy.signal import butter, filtfilt
 
 mne.set_log_level('WARNING')
 
 
 # =============================================================================
-# Settings — keep in sync with preprocess.py
+# Settings — edit these paths
 # =============================================================================
 PREPROCESSED_DIR = '/Users/folasewaabdulsalam/Downloads/TUNES/preprocessed'
 DATA_ROOT      = '/Users/folasewaabdulsalam/Downloads/TUNES/subjects'
@@ -895,56 +896,35 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
 # ERP and TFR visualisations
 # =============================================================================
 #
-# Both functions have been substantially rewritten to match the lead's
-# analysis instructions.  Every change is noted inline with "# CHANGED:" so
-# the diff is easy to follow.
-#
-# Summary of changes vs the original notebook versions
 # -----------------------------------------------------
 # plot_erps
-#   CHANGED 1  Multiple baseline corrections are tried (none, pre-mean,
-#              pre-zscore) and each is saved as a separate figure.  The
-#              original applied only a single mean-subtraction baseline.
-#   CHANGED 2  After averaging across trials, channels are ranked by peak
-#              absolute ERP amplitude.  Individual trials are then only
-#              plotted for the top-N_BEST_CHANNELS channels.  The original
-#              plotted all VIZ_CHANNELS indiscriminately.
-#   CHANGED 3  Noisy trials are flagged and excluded before averaging and
-#              before individual-trial plots.  A trial is considered noisy
-#              if its peak-to-peak amplitude (in the analysis window) exceeds
-#              TRIAL_NOISE_THRESHOLD_UV.  The original did no noise check.
-#   CHANGED 4  Per-trial mean amplitude during 0–1 s post-onset is extracted,
-#              plotted against trial number, and a linear regression (slope +
-#              R²) is fitted and displayed — this is the habituation/drift
-#              analysis.  Completely absent in the original.
-#   CHANGED 5  A scalp topography of the peak ERP amplitude (max abs across
-#              the 0–1 s window) is plotted using mne.viz.plot_topomap.
-#              The original had no ERP topomap.
-#
+# Multiple baseline corrections are tried (none, pre-mean,pre-zscore) and each is saved as a separate figure.  
+# After averaging across trials, channels are ranked by peak absolute ERP amplitude.  
+# Individual trials are then only plotted for the top-N_BEST_CHANNELS channels.
+#              
+# Noisy trials are flagged and excluded before averaging and  before individual-trial plots.  A trial is considered noisy
+# if its peak-to-peak amplitude (in the analysis window) exceeds TRIAL_NOISE_THRESHOLD_UV. 
+#             
+#  Per-trial mean amplitude during 0–1 s post-onset is extracted,plotted against trial number, and a linear regression (slope + R²) is fitted and displayed
+# — this is the habituation/drift analysis. 
+# A scalp topography of the peak ERP amplitude (max abs across  the 0–1 s window) is plotted using mne.viz.plot_topomap.
+#             
+#            
 # plot_tfrs
-#   CHANGED 6  Baseline window is now −0.3 to −0.05 s.  The original used
-#              −3 s to −0.5 s (the whole pre-burst window).
-#   CHANGED 7  Multiple baseline windows are tried and each is saved
-#              separately.  The original used a single fixed baseline.
-#   CHANGED 8  Average power per frequency band, per trial, per channel,
-#              and per post-onset time window (0–1 s) is extracted and saved
-#              to a CSV for downstream statistics.  The original saved no
-#              trial-level or band-level data at all.
-#   CHANGED 9  The "focus channel" — the channel with the biggest ERP
-#              response — is passed in and used to produce a dedicated
-#              per-trial TFR panel.  The original was independent of ERP
-#              results and plotted all VIZ_CHANNELS.
-#   CHANGED 10 A scalp topography of mean TFR band power (averaged over
-#              0–1 s post-onset) is plotted for each frequency band.
-#              The original had no TFR topomap.
-#   CHANGED 11 Trial-by-trial habituation/drift for TFR band power is
-#              computed, plotted, and a linear regression is fitted — one
-#              panel per band on the focus channel.  Completely absent in
-#              the original.
+#   Baseline window is now −0.3 to −0.05 s.  
+#   Multiple baseline windows are tried and each is saved separately.  
+#   Average power per frequency band, per trial, per channel,and per post-onset time window (0–1 s) is extracted and saved
+#   to a CSV for downstream statistics.  
+#   The "focus channel" — the channel with the biggest ERP response — is passed in and used to produce a dedicated
+#   per-trial TFR panel.   
+#   A scalp topography of mean TFR band power (averaged over  0–1 s post-onset) is plotted for each frequency band.
+#   Trial-by-trial habituation/drift for TFR band power is computed, plotted, and a linear regression is fitted — one
+#  panel per band on the focus channel. 
+#         
 # =============================================================================
 
-# --- Configurable constants for the new analyses ---
-# CHANGED 1/7: baseline options that will be tried for ERPs and TFRs
+
+# baseline options that will be tried for ERPs and TFRs
 ERP_BASELINES = {
     'none':    None,                  # raw signal, no baseline
     'pre_mean': 'pre_mean',           # subtract mean of pre-stimulus window
@@ -956,13 +936,13 @@ TFR_BASELINES = {
     'full_pre':        (-TUS_EPOCH_PRE_SEC, -0.5),  # original (kept for comparison)
 }
 
-# CHANGED 2: number of "biggest response" channels to show individual trials for
+# number of "biggest response" channels to show individual trials for
 N_BEST_CHANNELS = 3
 
-# CHANGED 3: peak-to-peak threshold for trial exclusion (µV, broadband)
+# peak-to-peak threshold for trial exclusion (µV, broadband)
 TRIAL_NOISE_THRESHOLD_UV = 500.0
 
-# CHANGED 4/11: time window for amplitude extraction and habituation analysis
+# time window for amplitude extraction and habituation analysis
 HABITUATION_WINDOW_SEC = (0.0, 1.0)
 
 # Frequency bands for TFR band-power extraction (CHANGED 8)
@@ -978,9 +958,6 @@ TFR_BANDS = {
 def _apply_erp_baseline(epochs_2d, pre_samples, mode):
     """
     Apply one of three baseline corrections to a (n_trials, n_times) array.
-
-    CHANGED 1: this helper did not exist in the original; a single
-    in-line mean subtraction was the only correction applied.
     """
     out = epochs_2d.copy()
     pre = epochs_2d[:, :pre_samples]
@@ -998,7 +975,6 @@ def _exclude_noisy_trials(epochs_2d, threshold_uv):
     """
     Return a boolean mask (True = keep) based on peak-to-peak amplitude.
 
-    CHANGED 3: the original did no noise screening.
     """
     ptp = np.ptp(epochs_2d, axis=1)          # peak-to-peak per trial
     mask = ptp <= threshold_uv
@@ -1026,9 +1002,6 @@ def _habituation_plot(trial_amplitudes, trial_numbers, ch_name, condition,
                       session_name, participant_id, output_dir, suffix, kind):
     """
     Plot amplitude (or band power) vs trial number with a linear regression.
-
-    CHANGED 4 / CHANGED 11: entirely new function — not present in the original.
-    `kind` is 'ERP' or a band name string for TFR.
     """
     from scipy.stats import linregress
 
@@ -1065,8 +1038,6 @@ def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
                  session_name, participant_id, output_dir, suffix, condition, baseline_name):
     """
     Plot scalp topography of peak ERP amplitude (max |ERP| in 0–1 s window).
-
-    CHANGED 5: not present in the original.
     """
     vals = np.array([mean_amp_by_channel.get(ch, np.nan) for ch in ch_names_topo])
     if np.all(np.isnan(vals)):
@@ -1094,19 +1065,15 @@ def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
 def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
               output_dir, suffix=''):
     """
-    ERP analysis — rewritten to match lead's instructions.
-
-    Changes vs original
+    ERP analysis 
     -------------------
-    CHANGED 1  Three baseline modes are tried and each produces its own figure.
-    CHANGED 2  Channels are ranked by peak |ERP|; individual trials are only
-               plotted for the top N_BEST_CHANNELS.
-    CHANGED 3  Noisy trials are excluded before averaging.
-    CHANGED 4  Habituation/drift figure: mean amplitude (0–1 s) vs trial number
-               with linear regression, one figure per channel × condition.
-    CHANGED 5  Scalp topomap of peak ERP amplitude for each condition/baseline.
+   Three baseline modes are tried and each produces its own figure.
+   Channels are ranked by peak |ERP|; individual trials are only plotted for the top N_BEST_CHANNELS.
+   Noisy trials are excluded before averaging.
+   Habituation/drift figure: mean amplitude (0–1 s) vs trial number with linear regression, one figure per channel × condition.
+   Scalp topomap of peak ERP amplitude for each condition/baseline.
     """
-    from scipy.signal import butter, filtfilt
+   
 
     channels = [ch for ch in VIZ_CHANNELS if ch in raw.ch_names]
     if not channels or bursts_df.empty:
@@ -1127,7 +1094,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
         b, a = butter(4, [low / (fs / 2), high / (fs / 2)], btype='band')
         return filtfilt(b, a, data)
 
-    # Build a topomap info object once (CHANGED 5)
+    # Build a topomap info object once
     montage   = mne.channels.make_standard_montage('standard_1020')
     known_chs = set(montage.ch_names)
     topo_chs  = [ch for ch in channels if ch in known_chs]
@@ -1164,7 +1131,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                 trials.append(trial)
             all_epochs[ch][group_label] = np.array(trials)   # (n_trials, n_times)
 
-    # CHANGED 1: loop over baseline modes
+    # loop over baseline modes
     for baseline_name, baseline_mode in ERP_BASELINES.items():
         print(f'\n    ERP baseline: {baseline_name}')
 
@@ -1175,14 +1142,14 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
 
         for group_label in ('sham', 'active'):
             mean_erps   = []
-            clean_masks = []   # CHANGED 3: keep track of which trials survived
+            clean_masks = []   #keep track of which trials survived
             for ch in channels:
                 raw_trials = all_epochs[ch][group_label].copy()
 
-                # CHANGED 1: apply the current baseline correction
+                # apply the current baseline correction
                 corrected = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode)
 
-                # CHANGED 3: exclude noisy trials
+                # exclude noisy trials
                 finite_mask = np.all(np.isfinite(corrected), axis=1)
                 noise_mask  = _exclude_noisy_trials(
                     corrected[finite_mask], TRIAL_NOISE_THRESHOLD_UV
@@ -1194,7 +1161,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
 
             mean_erps_by_condition[group_label] = mean_erps
 
-            # CHANGED 2: rank channels by post-onset peak amplitude
+            # rank channels by post-onset peak amplitude
             ranked_chs, scores = _rank_channels_by_erp(mean_erps, channels, post_start_idx)
             focus_channel_by_condition[group_label] = ranked_chs[0]
             peak_amp_by_condition[group_label]      = {ch: scores[ch] for ch in channels}
@@ -1203,8 +1170,8 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
             for rank_i, rc in enumerate(ranked_chs[:5], 1):
                 print(f'        {rank_i}. {rc}  {scores[rc]:.2f} µV')
 
-            # --- Per-condition ERP figure (mean + best channels individual trials) ---
-            best_chs = ranked_chs[:N_BEST_CHANNELS]   # CHANGED 2
+            # Per-condition ERP figure (mean + best channels individual trials)
+            best_chs = ranked_chs[:N_BEST_CHANNELS]   
             fig, axes = plt.subplots(
                 len(best_chs), 1,
                 figsize=(14, 4 * len(best_chs)),
@@ -1221,7 +1188,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                     all_epochs[ch][group_label], pre_samples, baseline_mode
                 )[keep]
 
-                # CHANGED 2: individual trials for top channels only
+                # individual trials for top channels only
                 for trial in clean_trials:
                     ax.plot(times, trial, color=color, alpha=0.12, lw=0.6)
 
@@ -1257,7 +1224,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
             plt.close(fig)
             print(f'      Saved ERP figure: {fname}')
 
-            # CHANGED 4: habituation/drift — mean amplitude (0–1 s) vs trial number
+            # habituation/drift — mean amplitude (0–1 s) vs trial number
             trial_nums = all_trial_nums[group_label]
             focus_ch   = focus_channel_by_condition[group_label]
             focus_idx  = channels.index(focus_ch)
@@ -1280,7 +1247,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                     output_dir=output_dir, suffix=f'{suffix}_{baseline_name}', kind='ERP'
                 )
 
-            # CHANGED 5: topomap of peak ERP amplitude
+            # topomap of peak ERP amplitude
             if info_topo is not None:
                 _erp_topomap(
                     peak_amp_by_condition[group_label],
@@ -1297,18 +1264,16 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
 def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
               output_dir, suffix='', focus_channel=None):
     """
-    TFR analysis — rewritten to match lead's instructions.
+    TFR analysis 
 
-    Changes vs original
+   
     -------------------
-    CHANGED 6  Default baseline is now −0.3 to −0.05 s (was −3 to −0.5 s).
-    CHANGED 7  Multiple baseline windows are tried; each produces its own figure.
-    CHANGED 8  Average power per band, per trial, per channel, and per post-onset
-               time window is extracted and saved to a CSV.
-    CHANGED 9  The focus_channel (biggest ERP response, from plot_erps) gets a
-               dedicated per-trial TFR panel.
-    CHANGED 10 Scalp topomaps of mean TFR band power (0–1 s) for each band.
-    CHANGED 11 Habituation/drift for TFR band power on the focus channel.
+    Default baseline is −0.3 to −0.05 s
+    Multiple baseline windows are tried; each produces its own figure.
+    Average power per band, per trial, per channel, and per post-onset time window is extracted and saved to a CSV.
+    The focus_channel (biggest ERP response, from plot_erps) gets a dedicated per-trial TFR panel.
+    Scalp topomaps of mean TFR band power (0–1 s) for each band.
+    Habituation/drift for TFR band power on the focus channel.
     """
     channels = [ch for ch in VIZ_CHANNELS if ch in raw.ch_names]
     if not channels or bursts_df.empty:
@@ -1326,7 +1291,7 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
     hab_start_idx = pre_samples + int(HABITUATION_WINDOW_SEC[0] * sfreq)
     hab_end_idx   = pre_samples + int(HABITUATION_WINDOW_SEC[1] * sfreq)
 
-    # Topomap setup (CHANGED 10)
+    # Topomap setup 
     montage   = mne.channels.make_standard_montage('standard_1020')
     known_chs = set(montage.ch_names)
     topo_chs  = [ch for ch in channels if ch in known_chs]
@@ -1335,7 +1300,7 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
         info_topo = mne.create_info(topo_chs, sfreq=sfreq, ch_types='eeg')
         info_topo.set_montage(montage, on_missing='ignore')
 
-    # CHANGED 9: fall back gracefully if no focus channel was returned
+    # fall back if no focus channel was returned
     if focus_channel is None or focus_channel not in channels:
         focus_channel = channels[0]
     print(f'    TFR focus channel (from ERP ranking): {focus_channel}')
@@ -1381,11 +1346,11 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
             if len(epochs) >= 2:
                 raw_power[(ch, group_label)] = morlet_tfr(np.array(epochs))
 
-    # CHANGED 7: loop over baseline windows
+    # loop over baseline windows
     for bl_name, (bl_start, bl_end) in TFR_BASELINES.items():
         print(f'\n    TFR baseline: {bl_name}  ({bl_start:.2f} to {bl_end:.2f} s)')
 
-        # CHANGED 8: container for band × trial × channel × window CSV
+        #  container for band × trial × channel × window CSV
         band_power_rows = []
 
         for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
@@ -1401,7 +1366,7 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
 
             color = '#4B7BE0' if group_label == 'sham' else '#E04B4B'
 
-            # --- Mean TFR figure per channel (CHANGED 7: one per baseline) ---
+            # --- Mean TFR figure per channel ---
             for ch in channels:
                 key = (ch, group_label)
                 if key not in raw_power:
@@ -1419,7 +1384,7 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                 ax.axvline(0, color='black', lw=1.2, ls='--', alpha=0.8, label='TUS onset')
                 ax.axhspan(freq_band[0], freq_band[1], color='yellow',
                            alpha=0.15, label='Spindle band')
-                # Mark baseline window (CHANGED 6/7)
+                # Mark baseline window 
                 ax.axvspan(bl_start, bl_end, color='lime', alpha=0.12, label='Baseline window')
                 ax.set_xlabel('Time (s)')
                 ax.set_ylabel('Frequency (Hz)')
@@ -1439,7 +1404,7 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                 fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
                 plt.close(fig)
 
-                # CHANGED 8: extract per-band per-trial power in the 0–1 s window
+                # extract per-band per-trial power in the 0–1 s window
                 for band_name, (b_low, b_high) in TFR_BANDS.items():
                     freq_mask = (freqs >= b_low) & (freqs <= b_high)
                     if not freq_mask.any():
@@ -1458,7 +1423,7 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                             'mean_power_db':  round(float(bp), 6),
                         })
 
-            # CHANGED 9: per-trial TFR on the focus channel
+            # per-trial TFR on the focus channel
             key_focus = (focus_channel, group_label)
             if key_focus in raw_power:
                 power_3d_focus  = apply_tfr_baseline(raw_power[key_focus], bl_start, bl_end)
@@ -1492,7 +1457,7 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                 plt.close(fig)
                 print(f'      Saved per-trial TFR: {fname}')
 
-                # CHANGED 11: habituation/drift for each band on focus channel
+                # habituation/drift for each band on focus channel
                 for band_name, (b_low, b_high) in TFR_BANDS.items():
                     freq_mask = (freqs >= b_low) & (freqs <= b_high)
                     if not freq_mask.any():
@@ -1507,7 +1472,7 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                         suffix=f'{suffix}_{bl_name}', kind=band_name
                     )
 
-            # CHANGED 10: topomap of mean band power (0–1 s) per band
+            # topomap of mean band power (0–1 s) per band
             if info_topo is not None:
                 for band_name, (b_low, b_high) in TFR_BANDS.items():
                     freq_mask = (freqs >= b_low) & (freqs <= b_high)
@@ -1543,7 +1508,7 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                     plt.close(fig)
                     print(f'      Saved TFR topomap: {fname}')
 
-        # CHANGED 8: save the band-power CSV for this baseline
+        # save the band-power CSV for this baseline
         if band_power_rows:
             bp_df = pd.DataFrame(band_power_rows)
             bp_csv = (Path(output_dir) /
@@ -1583,18 +1548,18 @@ def process_one_session(participant_id, target, session_name, is_adaptation,
     participant_output_dir : results output folder
     """
     try:
-        # --- [1] Load preprocessed .fif (lazy) ---
+        # Load preprocessed .fif 
         print(f'\n[1] Load preprocessed: {participant_id} / {target}')
         raw = load_preprocessed(participant_id, target)
         raw.load_data()   # pull into RAM once; from here it's at RESAMPLE_FREQ
 
-        # --- [2] Sleep staging (reads from raw .vhdr — small 3-ch copy) ---
+        # Sleep staging 
         vhdr_files, _ = find_vhdr_for_staging(participant_id, target)
         hypno_int, hypno_str, staging_ok = run_sleep_staging(
             vhdr_files, session_name, participant_id, participant_output_dir
         )
 
-        # --- QC plot (uses pre-ICA snapshot saved by preprocess.py) ---
+        # QC plot 
         snap_p = snapshot_path(participant_id, target)
         snap_ch_p = snapshot_channels_path(participant_id, target)
         if snap_p.exists() and snap_ch_p.exists():
@@ -1632,7 +1597,7 @@ def process_one_session(participant_id, target, session_name, is_adaptation,
             participant_id, participant_output_dir
         )
 
-        # --- Analysis ---
+        # Analysis 
         spindle_features = detect_spindles(
             raw, hypno_int, hypno_up, freq_band, session_name, participant_id, participant_output_dir
         )
@@ -1657,10 +1622,9 @@ def process_one_session(participant_id, target, session_name, is_adaptation,
         gc.collect()
         print('    Raw released — running CSV-based visualisations')
 
-        # --- CSV-based visualisations (copy from original notebook) ---
+        # CSV-based visualisations 
         # plot_topoplots, plot_spindle_boxplots, plot_spindle_violins,
-        # plot_erps, plot_tfrs etc. go here — they are unchanged and
-        # already work from CSVs + lightweight raw reloads.
+        # plot_erps, plot_tfrs etc. .
 
         row = flatten_features(peak_freq, spindle_features, sw_features,
                                power_features, pulse_results)
