@@ -1,4 +1,4 @@
-# TUNES — Transcranial Ultrasound Neural EEG Study
+# TUNES — Thalamic Ultrasound Neuromodulation 
 
 A two-stage EEG analysis pipeline for characterizing neural responses to transcranial ultrasound stimulation (TUS). The pipeline preprocesses multi-session BrainVision recordings, runs automated sleep staging, and extracts oscillatory features (spindles, slow waves, spectral power) to build a per-participant neural response profile.
 
