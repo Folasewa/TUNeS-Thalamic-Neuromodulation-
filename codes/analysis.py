@@ -1124,6 +1124,11 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
     if 'burst_time_s' not in bursts_df.columns:
         print('    plot_erps: burst_time_s column missing — skipping')
         return None
+    bursts_df['burst_time_s'] = pd.to_numeric(
+    bursts_df['burst_time_s'],
+    errors='coerce')
+
+    bursts_df = bursts_df.dropna(subset=['burst_time_s'])
 
     channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
     if not channels or bursts_df.empty:
@@ -1303,6 +1308,11 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
     if 'burst_time_s' not in bursts_df.columns:
         print('    plot_tfrs: burst_time_s column missing — skipping')
         return
+    bursts_df['burst_time_s'] = pd.to_numeric(
+    bursts_df['burst_time_s'],
+    errors='coerce')
+
+    bursts_df = bursts_df.dropna(subset=['burst_time_s'])
 
     channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
     if not channels or bursts_df.empty:
