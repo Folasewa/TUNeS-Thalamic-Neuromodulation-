@@ -17,15 +17,11 @@ import time
 import traceback
 from pathlib import Path
  
+import json
 import mne
 import numpy as np
  
 mne.set_log_level('WARNING')
-
-"""
-Make edits to this section
-
-"""
 
 DATA_ROOT      = '/Users/folasewaabdulsalam/Downloads/TUNES/subjects'
 PREPROCESSED_DIR = '/Users/folasewaabdulsalam/Downloads/TUNES/preprocessed'
@@ -41,23 +37,14 @@ BANDPASS_HIGH  = 40.0
 NOTCH_FREQ     = 50.0
  
 ICA_N_COMPONENTS = 20
-# Channels to include in the saved snapshot for QC plots
 VIZ_CHANNELS = ['Fp1', 'Fp2', 'F3', 'F4', 'Fz',
                  'C3',  'C4',  'Cz',
                  'P3',  'P4',  'Pz',
                  'O1',  'O2']
 
 KNOWN_TARGETS = {'adapt', 'thalamus', 'ventricle', 'ventricles'}
-# How many seconds of pre-ICA data to snapshot for QC (set to None for all)
 SNAPSHOT_SECS = 300.0
 
-
-"""
-Functions to locate the sessions, 
-prepare a local copy if you are streaming data from drive, 
-load and resample to resampling frequency
-
-"""
 
 def find_sessions(participant_folder):
     sessions = {'adapt': None, 'thalamus': None, 'ventricle': None}
@@ -115,22 +102,19 @@ def set_channel_types(raw):
     return raw
 
 def load_and_resample(vhdr_path):
-    """Load one block, resampling to RESAMPLE_FREQ """
+    """Load one block, resampling to RESAMPLE_FREQ.
+    Returns (raw, original_sfreq) so callers can persist the hardware rate."""
     print(f'    Loading {Path(vhdr_path).name}')
     raw = mne.io.read_raw_brainvision(vhdr_path, preload=False, verbose=False)
-    print(f'    {len(raw.ch_names)} channels @ {raw.info["sfreq"]:.0f} Hz')
-    if raw.info['sfreq'] > RESAMPLE_FREQ:
-        print(f'    Resampling {raw.info["sfreq"]:.0f} → {RESAMPLE_FREQ} Hz (lazy)')
+    original_sfreq = raw.info['sfreq']
+    print(f'    {len(raw.ch_names)} channels @ {original_sfreq:.0f} Hz')
+    if original_sfreq > RESAMPLE_FREQ:
+        print(f'    Resampling {original_sfreq:.0f} → {RESAMPLE_FREQ} Hz (lazy)')
         raw.resample(RESAMPLE_FREQ, npad='auto')
     raw.load_data()
     set_channel_types(raw)
-    return raw
+    return raw, original_sfreq
 
-
-"""
-Function to preprocess the raw data, apply filter, band-pass filter, and ICA
-
-"""
 
 def preprocess(raw):
     """Filter + ICA. Modifies raw in place, returns it."""
@@ -140,7 +124,6 @@ def preprocess(raw):
     raw.filter(BANDPASS_LOW, BANDPASS_HIGH, verbose=False)
     raw.notch_filter(NOTCH_FREQ, verbose=False)
  
-    # Artefact rate on filtered data
     ART_THRESHOLD_UV = 150.0
     eeg_chs = [ch for idx, ch in enumerate(raw.ch_names)
                if mne.channel_type(raw.info, idx) == 'eeg']
@@ -152,7 +135,6 @@ def preprocess(raw):
         del data_uv, flags
         gc.collect()
  
-    # ICA
     if ICA_N_COMPONENTS is not None:
         try:
             eeg_picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
@@ -168,7 +150,6 @@ def preprocess(raw):
             gc.collect()
  
             exclude = []
-            # EOG
             eog_chs = [ch for ch in raw.ch_names
                        if mne.channel_type(raw.info, raw.ch_names.index(ch)) == 'eog']
             if eog_chs:
@@ -185,7 +166,6 @@ def preprocess(raw):
                         exclude.extend(idx)
                     except Exception:
                         pass
-            # ECG
             try:
                 idx, _ = ica.find_bads_ecg(raw, method='correlation', verbose=False)
                 exclude.extend(idx)
@@ -202,10 +182,6 @@ def preprocess(raw):
  
     return raw
 
-"""
-#per-session runner
-
-"""
 
 def preprocess_session(participant_id, session_folder, target, out_dir):
     """
@@ -221,12 +197,19 @@ def preprocess_session(participant_id, session_folder, target, out_dir):
  
     try:
         vhdr_files, _ = find_vhdr_files(session_folder)
-        raws = [load_and_resample(v) for v in vhdr_files]
-        raw  = raws[0] if len(raws) == 1 else mne.concatenate_raws(raws)
-        del raws
+        loaded        = [load_and_resample(v) for v in vhdr_files]
+        raws, sfreqs  = zip(*loaded)
+        original_sfreq = sfreqs[0]   # hardware rate before resampling
+        raw  = raws[0] if len(raws) == 1 else mne.concatenate_raws(list(raws))
+        del raws, loaded
         gc.collect()
+
+        # Save hardware sfreq so analysis.py never needs to open the .vhdr
+        info_path = Path(out_dir) / f'{target}_info.json'
+        with open(str(info_path), 'w') as _f:
+            json.dump({'original_sfreq': original_sfreq}, _f)
+        print(f'    Saved {info_path.name} (original_sfreq={original_sfreq:.0f} Hz)')
  
-        # --- Capture pre-ICA snapshot for QC ---
         viz_present  = [ch for ch in VIZ_CHANNELS if ch in raw.ch_names]
         snap_secs    = min(SNAPSHOT_SECS, raw.times[-1]) if SNAPSHOT_SECS else raw.times[-1]
         snap_samples = int(snap_secs * raw.info['sfreq'])
@@ -234,17 +217,14 @@ def preprocess_session(participant_id, session_folder, target, out_dir):
             snapshot = raw.get_data(picks=viz_present, start=0, stop=snap_samples) * 1e6
             snap_path = Path(out_dir) / f'{target}_raw_snapshot.npy'
             np.save(str(snap_path), snapshot)
-            # Also save channel names so analyze.py can reconstruct
             np.save(str(Path(out_dir) / f'{target}_snapshot_channels.npy'),
                     np.array(viz_present))
             del snapshot
             gc.collect()
             print(f'    Saved pre-ICA snapshot ({snap_secs:.0f} s, {len(viz_present)} ch)')
  
-        # --- Preprocess ---
         raw = preprocess(raw)
  
-        # --- Save ---
         out_dir_path = Path(out_dir)
         out_dir_path.mkdir(parents=True, exist_ok=True)
         raw.save(str(fif_path), overwrite=True, verbose=False)
@@ -260,9 +240,6 @@ def preprocess_session(participant_id, session_folder, target, out_dir):
         traceback.print_exc()
         return None
     
-"""
-Per-participant runner
-"""
 
 def preprocess_participant(participant_id):
     print('\n' + '=' * 70)
@@ -292,10 +269,6 @@ def preprocess_participant(participant_id):
         local = prepare_local_session(session_folder, participant_id, target)
         preprocess_session(participant_id, local, target, str(out_dir))
  
-
-"""
-Entry Point
-"""
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='TUNES preprocessing pipeline')

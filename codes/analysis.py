@@ -6,7 +6,7 @@ What this script does
 Reads the preprocessed .fif files written by preprocess.py and runs the
 full analysis pipeline
 
-  1.  Sleep staging (YASA, 100 Hz 3-channel copy; cached to CSV)
+  1.  Sleep staging (YASA, 100 Hz 3-channel copy extracted from .fif; cached to CSV)
   2.  Individual spindle frequency (adaptation session)
   3.  Spindle detection (YASA)
   4.  Slow-wave detection (YASA)
@@ -18,6 +18,13 @@ full analysis pipeline
       / plot_response_profile) — runs automatically once all participants
       have been processed.
 
+Note: sleep staging and all analyses are performed directly from the
+preprocessed .fif files. No raw .vhdr files are ever loaded here.
+The .vmrk file is still needed only for TUS burst/pulse marker parsing
+(burst-level analysis), as those markers live in the original recording
+file.  The original hardware sampling frequency — required to convert
+.vmrk sample numbers to seconds — is read from the small JSON written by
+preprocess.py ({target}_info.json), so no .vhdr access is needed either.
 """
 
 import argparse
@@ -50,15 +57,18 @@ mne.set_log_level('WARNING')
 # Settings — edit these paths
 # =============================================================================
 PREPROCESSED_DIR = '/Users/folasewaabdulsalam/Downloads/TUNES/preprocessed'
-DATA_ROOT      = '/Users/folasewaabdulsalam/Downloads/TUNES/subjects'
-OUTPUT_DIR     = '/Users/folasewaabdulsalam/Downloads/TUNES/results'
-PARTICIPANTS   = ['03', '06', '08']
+# MARKERS_ROOT is the ONLY path to raw data still needed in analysis.py.
+# It is used solely to locate the .vmrk marker files for TUS burst/pulse
+# timing.  No .vhdr or EEG signal data are ever loaded from here.
+MARKERS_ROOT     = '/Users/folasewaabdulsalam/Downloads/TUNES/subjects'
+OUTPUT_DIR       = '/Users/folasewaabdulsalam/Downloads/TUNES/results'
+PARTICIPANTS     = ['03', '06', '08']
 
 RESAMPLE_FREQ  = 500
 STAGING_FREQ   = 100
 RUN_SLEEP_STAGING = True
 
-BANDPASS_LOW   = 0.1    
+BANDPASS_LOW   = 0.1
 BANDPASS_HIGH  = 40.0
 
 SPINDLE_CHANNELS = ['C3', 'C4']
@@ -71,6 +81,9 @@ VIZ_CHANNELS     = ['Fp1', 'Fp2', 'F3', 'F4', 'Fz',
                      'C3',  'C4',  'Cz',
                      'P3',  'P4',  'Pz',
                      'O1',  'O2']
+# VIZ_CHANNELS is used ONLY for the pre-ICA / post-ICA QC snapshot saved
+# by preprocess.py.  All analysis and visualisation functions (spectrogram,
+# ERP, TFR, boxplots) now operate on all EEG channels present in the .fif.
 
 NREM_STAGES      = [2, 3]
 SPINDLE_FREQ_DEFAULT = (12.0, 15.0)
@@ -148,10 +161,34 @@ def set_channel_types(raw):
     return raw
 
 
+def original_sfreq_path(participant_id, target):
+    """Path to the JSON saved by preprocess.py that records the hardware sfreq."""
+    return Path(PREPROCESSED_DIR) / participant_id / f'{target}_info.json'
+
+
+def load_original_sfreq(participant_id, target, fallback=5000.0):
+    """
+    Read the original hardware sampling frequency saved by preprocess.py.
+    Falls back to `fallback` (5000 Hz) if the file is absent so that old
+    preprocessed datasets still work.
+    """
+    p = original_sfreq_path(participant_id, target)
+    if p.exists():
+        import json
+        with open(p) as f:
+            return float(json.load(f).get('original_sfreq', fallback))
+    print(f'    Warning: {p.name} not found — assuming original sfreq = {fallback} Hz')
+    return fallback
+
+
 def find_vmrk(participant_id, target):
-    """Locate the original .vmrk file (stays in raw subjects folder)."""
-    subject_folder = Path(DATA_ROOT) / participant_id
-    # Walk all subdirectories, match on target keyword
+    """
+    Locate the .vmrk marker file.
+    This is the ONLY access to the raw subjects folder in analysis.py;
+    it is needed because TUS pulse/burst timing lives solely in the .vmrk.
+    No EEG signal data are ever loaded from here.
+    """
+    subject_folder = Path(MARKERS_ROOT) / participant_id
     for folder in sorted(subject_folder.iterdir()):
         if not folder.is_dir():
             continue
@@ -165,50 +202,17 @@ def find_vmrk(participant_id, target):
     return None
 
 
-def find_vhdr_for_staging(participant_id, target):
-    """Return list of .vhdr paths for the given session (needed for staging)."""
-    subject_folder = Path(DATA_ROOT) / participant_id
-    for folder in sorted(subject_folder.iterdir()):
-        if not folder.is_dir():
-            continue
-        text = folder.name.lower()
-        match = (target == 'adapt' and 'adapt' in text) or \
-                (target == 'thalamus' and 'thalamus' in text) or \
-                (target == 'ventricle' and ('ventricle' in text or 'ventricles' in text))
-        if not match:
-            continue
-        files = sorted(folder.glob('*.vhdr'))
-        if files:
-            return [str(f) for f in files], folder
-    return [], None
-
-
 # =============================================================================
-# Sleep staging 
+# Sleep staging — runs directly from the preprocessed .fif
 # =============================================================================
 
-def load_staging_only(vhdr_files):
-    """Load a minimal 3-channel, 100 Hz copy from the raw .vhdr files."""
-    staging_channels = [STAGING_EEG_CH, STAGING_EOG_CH, STAGING_EMG_CH]
-    raws = []
-    for vhdr in vhdr_files:
-        r = mne.io.read_raw_brainvision(vhdr, preload=False, verbose=False)
-        available = [ch for ch in staging_channels if ch in r.ch_names]
-        r.pick_channels(available)
-        r.resample(STAGING_FREQ)
-        r.load_data()
-        raws.append(r)
-    raw_staging = raws[0] if len(raws) == 1 else mne.concatenate_raws(raws)
-    del raws
-    set_channel_types(raw_staging)
-    mb = raw_staging.get_data().nbytes / 1e6
-    print(f'    Staging raw: {raw_staging.ch_names} | '
-          f'{raw_staging.info["sfreq"]:.0f} Hz | '
-          f'{raw_staging.times[-1]/60:.1f} min | {mb:.1f} MB')
-    return raw_staging
-
-
-def run_sleep_staging(vhdr_files, session_name, participant_id, output_dir):
+def run_sleep_staging_from_fif(raw, session_name, participant_id, output_dir):
+    """
+    Run YASA sleep staging using C4/HEOG/EMG channels already present in the
+    preprocessed .fif.  A lightweight 100 Hz copy is made via raw.copy() so
+    the main raw object is not modified.  Result is cached to CSV so subsequent
+    runs skip YASA entirely.
+    """
     print(f'\n[2] Sleep staging: {participant_id} / {session_name}')
     if not RUN_SLEEP_STAGING:
         print('    Skipped (RUN_SLEEP_STAGING=False)')
@@ -221,17 +225,28 @@ def run_sleep_staging(vhdr_files, session_name, participant_id, output_dir):
         hypno_int = np.asarray(yasa.Hypnogram(hypno_str).as_int(), dtype=int)
         return hypno_int, hypno_str, True
 
-    if not vhdr_files:
-        print('    No .vhdr files available for staging')
+    # Verify the required EEG channel is present
+    if STAGING_EEG_CH not in raw.ch_names:
+        print(f'    Missing required staging channel: {STAGING_EEG_CH} — skipping staging')
         return None, None, False
 
-    peek = mne.io.read_raw_brainvision(vhdr_files[0], preload=False, verbose=False)
-    if STAGING_EEG_CH not in peek.ch_names:
-        print(f'    Missing staging channel: {STAGING_EEG_CH}')
-        return None, None, False
-    del peek
+    staging_channels = [STAGING_EEG_CH, STAGING_EOG_CH, STAGING_EMG_CH]
+    available = [ch for ch in staging_channels if ch in raw.ch_names]
+    missing   = [ch for ch in staging_channels if ch not in raw.ch_names]
+    if missing:
+        print(f'    Note: optional staging channels not found (will proceed without): {missing}')
 
-    raw_staging = load_staging_only(vhdr_files)
+    # Lightweight copy — does not affect the main raw object
+    raw_staging = raw.copy().pick_channels(available)
+    raw_staging.resample(STAGING_FREQ)
+    # Ensure EOG/EMG channel types are set correctly for YASA
+    set_channel_types(raw_staging)
+
+    mb = raw_staging.get_data().nbytes / 1e6
+    print(f'    Staging raw: {raw_staging.ch_names} | '
+          f'{raw_staging.info["sfreq"]:.0f} Hz | '
+          f'{raw_staging.times[-1]/60:.1f} min | {mb:.1f} MB')
+
     kwargs = {'eeg_name': STAGING_EEG_CH}
     if STAGING_EOG_CH in raw_staging.ch_names:
         kwargs['eog_name'] = STAGING_EOG_CH
@@ -240,7 +255,7 @@ def run_sleep_staging(vhdr_files, session_name, participant_id, output_dir):
 
     try:
         gc.collect()
-        print('    Running YASA …')
+        print('    Running YASA ...')
         t0  = time.time()
         sls = yasa.SleepStaging(raw_staging, **kwargs)
         hypno_pred = sls.predict()
@@ -411,7 +426,10 @@ def compute_spectral_power(raw, hypno_int, session_name, participant_id, output_
     mask  = nrem_mask_from_hypno(hypno_int, raw)
     sfreq = raw.info['sfreq']
     features, rows = {}, []
-    channels = [ch for ch in (POWER_CHANNELS or raw.ch_names) if ch in raw.ch_names]
+    # If POWER_CHANNELS is empty/None, fall back to all EEG channels in the recording.
+    eeg_all  = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
+    channels = [ch for ch in (POWER_CHANNELS if POWER_CHANNELS else eeg_all)
+                if ch in raw.ch_names]
     for ch in channels:
         data = raw.get_data(picks=[ch])[0][mask]
         if len(data) < sfreq * 30:
@@ -458,16 +476,9 @@ def _plot_spectral_power(power_df, session_name, participant_id, output_dir):
 
 
 # =============================================================================
-# Marker / burst parsing  
+# Marker / burst parsing
+# (.vmrk is still needed here — TUS pulse markers live in the original file)
 # =============================================================================
-
-def read_original_sfreq(vhdr_path):
-    with open(vhdr_path, 'r', encoding='utf-8', errors='replace') as f:
-        for line in f:
-            if line.startswith('SamplingInterval='):
-                return 1_000_000.0 / float(line.split('=')[1])
-    return 5000.0
-
 
 def parse_tus_markers_bursts(vmrk_path, original_sfreq, burst_gap_threshold=0.5):
     pulses            = []
@@ -559,8 +570,22 @@ def compute_event_locked_spindle_features(burst_times_by_group, spindle_summary,
                                            post_window_sec=5.0):
     if spindle_summary is None or spindle_summary.empty:
         return {}
+
+    # De-duplicate across channels: YASA emits one row per spindle per channel,
+    # so the same underlying event appears multiple times if multiple channels
+    # were detected. Group by 0.1 s onset bins and keep one row per event to
+    # avoid inflating burst-matched counts.
+    sp_deduped = spindle_summary.sort_values('Start').copy()
+    sp_deduped['_event_bin'] = (sp_deduped['Start'] / 0.1).round().astype(int)
+    sp_deduped = (
+        sp_deduped
+        .groupby('_event_bin', sort=False)
+        .first()
+        .reset_index(drop=True)
+    )
+    spindle_starts = sp_deduped['Start'].values
+
     out = {}
-    spindle_starts = spindle_summary['Start'].values
     for group, burst_times in burst_times_by_group.items():
         if not burst_times:
             continue
@@ -574,7 +599,7 @@ def compute_event_locked_spindle_features(burst_times_by_group, spindle_summary,
         total_sp         = int(spindle_counts.sum())
         sp_rate_per_burst = float(spindle_counts.mean())
         matched_idx = np.where(in_window.any(axis=0))[0]
-        matched     = spindle_summary.iloc[matched_idx]
+        matched     = sp_deduped.iloc[matched_idx]
         amp  = float(matched['Amplitude'].mean()) if len(matched) else np.nan
         freq = float(matched['Frequency'].mean()) if len(matched) else np.nan
         dur  = float(matched['Duration'].mean())  if len(matched) else np.nan
@@ -590,6 +615,7 @@ def compute_event_locked_spindle_features(burst_times_by_group, spindle_summary,
         out[f'{prefix}_spindle_rms_uv']            = round(rms,  3) if not np.isnan(rms)  else np.nan
         out[f'{prefix}_total_spindles_in_windows'] = total_sp
         print(f'    Event-locked [{group}]: {n_bursts} bursts, {total_sp} post-burst spindles')
+
     for metric in ('spindle_rate_per_burst', 'spindle_density_per_s',
                    'spindle_amplitude_uv', 'spindle_frequency_hz', 'spindle_duration_sec'):
         a = out.get(f'event_locked_active_{metric}', np.nan)
@@ -606,11 +632,12 @@ def compute_event_locked_spindle_features(burst_times_by_group, spindle_summary,
 
 def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
                               freq_band, session_name, participant_id,
-                              is_adaptation, output_dir):
+                              target, is_adaptation, output_dir):
     if is_adaptation or not vmrk_path or not Path(vmrk_path).exists():
         return {}
     print(f'\n[8] Burst-level analysis: {participant_id} / {session_name}')
-    original_sfreq = read_original_sfreq(vmrk_path.replace('.vmrk', '.vhdr'))
+    # Original sfreq is read from the JSON saved by preprocess.py — no .vhdr access.
+    original_sfreq = load_original_sfreq(participant_id, target)
     bursts = parse_tus_markers_bursts(vmrk_path, original_sfreq)
     if bursts.empty:
         print('    No bursts found')
@@ -742,17 +769,10 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
         del el_df
         gc.collect()
 
-    # Save MNE Epochs
+    # Save MNE Epochs — built from the preprocessed .fif directly
     try:
-        vhdr_path_epo = vmrk_path.replace('.vmrk', '.vhdr')
-        raw_epo = mne.io.read_raw_brainvision(vhdr_path_epo, preload=False, verbose=False)
-        viz_present = [ch for ch in VIZ_CHANNELS if ch in raw_epo.ch_names]
-        if viz_present:
-            raw_epo.pick_channels(viz_present)
-        if raw_epo.info['sfreq'] > RESAMPLE_FREQ:
-            raw_epo.resample(RESAMPLE_FREQ, verbose=False)
-        raw_epo.load_data()
-        raw_epo.filter(BANDPASS_LOW, BANDPASS_HIGH, verbose=False)
+        eeg_all     = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
+        raw_epo     = raw.copy().pick_channels(eeg_all) if eeg_all else raw.copy()
         burst_df_epo = pd.read_csv(out_csv) if out_csv.exists() else pd.DataFrame()
         if not burst_df_epo.empty:
             cond_to_code = {c: i for i, c in enumerate(burst_df_epo['condition'].unique(), 1)}
@@ -763,8 +783,8 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
                 if row['burst_time_s'] * epo_sfreq < raw_epo.n_times
             ], dtype=int)
             if len(events_epo):
-                valid_mask = [row['burst_time_s'] * epo_sfreq < raw_epo.n_times
-                              for _, row in burst_df_epo.iterrows()]
+                valid_mask   = [row['burst_time_s'] * epo_sfreq < raw_epo.n_times
+                                for _, row in burst_df_epo.iterrows()]
                 metadata_epo = burst_df_epo[valid_mask].reset_index(drop=True)
                 epochs_obj   = mne.Epochs(
                     raw_epo, events_epo, event_id=cond_to_code,
@@ -793,10 +813,30 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
 # =============================================================================
 
 def safe_plot(fn, *args, **kwargs):
+    """
+    Call fn(*args, **kwargs), suppress and log any exception, then close all
+    figures and run gc.  Use this for void plot functions.  When you need the
+    return value (e.g. plot_erps → focus_channel) use safe_plot_returning.
+    """
     try:
         fn(*args, **kwargs)
     except Exception as e:
         print(f'    Plot failed ({fn.__name__}): {e}')
+    finally:
+        plt.close('all')
+        gc.collect()
+
+
+def safe_plot_returning(fn, *args, **kwargs):
+    """
+    Like safe_plot but preserves and returns the function's return value.
+    On exception returns None and logs the error.
+    """
+    try:
+        return fn(*args, **kwargs)
+    except Exception as e:
+        print(f'    Plot failed ({fn.__name__}): {e}')
+        return None
     finally:
         plt.close('all')
         gc.collect()
@@ -849,7 +889,8 @@ def plot_raw_vs_preprocessed(raw_snapshot_uv, raw_post, channels,
 
 
 def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
-    channels = [ch for ch in VIZ_CHANNELS if ch in raw.ch_names]
+    # Plot every EEG channel present in the recording, not a hand-picked subset.
+    channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
     if not channels:
         return
     sfreq = raw.info['sfreq']
@@ -895,57 +936,21 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
 # =============================================================================
 # ERP and TFR visualisations
 # =============================================================================
-#
-# -----------------------------------------------------
-# plot_erps
-# Multiple baseline corrections are tried (none, pre-mean,pre-zscore) and each is saved as a separate figure.  
-# After averaging across trials, channels are ranked by peak absolute ERP amplitude.  
-# Individual trials are then only plotted for the top-N_BEST_CHANNELS channels.
-#              
-# Noisy trials are flagged and excluded before averaging and  before individual-trial plots.  A trial is considered noisy
-# if its peak-to-peak amplitude (in the analysis window) exceeds TRIAL_NOISE_THRESHOLD_UV. 
-#             
-#  Per-trial mean amplitude during 0–1 s post-onset is extracted,plotted against trial number, and a linear regression (slope + R²) is fitted and displayed
-# — this is the habituation/drift analysis. 
-# A scalp topography of the peak ERP amplitude (max abs across  the 0–1 s window) is plotted using mne.viz.plot_topomap.
-#             
-#            
-# plot_tfrs
-#   Baseline window is now −0.3 to −0.05 s.  
-#   Multiple baseline windows are tried and each is saved separately.  
-#   Average power per frequency band, per trial, per channel,and per post-onset time window (0–1 s) is extracted and saved
-#   to a CSV for downstream statistics.  
-#   The "focus channel" — the channel with the biggest ERP response — is passed in and used to produce a dedicated
-#   per-trial TFR panel.   
-#   A scalp topography of mean TFR band power (averaged over  0–1 s post-onset) is plotted for each frequency band.
-#   Trial-by-trial habituation/drift for TFR band power is computed, plotted, and a linear regression is fitted — one
-#  panel per band on the focus channel. 
-#         
-# =============================================================================
 
-
-# baseline options that will be tried for ERPs and TFRs
 ERP_BASELINES = {
-    'none':    None,                  # raw signal, no baseline
-    'pre_mean': 'pre_mean',           # subtract mean of pre-stimulus window
-    'pre_zscore': 'pre_zscore',       # z-score relative to pre-stimulus window
+    'none':       None,
+    'pre_mean':   'pre_mean',
+    'pre_zscore': 'pre_zscore',
 }
 TFR_BASELINES = {
-    'tight_300_50ms':  (-0.30, -0.05),   # lead's recommended baseline
-    'tight_500_100ms': (-0.50, -0.10),   # slightly wider alternative
-    'full_pre':        (-TUS_EPOCH_PRE_SEC, -0.5),  # original (kept for comparison)
+    'tight_300_50ms':  (-0.30, -0.05),
+    'tight_500_100ms': (-0.50, -0.10),
+    'full_pre':        (-TUS_EPOCH_PRE_SEC, -0.5),
 }
 
-# number of "biggest response" channels to show individual trials for
-N_BEST_CHANNELS = 3
-
-# peak-to-peak threshold for trial exclusion (µV, broadband)
+N_BEST_CHANNELS          = 3
 TRIAL_NOISE_THRESHOLD_UV = 500.0
-
-# time window for amplitude extraction and habituation analysis
-HABITUATION_WINDOW_SEC = (0.0, 1.0)
-
-# Frequency bands for TFR band-power extraction (CHANGED 8)
+HABITUATION_WINDOW_SEC   = (0.0, 1.0)
 TFR_BANDS = {
     'delta': (0.5, 4.0),
     'theta': (4.0, 8.0),
@@ -956,9 +961,6 @@ TFR_BANDS = {
 
 
 def _apply_erp_baseline(epochs_2d, pre_samples, mode):
-    """
-    Apply one of three baseline corrections to a (n_trials, n_times) array.
-    """
     out = epochs_2d.copy()
     pre = epochs_2d[:, :pre_samples]
     if mode == 'pre_mean':
@@ -967,16 +969,11 @@ def _apply_erp_baseline(epochs_2d, pre_samples, mode):
         mu  = pre.mean(axis=1, keepdims=True)
         sd  = pre.std(axis=1, keepdims=True) + 1e-12
         out = (out - mu) / sd
-    # mode == 'none': return as-is
     return out
 
 
 def _exclude_noisy_trials(epochs_2d, threshold_uv):
-    """
-    Return a boolean mask (True = keep) based on peak-to-peak amplitude.
-
-    """
-    ptp = np.ptp(epochs_2d, axis=1)          # peak-to-peak per trial
+    ptp  = np.ptp(epochs_2d, axis=1)
     mask = ptp <= threshold_uv
     n_excluded = int((~mask).sum())
     if n_excluded:
@@ -986,12 +983,6 @@ def _exclude_noisy_trials(epochs_2d, threshold_uv):
 
 
 def _rank_channels_by_erp(mean_erps, ch_names, post_start_idx):
-    """
-    Rank channels by peak absolute amplitude in the post-onset window.
-    Returns list of channel names sorted largest → smallest.
-
-    CHANGED 2: the original plotted all VIZ_CHANNELS with no ranking.
-    """
     scores = {}
     for ch, erp in zip(ch_names, mean_erps):
         scores[ch] = np.max(np.abs(erp[post_start_idx:]))
@@ -1000,19 +991,13 @@ def _rank_channels_by_erp(mean_erps, ch_names, post_start_idx):
 
 def _habituation_plot(trial_amplitudes, trial_numbers, ch_name, condition,
                       session_name, participant_id, output_dir, suffix, kind):
-    """
-    Plot amplitude (or band power) vs trial number with a linear regression.
-    """
     from scipy.stats import linregress
-
     valid = ~np.isnan(trial_amplitudes)
     x = trial_numbers[valid]
     y = trial_amplitudes[valid]
     if len(x) < 3:
         return
-
     slope, intercept, r, p, _ = linregress(x, y)
-
     fig, ax = plt.subplots(figsize=(8, 4))
     ax.scatter(x, y, color='steelblue', s=30, alpha=0.7, zorder=3)
     ax.plot(x, slope * x + intercept, color='crimson', lw=1.8,
@@ -1036,9 +1021,6 @@ def _habituation_plot(trial_amplitudes, trial_numbers, ch_name, condition,
 
 def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
                  session_name, participant_id, output_dir, suffix, condition, baseline_name):
-    """
-    Plot scalp topography of peak ERP amplitude (max |ERP| in 0–1 s window).
-    """
     vals = np.array([mean_amp_by_channel.get(ch, np.nan) for ch in ch_names_topo])
     if np.all(np.isnan(vals)):
         return
@@ -1064,20 +1046,10 @@ def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
 
 def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
               output_dir, suffix=''):
-    """
-    ERP analysis 
-    -------------------
-   Three baseline modes are tried and each produces its own figure.
-   Channels are ranked by peak |ERP|; individual trials are only plotted for the top N_BEST_CHANNELS.
-   Noisy trials are excluded before averaging.
-   Habituation/drift figure: mean amplitude (0–1 s) vs trial number with linear regression, one figure per channel × condition.
-   Scalp topomap of peak ERP amplitude for each condition/baseline.
-    """
-   
-
-    channels = [ch for ch in VIZ_CHANNELS if ch in raw.ch_names]
+    # Use every EEG channel in the recording so no data is silently dropped.
+    channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
     if not channels or bursts_df.empty:
-        return
+        return None
 
     sfreq        = raw.info['sfreq']
     pre_samples  = int(TUS_EPOCH_PRE_SEC * sfreq)
@@ -1085,16 +1057,14 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
     n_samples    = pre_samples + post_samples
     times        = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples)
 
-    # Index into the post-onset window for habituation / ranking
-    post_start_idx   = pre_samples
-    hab_start        = pre_samples + int(HABITUATION_WINDOW_SEC[0] * sfreq)
-    hab_end          = pre_samples + int(HABITUATION_WINDOW_SEC[1] * sfreq)
+    post_start_idx = pre_samples
+    hab_start      = pre_samples + int(HABITUATION_WINDOW_SEC[0] * sfreq)
+    hab_end        = pre_samples + int(HABITUATION_WINDOW_SEC[1] * sfreq)
 
     def bandpass(data, low, high, fs):
         b, a = butter(4, [low / (fs / 2), high / (fs / 2)], btype='band')
         return filtfilt(b, a, data)
 
-    # Build a topomap info object once
     montage   = mne.channels.make_standard_montage('standard_1020')
     known_chs = set(montage.ch_names)
     topo_chs  = [ch for ch in channels if ch in known_chs]
@@ -1103,10 +1073,8 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
         info_topo = mne.create_info(topo_chs, sfreq=sfreq, ch_types='eeg')
         info_topo.set_montage(montage, on_missing='ignore')
 
-    # Collect all epochs per channel across both conditions first,
-    # then loop over baselines so we only read raw data once.
-    all_epochs = {ch: {} for ch in channels}   # ch -> {condition: (n_trials, n_times)}
-    all_trial_nums = {}                         # condition -> array of 1-based trial indices
+    all_epochs     = {ch: {} for ch in channels}
+    all_trial_nums = {}
 
     for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
         mask     = bursts_df['condition'].isin(condition_set)
@@ -1129,49 +1097,42 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                 except Exception:
                     pass
                 trials.append(trial)
-            all_epochs[ch][group_label] = np.array(trials)   # (n_trials, n_times)
+            all_epochs[ch][group_label] = np.array(trials)
 
-    # loop over baseline modes
+    focus_channel_by_condition = {}
+
     for baseline_name, baseline_mode in ERP_BASELINES.items():
         print(f'\n    ERP baseline: {baseline_name}')
-
-        # Per-condition, per-channel mean ERPs (after baseline + noise exclusion)
-        mean_erps_by_condition = {}
-        peak_amp_by_condition  = {}   # for topomap (CHANGED 5)
-        focus_channel_by_condition = {}   # CHANGED 2
+        mean_erps_by_condition     = {}
+        peak_amp_by_condition      = {}
 
         for group_label in ('sham', 'active'):
             mean_erps   = []
-            clean_masks = []   #keep track of which trials survived
+            clean_masks = []
             for ch in channels:
                 raw_trials = all_epochs[ch][group_label].copy()
-
-                # apply the current baseline correction
-                corrected = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode)
-
-                # exclude noisy trials
+                corrected  = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode)
                 finite_mask = np.all(np.isfinite(corrected), axis=1)
                 noise_mask  = _exclude_noisy_trials(
                     corrected[finite_mask], TRIAL_NOISE_THRESHOLD_UV
                 )
-                keep = np.where(finite_mask)[0][noise_mask]
+                keep  = np.where(finite_mask)[0][noise_mask]
                 clean = corrected[keep]
                 clean_masks.append(keep)
                 mean_erps.append(clean.mean(axis=0) if len(clean) else np.full(n_samples, np.nan))
 
             mean_erps_by_condition[group_label] = mean_erps
-
-            # rank channels by post-onset peak amplitude
             ranked_chs, scores = _rank_channels_by_erp(mean_erps, channels, post_start_idx)
-            focus_channel_by_condition[group_label] = ranked_chs[0]
-            peak_amp_by_condition[group_label]      = {ch: scores[ch] for ch in channels}
+            # Record the top channel for active condition; used to drive TFR focus.
+            if group_label == 'active':
+                focus_channel_by_condition['active'] = ranked_chs[0]
+            peak_amp_by_condition[group_label] = {ch: scores[ch] for ch in channels}
 
             print(f'      [{group_label}] Channel ranking (peak |ERP|, 0–end):')
             for rank_i, rc in enumerate(ranked_chs[:5], 1):
                 print(f'        {rank_i}. {rc}  {scores[rc]:.2f} µV')
 
-            # Per-condition ERP figure (mean + best channels individual trials)
-            best_chs = ranked_chs[:N_BEST_CHANNELS]   
+            best_chs = ranked_chs[:N_BEST_CHANNELS]
             fig, axes = plt.subplots(
                 len(best_chs), 1,
                 figsize=(14, 4 * len(best_chs)),
@@ -1188,7 +1149,6 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                     all_epochs[ch][group_label], pre_samples, baseline_mode
                 )[keep]
 
-                # individual trials for top channels only
                 for trial in clean_trials:
                     ax.plot(times, trial, color=color, alpha=0.12, lw=0.6)
 
@@ -1224,13 +1184,11 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
             plt.close(fig)
             print(f'      Saved ERP figure: {fname}')
 
-            # habituation/drift — mean amplitude (0–1 s) vs trial number
             trial_nums = all_trial_nums[group_label]
-            focus_ch   = focus_channel_by_condition[group_label]
+            focus_ch   = focus_channel_by_condition.get('active', channels[0])
             focus_idx  = channels.index(focus_ch)
             keep_focus = clean_masks[focus_idx]
 
-            # Align trial numbers to surviving trials
             hab_amps = []
             for t_idx in keep_focus:
                 corrected_trial = _apply_erp_baseline(
@@ -1247,7 +1205,6 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                     output_dir=output_dir, suffix=f'{suffix}_{baseline_name}', kind='ERP'
                 )
 
-            # topomap of peak ERP amplitude
             if info_topo is not None:
                 _erp_topomap(
                     peak_amp_by_condition[group_label],
@@ -1256,26 +1213,15 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                     suffix, group_label, baseline_name
                 )
 
-    # Return the focus channel from the tight-baseline active condition so
-    # plot_tfrs can use it (CHANGED 9 in plot_tfrs).
-    return focus_channel_by_condition.get('active', channels[0]) if channels else None
+    # Return the ERP-ranked best channel for the active condition so the
+    # caller can pass it to plot_tfrs as the focus channel.
+    return focus_channel_by_condition.get('active', channels[0] if channels else None)
 
 
 def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
               output_dir, suffix='', focus_channel=None):
-    """
-    TFR analysis 
-
-   
-    -------------------
-    Default baseline is −0.3 to −0.05 s
-    Multiple baseline windows are tried; each produces its own figure.
-    Average power per band, per trial, per channel, and per post-onset time window is extracted and saved to a CSV.
-    The focus_channel (biggest ERP response, from plot_erps) gets a dedicated per-trial TFR panel.
-    Scalp topomaps of mean TFR band power (0–1 s) for each band.
-    Habituation/drift for TFR band power on the focus channel.
-    """
-    channels = [ch for ch in VIZ_CHANNELS if ch in raw.ch_names]
+    # Use every EEG channel in the recording so no data is silently dropped.
+    channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
     if not channels or bursts_df.empty:
         return
 
@@ -1291,7 +1237,6 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
     hab_start_idx = pre_samples + int(HABITUATION_WINDOW_SEC[0] * sfreq)
     hab_end_idx   = pre_samples + int(HABITUATION_WINDOW_SEC[1] * sfreq)
 
-    # Topomap setup 
     montage   = mne.channels.make_standard_montage('standard_1020')
     known_chs = set(montage.ch_names)
     topo_chs  = [ch for ch in channels if ch in known_chs]
@@ -1300,26 +1245,19 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
         info_topo = mne.create_info(topo_chs, sfreq=sfreq, ch_types='eeg')
         info_topo.set_montage(montage, on_missing='ignore')
 
-    # fall back if no focus channel was returned
     if focus_channel is None or focus_channel not in channels:
         focus_channel = channels[0]
     print(f'    TFR focus channel (from ERP ranking): {focus_channel}')
 
     def morlet_tfr(epochs_2d):
-        """(n_trials, n_times) → (n_trials, n_freqs, n_times) power."""
-        data_3d = epochs_2d[:, np.newaxis, :]
+        data_3d  = epochs_2d[:, np.newaxis, :]
         power_4d = mne.time_frequency.tfr_array_morlet(
             data_3d, sfreq=sfreq, freqs=freqs, n_cycles=n_cycles,
             output='power', verbose=False,
         )
-        return power_4d[:, 0, :, :]   # (n_trials, n_freqs, n_times)
+        return power_4d[:, 0, :, :]
 
     def apply_tfr_baseline(power_3d, bl_start_sec, bl_end_sec):
-        """
-        dB baseline correction on (n_trials, n_freqs, n_times).
-
-        CHANGED 6/7: baseline window is now a parameter rather than hardcoded.
-        """
         bl_s = pre_samples + int(bl_start_sec * sfreq)
         bl_e = pre_samples + int(bl_end_sec   * sfreq)
         bl_s = max(bl_s, 0)
@@ -1327,8 +1265,7 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
         bl_power = power_3d[:, :, bl_s:bl_e].mean(axis=2, keepdims=True)
         return 10 * np.log10(power_3d / (bl_power + 1e-30))
 
-    # Collect raw (unbaselined) epochs per channel per condition once
-    raw_power = {}   # (ch, group_label) -> (n_trials, n_freqs, n_times)
+    raw_power = {}
     for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
         mask     = bursts_df['condition'].isin(condition_set)
         group_df = bursts_df[mask].reset_index(drop=True)
@@ -1346,11 +1283,8 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
             if len(epochs) >= 2:
                 raw_power[(ch, group_label)] = morlet_tfr(np.array(epochs))
 
-    # loop over baseline windows
     for bl_name, (bl_start, bl_end) in TFR_BASELINES.items():
         print(f'\n    TFR baseline: {bl_name}  ({bl_start:.2f} to {bl_end:.2f} s)')
-
-        #  container for band × trial × channel × window CSV
         band_power_rows = []
 
         for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
@@ -1366,13 +1300,12 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
 
             color = '#4B7BE0' if group_label == 'sham' else '#E04B4B'
 
-            # --- Mean TFR figure per channel ---
             for ch in channels:
                 key = (ch, group_label)
                 if key not in raw_power:
                     continue
                 power_3d = apply_tfr_baseline(raw_power[key], bl_start, bl_end)
-                mean_tfr = power_3d.mean(axis=0)   # (n_freqs, n_times)
+                mean_tfr = power_3d.mean(axis=0)
                 n_used   = power_3d.shape[0]
 
                 vmax = np.nanpercentile(np.abs(mean_tfr), 97)
@@ -1384,7 +1317,6 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                 ax.axvline(0, color='black', lw=1.2, ls='--', alpha=0.8, label='TUS onset')
                 ax.axhspan(freq_band[0], freq_band[1], color='yellow',
                            alpha=0.15, label='Spindle band')
-                # Mark baseline window 
                 ax.axvspan(bl_start, bl_end, color='lime', alpha=0.12, label='Baseline window')
                 ax.set_xlabel('Time (s)')
                 ax.set_ylabel('Frequency (Hz)')
@@ -1404,12 +1336,10 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                 fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
                 plt.close(fig)
 
-                # extract per-band per-trial power in the 0–1 s window
                 for band_name, (b_low, b_high) in TFR_BANDS.items():
                     freq_mask = (freqs >= b_low) & (freqs <= b_high)
                     if not freq_mask.any():
                         continue
-                    # power per trial in the hab window
                     trial_band_power = power_3d[:, freq_mask, :][:, :, hab_start_idx:hab_end_idx].mean(axis=(1, 2))
                     for t_idx, bp in enumerate(trial_band_power):
                         band_power_rows.append({
@@ -1423,14 +1353,13 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                             'mean_power_db':  round(float(bp), 6),
                         })
 
-            # per-trial TFR on the focus channel
             key_focus = (focus_channel, group_label)
             if key_focus in raw_power:
-                power_3d_focus  = apply_tfr_baseline(raw_power[key_focus], bl_start, bl_end)
-                n_focus_trials  = power_3d_focus.shape[0]
-                n_show          = min(n_focus_trials, 16)
-                ncols           = 4
-                nrows           = int(np.ceil(n_show / ncols))
+                power_3d_focus = apply_tfr_baseline(raw_power[key_focus], bl_start, bl_end)
+                n_focus_trials = power_3d_focus.shape[0]
+                n_show         = min(n_focus_trials, 16)
+                ncols          = 4
+                nrows          = int(np.ceil(n_show / ncols))
                 fig, axes = plt.subplots(nrows, ncols,
                                          figsize=(ncols * 4, nrows * 3),
                                          sharex=True, sharey=True)
@@ -1457,7 +1386,6 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                 plt.close(fig)
                 print(f'      Saved per-trial TFR: {fname}')
 
-                # habituation/drift for each band on focus channel
                 for band_name, (b_low, b_high) in TFR_BANDS.items():
                     freq_mask = (freqs >= b_low) & (freqs <= b_high)
                     if not freq_mask.any():
@@ -1472,7 +1400,6 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                         suffix=f'{suffix}_{bl_name}', kind=band_name
                     )
 
-            # topomap of mean band power (0–1 s) per band
             if info_topo is not None:
                 for band_name, (b_low, b_high) in TFR_BANDS.items():
                     freq_mask = (freqs >= b_low) & (freqs <= b_high)
@@ -1508,13 +1435,257 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                     plt.close(fig)
                     print(f'      Saved TFR topomap: {fname}')
 
-        # save the band-power CSV for this baseline
         if band_power_rows:
-            bp_df = pd.DataFrame(band_power_rows)
-            bp_csv = (Path(output_dir) /
-                      f'{participant_id}_{session_name}_{suffix}_TFR_band_power_{bl_name}.csv')
+            bp_df   = pd.DataFrame(band_power_rows)
+            bp_csv  = (Path(output_dir) /
+                       f'{participant_id}_{session_name}_{suffix}_TFR_band_power_{bl_name}.csv')
             bp_df.to_csv(bp_csv, index=False)
             print(f'      Saved TFR band-power CSV: {bp_csv.name}')
+
+
+# =============================================================================
+# Boxplot and violin plots  (per-session, per-pulse data)
+# =============================================================================
+
+def plot_spindle_boxplots(pulse_df, session_info, output_dir, suffix=''):
+    """
+    Panel 1: [Sham Pre | Sham Post | Active Pre | Active Post] for sigma & delta power.
+    Panel 2: sigma_power_change and post_ptp_uv as Sham vs Active.
+    Channels: all EEG channels present in the pulse feature CSV.
+    """
+    pid     = session_info['participant_id']
+    session = session_info['session_name']
+
+    if pulse_df is None or pulse_df.empty:
+        return
+
+    # Use every channel that has features in the pulse CSV, not a fixed list.
+    channels = sorted({
+        col.split('_')[0] for col in pulse_df.columns
+        if col.endswith('_pre_sigma_power') or col.endswith('_post_sigma_power')
+    })
+    if not channels:
+        return
+
+    # ── Panel 1: pre/post power ───────────────────────────────────────────────
+    pre_post_pairs = [
+        ('pre_sigma_power',  'post_sigma_power',  'Sigma power'),
+        ('pre_delta_power',  'post_delta_power',  'Delta power'),
+    ]
+    nrow = len(channels)
+    ncol = len(pre_post_pairs)
+    colors = {
+        'sham_pre':    '#90B4E8',
+        'sham_post':   '#1E50A2',
+        'active_pre':  '#F0A0A0',
+        'active_post': '#C0152A',
+    }
+    labels_order = ['sham_pre', 'sham_post', 'active_pre', 'active_post']
+    tick_labels  = ['Sham\nPre', 'Sham\nPost', 'Active\nPre', 'Active\nPost']
+
+    fig, axes = plt.subplots(nrow, ncol,
+                             figsize=(ncol * 4.5, nrow * 3.8),
+                             squeeze=False)
+
+    for row_idx, ch in enumerate(channels):
+        for col_idx, (pre_feat, post_feat, feat_label) in enumerate(pre_post_pairs):
+            ax = axes[row_idx][col_idx]
+            groups_data = []
+            for key in labels_order:
+                condition, timing = key.split('_', 1)
+                col_name = f'{ch}_{pre_feat}' if timing == 'pre' else f'{ch}_{post_feat}'
+                mask = pulse_df['group'] == condition
+                groups_data.append(
+                    pulse_df.loc[mask, col_name].dropna().values
+                    if col_name in pulse_df.columns else np.array([])
+                )
+
+            bp = ax.boxplot(
+                groups_data, patch_artist=True, widths=0.55,
+                medianprops=dict(color='white', linewidth=2.5),
+                whiskerprops=dict(linewidth=1.2),
+                capprops=dict(linewidth=1.2),
+                flierprops=dict(marker='o', markersize=3, alpha=0.4, linestyle='none')
+            )
+            for patch, key in zip(bp['boxes'], labels_order):
+                patch.set_facecolor(colors[key])
+                patch.set_alpha(0.9)
+
+            # Median connector lines
+            for x_pre, x_post, condition in [(1, 2, 'sham'), (3, 4, 'active')]:
+                pre_col  = f'{ch}_{pre_feat}'
+                post_col = f'{ch}_{post_feat}'
+                if pre_col in pulse_df.columns and post_col in pulse_df.columns:
+                    mask     = pulse_df['group'] == condition
+                    pre_med  = pulse_df.loc[mask, pre_col].median()
+                    post_med = pulse_df.loc[mask, post_col].median()
+                    ax.plot([x_pre, x_post], [pre_med, post_med],
+                            color='black', linewidth=1.5,
+                            linestyle='--', alpha=0.6, zorder=5)
+
+            ax.axvline(2.5, color='grey', linewidth=1.0, linestyle=':', alpha=0.7)
+            ax.set_xticks([1, 2, 3, 4])
+            ax.set_xticklabels(tick_labels, fontsize=8)
+            ax.set_title(f'{ch} — {feat_label}', fontsize=10, fontweight='bold')
+            ax.axhline(0, color='grey', linewidth=0.6, linestyle='--', alpha=0.5)
+            for x_center, lbl in [(1.5, 'Sham'), (3.5, 'Active')]:
+                ax.text(x_center, -0.18, lbl,
+                        transform=ax.get_xaxis_transform(),
+                        ha='center', fontsize=9, color='grey')
+
+    baseline_note = (
+        f'Baseline (pre): −3 to 0 s  |  Response (post): 0 to +5 s  '
+        f'relative to TUS burst onset'
+    )
+    fig.suptitle(
+        f'{pid} – {session}: pre vs post power  [Sham | Active]\n'
+        f'{baseline_note}',
+        fontsize=11, fontweight='bold', y=1.02
+    )
+    fig.tight_layout()
+    fname = f'{pid}_{session}_{suffix}_spindle_prepost_boxplots.png'
+    fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'    Saved pre/post boxplots: {fname}')
+
+    # ── Panel 2: sigma change ratio & PtP ────────────────────────────────────
+    ratio_features = [
+        ('sigma_power_change', 'Sigma power change\n(post−pre)/pre'),
+        ('post_ptp_uv',        'Post-pulse peak-to-peak (µV)'),
+    ]
+    fig2, axes2 = plt.subplots(len(channels), len(ratio_features),
+                               figsize=(len(ratio_features) * 4.5,
+                                        len(channels) * 3.8),
+                               squeeze=False)
+    for row_idx, ch in enumerate(channels):
+        for col_idx, (feat_suffix, feat_label) in enumerate(ratio_features):
+            ax       = axes2[row_idx][col_idx]
+            col_name = f'{ch}_{feat_suffix}'
+            sham_vals   = (pulse_df.loc[pulse_df['group'] == 'sham',   col_name].dropna().values
+                           if col_name in pulse_df.columns else np.array([]))
+            active_vals = (pulse_df.loc[pulse_df['group'] == 'active', col_name].dropna().values
+                           if col_name in pulse_df.columns else np.array([]))
+
+            bp = ax.boxplot(
+                [sham_vals, active_vals], patch_artist=True, widths=0.5,
+                medianprops=dict(color='white', linewidth=2.5),
+                whiskerprops=dict(linewidth=1.2),
+                capprops=dict(linewidth=1.2),
+                flierprops=dict(marker='o', markersize=3, alpha=0.4, linestyle='none')
+            )
+            bp['boxes'][0].set_facecolor('#4B7BE0'); bp['boxes'][0].set_alpha(0.88)
+            bp['boxes'][1].set_facecolor('#E04B4B'); bp['boxes'][1].set_alpha(0.88)
+            ax.set_xticks([1, 2])
+            ax.set_xticklabels(['Sham', 'Active'], fontsize=10)
+            ax.set_title(f'{ch} — {feat_label}', fontsize=10, fontweight='bold')
+            ax.axhline(0, color='grey', linewidth=0.8, linestyle='--', alpha=0.6)
+
+    fig2.suptitle(
+        f'{pid} – {session}: sigma change & amplitude  [Sham vs Active]\n'
+        f'Baseline: −3 to 0 s | Response: 0 to +5 s (re: TUS burst onset)',
+        fontsize=11, fontweight='bold', y=1.02
+    )
+    fig2.tight_layout()
+    fname2 = f'{pid}_{session}_{suffix}_spindle_change_boxplots.png'
+    fig2.savefig(Path(output_dir) / fname2, dpi=150, bbox_inches='tight')
+    plt.close(fig2)
+    print(f'    Saved change boxplots: {fname2}')
+
+
+def plot_spindle_violins(pulse_df, session_info, output_dir, suffix=''):
+    """
+    Violin plots (+ overlaid box) for sigma_power_change and post_ptp_uv.
+    Mirrors panel 2 of plot_spindle_boxplots but uses violins.
+    Channels: all EEG channels present in the pulse feature CSV.
+    """
+    pid     = session_info['participant_id']
+    session = session_info['session_name']
+
+    if pulse_df is None or pulse_df.empty:
+        return
+
+    # Use every channel that has features in the pulse CSV, not a fixed list.
+    channels = sorted({
+        col.split('_')[0] for col in pulse_df.columns
+        if col.endswith('_sigma_power_change') or col.endswith('_post_ptp_uv')
+    })
+    if not channels:
+        return
+
+    ratio_features = [
+        ('sigma_power_change', 'Sigma power change\n(post−pre)/pre'),
+        ('post_ptp_uv',        'Post-pulse peak-to-peak (µV)'),
+    ]
+    palette = {'sham': '#4B7BE0', 'active': '#E04B4B'}
+
+    fig, axes = plt.subplots(len(channels), len(ratio_features),
+                             figsize=(len(ratio_features) * 4.5, len(channels) * 4.0),
+                             squeeze=False)
+
+    for row_idx, ch in enumerate(channels):
+        for col_idx, (feat_suffix, feat_label) in enumerate(ratio_features):
+            ax       = axes[row_idx][col_idx]
+            col_name = f'{ch}_{feat_suffix}'
+            groups_data, positions, colors_list = [], [], []
+
+            for pos, group in enumerate(['sham', 'active'], start=1):
+                vals = (pulse_df.loc[pulse_df['group'] == group, col_name]
+                        .dropna().astype(float).values
+                        if col_name in pulse_df.columns else np.array([]))
+                groups_data.append(vals)
+                positions.append(pos)
+                colors_list.append(palette[group])
+
+            # Only draw violin if there are enough data points
+            has_data = [len(d) >= 3 for d in groups_data]
+            if any(has_data):
+                parts = ax.violinplot(
+                    [d if ok else [np.nan] for d, ok in zip(groups_data, has_data)],
+                    positions=positions,
+                    showmedians=False, showextrema=False
+                )
+                for body, color in zip(parts['bodies'], colors_list):
+                    body.set_facecolor(color)
+                    body.set_alpha(0.55)
+                    body.set_edgecolor('none')
+
+            # Overlay a thin boxplot for the quartile summary
+            bp = ax.boxplot(
+                groups_data, positions=positions,
+                widths=0.18, patch_artist=True,
+                medianprops=dict(color='white', linewidth=2.0),
+                whiskerprops=dict(linewidth=1.0, color='#444'),
+                capprops=dict(linewidth=1.0, color='#444'),
+                flierprops=dict(marker='o', markersize=2.5, alpha=0.35,
+                                linestyle='none', markerfacecolor='#555')
+            )
+            for patch, color in zip(bp['boxes'], colors_list):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.9)
+
+            # Individual data points
+            rng = np.random.default_rng(42)
+            for pos, vals, color in zip(positions, groups_data, colors_list):
+                if len(vals):
+                    jitter = rng.uniform(-0.06, 0.06, len(vals))
+                    ax.scatter(pos + jitter, vals, s=8, color=color,
+                               alpha=0.4, zorder=3, linewidths=0)
+
+            ax.set_xticks(positions)
+            ax.set_xticklabels(['Sham', 'Active'], fontsize=10)
+            ax.set_title(f'{ch} — {feat_label}', fontsize=10, fontweight='bold')
+            ax.axhline(0, color='grey', linewidth=0.8, linestyle='--', alpha=0.6)
+
+    fig.suptitle(
+        f'{pid} – {session}: sigma change & amplitude  [violin + box]\n'
+        f'Baseline: −3 to 0 s | Response: 0 to +5 s (re: TUS burst onset)',
+        fontsize=11, fontweight='bold', y=1.02
+    )
+    fig.tight_layout()
+    fname = f'{pid}_{session}_{suffix}_spindle_change_violins.png'
+    fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'    Saved violin plots: {fname}')
 
 
 # =============================================================================
@@ -1538,29 +1709,22 @@ def process_one_session(participant_id, target, session_name, is_adaptation,
                          participant_output_dir):
     """
     Run full analysis for one session using the preprocessed .fif.
-
-    Parameters
-    ----------
-    participant_id       : e.g. 'tunes-08'
-    target               : 'adapt' | 'thalamus' | 'ventricle'
-    session_name         : e.g. 'tunes-08_thalamus'  (used for file naming)
-    is_adaptation        : bool
-    participant_output_dir : results output folder
+    All staging is done directly from the .fif — no raw .vhdr files needed.
+    The .vmrk is still used for TUS burst marker parsing only.
     """
     try:
-        # Load preprocessed .fif 
+        # Load preprocessed .fif
         print(f'\n[1] Load preprocessed: {participant_id} / {target}')
         raw = load_preprocessed(participant_id, target)
-        raw.load_data()   # pull into RAM once; from here it's at RESAMPLE_FREQ
+        raw.load_data()
 
-        # Sleep staging 
-        vhdr_files, _ = find_vhdr_for_staging(participant_id, target)
-        hypno_int, hypno_str, staging_ok = run_sleep_staging(
-            vhdr_files, session_name, participant_id, participant_output_dir
+        # Sleep staging — directly from the .fif
+        hypno_int, hypno_str, staging_ok = run_sleep_staging_from_fif(
+            raw, session_name, participant_id, participant_output_dir
         )
 
-        # QC plot 
-        snap_p = snapshot_path(participant_id, target)
+        # QC plot
+        snap_p    = snapshot_path(participant_id, target)
         snap_ch_p = snapshot_channels_path(participant_id, target)
         if snap_p.exists() and snap_ch_p.exists():
             snap_uv       = np.load(str(snap_p))
@@ -1597,7 +1761,7 @@ def process_one_session(participant_id, target, session_name, is_adaptation,
             participant_id, participant_output_dir
         )
 
-        # Analysis 
+        # Analysis
         spindle_features = detect_spindles(
             raw, hypno_int, hypno_up, freq_band, session_name, participant_id, participant_output_dir
         )
@@ -1608,23 +1772,42 @@ def process_one_session(participant_id, target, session_name, is_adaptation,
             raw, hypno_int, session_name, participant_id, participant_output_dir
         )
 
+        # vmrk still needed for TUS burst markers
         vmrk = find_vmrk(participant_id, target)
         pulse_results = run_pulse_level_analysis(
             raw, vmrk, hypno_int, hypno_up, freq_band,
-            session_name, participant_id, is_adaptation, participant_output_dir
+            session_name, participant_id, target, is_adaptation, participant_output_dir
         )
 
-        # Spectrogram while raw is still loaded
+        # Spectrogram while raw is still in memory
         safe_plot(plot_spectrogram, raw, hypno_int,
                   session_name, participant_id, participant_output_dir)
 
+        # Load burst CSV for ERP/TFR plots
+        suffix   = 'nrem' if hypno_int is not None else 'full_recording'
+        burst_csv = (Path(participant_output_dir) /
+                     f'{participant_id}_{session_name}_{suffix}_per_pulse_features.csv')
+        bursts_df = pd.read_csv(burst_csv) if burst_csv.exists() else pd.DataFrame()
+
+        # ERP plots — use safe_plot_returning to preserve the focus channel
+        # returned by plot_erps so that plot_tfrs can use it.
+        focus_ch = None
+        if not bursts_df.empty:
+            focus_ch = safe_plot_returning(
+                plot_erps, raw, bursts_df, freq_band,
+                session_name, participant_id,
+                participant_output_dir, suffix,
+            )
+            safe_plot(
+                plot_tfrs, raw, bursts_df, freq_band,
+                session_name, participant_id,
+                participant_output_dir, suffix,
+                focus_ch,  # may be None; plot_tfrs falls back to channels[0] gracefully
+            )
+
         del raw, hypno_up
         gc.collect()
-        print('    Raw released — running CSV-based visualisations')
-
-        # CSV-based visualisations 
-        # plot_topoplots, plot_spindle_boxplots, plot_spindle_violins,
-        # plot_erps, plot_tfrs etc. .
+        print('    Raw released')
 
         row = flatten_features(peak_freq, spindle_features, sw_features,
                                power_features, pulse_results)
@@ -1674,6 +1857,35 @@ def process_participant(participant_id):
     df = pd.DataFrame(rows)
     df.to_csv(out_dir / f'{participant_id}_session_features.csv', index=False)
     print(f'\n  Feature table saved: {out_dir}')
+
+    # Per-session boxplot and violin plots.
+    # Each experimental session has a per-burst pulse CSV; load it and plot.
+    # Adaptation sessions have no burst data and are skipped.
+    non_numeric = {'participant_id', 'session', 'analysis_scope',
+                   'condition', 'group', 'brain_state'}
+    for _, session_row in df.iterrows():
+        if bool(session_row.get('is_adaptation', False)):
+            continue
+        session_name   = session_row.get('session')
+        analysis_scope = session_row.get('analysis_scope', '')
+        suffix         = 'nrem' if 'NREM' in str(analysis_scope) else 'full_recording'
+        pulse_csv      = out_dir / f'{participant_id}_{session_name}_{suffix}_per_pulse_features.csv'
+        if not pulse_csv.exists():
+            print(f'  Boxplot/violin skipped ({session_name}): pulse CSV not found')
+            continue
+        try:
+            pulse_df = pd.read_csv(pulse_csv)
+        except Exception as exc:
+            print(f'  Boxplot/violin skipped ({session_name}): could not read CSV — {exc}')
+            continue
+        # Coerce feature columns to numeric; CSV round-trips can stringify them.
+        for col in pulse_df.columns:
+            if col not in non_numeric:
+                pulse_df[col] = pd.to_numeric(pulse_df[col], errors='coerce')
+        session_info = {'participant_id': participant_id, 'session_name': session_name}
+        safe_plot(plot_spindle_boxplots, pulse_df, session_info, str(out_dir), suffix)
+        safe_plot(plot_spindle_violins,  pulse_df, session_info, str(out_dir), suffix)
+
     return df
 
 
@@ -1702,7 +1914,5 @@ if __name__ == '__main__':
         group_path = Path(OUTPUT_DIR) / 'all_session_features.csv'
         group_df.to_csv(group_path, index=False)
         print(f'\nGroup feature table → {group_path}')
-        # build_response_profile / run_response_statistics / plot_response_profile
-        # are unchanged — paste them here or import from a shared module.
     else:
         print('\nNo participant tables produced.')
