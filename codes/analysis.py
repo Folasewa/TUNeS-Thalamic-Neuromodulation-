@@ -622,7 +622,6 @@ def compute_event_locked_spindle_features(burst_times_by_group, spindle_summary,
         )
     return out
 
-
 # =============================================================================
 # Burst-locked spindle characterisation CSV  ← NEW
 # =============================================================================
@@ -686,15 +685,79 @@ def save_burst_locked_spindle_csv(burst_times_by_group, spindle_summary,
         df = pd.DataFrame(rows)
         df.to_csv(Path(output_dir) / fname, index=False)
         print(f'    Saved burst-locked spindle CSV: {fname}')
+        # The summary is always (re)computed from the per-burst CSV so the
+        # terminal output and the saved file stay in sync.
+        _save_burst_locked_spindle_summary(df, session_name, participant_id,
+                                           output_dir, suffix)
 
-        # Also print a quick per-condition summary to terminal
-        print('\n    ── Burst-locked spindle summary ──')
-        summary_cols = ['n_spindles_in_window', 'mean_spindle_amplitude_uv',
-                        'mean_spindle_frequency_hz', 'mean_spindle_duration_sec',
-                        'mean_spindle_rms_uv', 'spindle_density_per_s']
-        grp = df.groupby('condition')[summary_cols].agg(['mean', 'std'])
-        print(grp.to_string())
-        print()
+
+def _save_burst_locked_spindle_summary(burst_locked_df, session_name,
+                                        participant_id, output_dir, suffix):
+    """
+    Collapse the per-burst spindle CSV into a tidy summary table:
+
+        participant_id | session | target | condition | n_bursts
+        | n_bursts_with_spindle | pct_bursts_with_spindle
+        | total_spindles | mean_spindles_per_burst | mean_spindle_density_per_s
+        | mean_amplitude_uv | sd_amplitude_uv
+        | mean_frequency_hz | sd_frequency_hz
+        | mean_duration_sec | sd_duration_sec
+        | mean_rms_uv       | sd_rms_uv
+
+    One row per condition (active / sham) — at a glance you can see whether
+    any characteristic changed between conditions.
+    """
+    fname_summary = (f'{participant_id}_{session_name}_{suffix}'
+                     f'_burst_locked_spindles_summary.csv')
+    if _already_done(output_dir, fname_summary):
+        return
+
+    stat_cols = ['n_spindles_in_window', 'mean_spindle_amplitude_uv',
+                 'mean_spindle_frequency_hz', 'mean_spindle_duration_sec',
+                 'mean_spindle_rms_uv', 'spindle_density_per_s']
+
+    rows = []
+    for condition, grp in burst_locked_df.groupby('condition'):
+        n_bursts          = len(grp)
+        n_with_sp         = int((grp['n_spindles_in_window'] > 0).sum())
+        pct_with_sp       = round(100 * n_with_sp / n_bursts, 1) if n_bursts else np.nan
+        total_sp          = int(grp['n_spindles_in_window'].sum())
+        mean_sp_per_burst = round(grp['n_spindles_in_window'].mean(), 4)
+
+        # Amplitude / frequency / duration / RMS: mean only over bursts that
+        # actually had spindles, otherwise the NaN rows skew the average.
+        has_sp = grp[grp['n_spindles_in_window'] > 0]
+
+        def _m(col): return round(has_sp[col].mean(), 4) if len(has_sp) else np.nan
+        def _s(col): return round(has_sp[col].std(),  4) if len(has_sp) > 1 else np.nan
+
+        rows.append({
+            'participant_id':             participant_id,
+            'session':                    session_name,
+            'condition':                  condition,
+            'n_bursts':                   n_bursts,
+            'n_bursts_with_spindle':      n_with_sp,
+            'pct_bursts_with_spindle':    pct_with_sp,
+            'total_spindles_in_windows':  total_sp,
+            'mean_spindles_per_burst':    mean_sp_per_burst,
+            'mean_spindle_density_per_s': round(grp['spindle_density_per_s'].mean(), 4),
+            'sd_spindle_density_per_s':   round(grp['spindle_density_per_s'].std(),  4),
+            'mean_amplitude_uv':          _m('mean_spindle_amplitude_uv'),
+            'sd_amplitude_uv':            _s('mean_spindle_amplitude_uv'),
+            'mean_frequency_hz':          _m('mean_spindle_frequency_hz'),
+            'sd_frequency_hz':            _s('mean_spindle_frequency_hz'),
+            'mean_duration_sec':          _m('mean_spindle_duration_sec'),
+            'sd_duration_sec':            _s('mean_spindle_duration_sec'),
+            'mean_rms_uv':                _m('mean_spindle_rms_uv'),
+            'sd_rms_uv':                  _s('mean_spindle_rms_uv'),
+        })
+
+    summary_df = pd.DataFrame(rows)
+    summary_df.to_csv(Path(output_dir) / fname_summary, index=False)
+
+    print(f'\n    ── Burst-locked spindle summary ({session_name}) ──')
+    print(summary_df.to_string(index=False))
+    print(f'    Saved: {fname_summary}\n')
 
 
 # =============================================================================
