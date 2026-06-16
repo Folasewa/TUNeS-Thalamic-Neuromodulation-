@@ -1122,12 +1122,12 @@ def _rank_channels_by_erp(mean_erps, ch_names, post_start_idx):
 
 def _habituation_plot(trial_amplitudes, trial_numbers, ch_name, condition,
                       session_name, participant_id, output_dir, suffix, kind):
+    """Single-channel habituation plot used by TFR band-power analysis."""
     from scipy.stats import linregress
     fname = (f'{participant_id}_{session_name}_{suffix}_'
              f'habituation_{kind}_{ch_name}_{condition}.png')
     if _already_done(output_dir, fname):
         return
-
     valid = ~np.isnan(trial_amplitudes)
     x = trial_numbers[valid]
     y = trial_amplitudes[valid]
@@ -1151,6 +1151,93 @@ def _habituation_plot(trial_amplitudes, trial_numbers, ch_name, condition,
     fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'      Saved habituation plot: {fname}')
+
+
+def _habituation_plot_all_channels(
+        all_epochs, channels, pre_samples, baseline_mode,
+        hab_start, hab_end, clean_masks,
+        condition, session_name, participant_id,
+        output_dir, suffix, kind,
+        best_channel=None):
+    """
+    Plot one habituation subplot per channel (amplitude vs trial number with
+    linear regression).  The channel with the highest ERP response
+    (``best_channel``) is flagged in its subplot title with a star and
+    'highest ERP response' note so it can still be identified at a glance.
+    """
+    from scipy.stats import linregress
+
+    fname = (f'{participant_id}_{session_name}_{suffix}_'
+             f'habituation_{kind}_{condition}_all_channels.png')
+    if _already_done(output_dir, fname):
+        return
+
+    n_ch  = len(channels)
+    ncols = 3
+    nrows = int(np.ceil(n_ch / ncols))
+    fig, axes = plt.subplots(nrows, ncols,
+                             figsize=(6 * ncols, 4 * nrows),
+                             squeeze=False)
+
+    ylabel = 'Mean amplitude (µV)' if kind == 'ERP' else f'Mean {kind} power (dB)'
+
+    for idx, ch in enumerate(channels):
+        row_i, col_i = divmod(idx, ncols)
+        ax = axes[row_i][col_i]
+
+        raw_trials = all_epochs[ch][condition].copy()
+        corrected  = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode)
+        keep       = clean_masks[idx]
+        clean      = corrected[keep]
+
+        hab_amps   = np.array([t[hab_start:hab_end].mean() for t in clean])
+        trial_nums = np.arange(1, len(hab_amps) + 1)
+
+        valid = ~np.isnan(hab_amps)
+        x, y  = trial_nums[valid], hab_amps[valid]
+
+        is_best = (ch == best_channel)
+        color   = '#E04B4B' if is_best else 'steelblue'
+
+        if len(x) >= 3:
+            slope, intercept, r, p, _ = linregress(x, y)
+            ax.scatter(x, y, color=color, s=20, alpha=0.65, zorder=3)
+            ax.plot(x, slope * x + intercept, color='crimson', lw=1.6,
+                    label=f'slope={slope:.4f}  R²={r**2:.3f}  p={p:.3f}')
+            ax.legend(fontsize=6.5, loc='upper right')
+        else:
+            ax.scatter(x, y, color=color, s=20, alpha=0.65, zorder=3)
+            ax.text(0.5, 0.5, 'too few trials', transform=ax.transAxes,
+                    ha='center', va='center', color='grey', fontsize=8)
+
+        ax.axhline(0, color='grey', lw=0.6, ls='--', alpha=0.5)
+        ax.set_xlabel('Trial number', fontsize=8)
+        ax.set_ylabel(ylabel, fontsize=8)
+        ax.tick_params(labelsize=7)
+
+        title_str = ch
+        if is_best:
+            title_str = f'★ {ch}  [highest ERP response]'
+        ax.set_title(title_str, fontsize=9,
+                     fontweight='bold' if is_best else 'normal',
+                     color='#C0392B' if is_best else 'black')
+
+    # Hide any unused axes
+    for idx in range(n_ch, nrows * ncols):
+        row_i, col_i = divmod(idx, ncols)
+        axes[row_i][col_i].set_visible(False)
+
+    best_note = f'  |  ★ = {best_channel} (highest ERP response)' if best_channel else ''
+    fig.suptitle(
+        f'{participant_id} – {session_name}  |  {kind} habituation/drift  '
+        f'[{condition.upper()}]  –  all channels{best_note}\n'
+        f'Each panel: mean post-stimulus amplitude vs trial number',
+        fontsize=11, fontweight='bold'
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'      Saved habituation plot (all channels): {fname}')
 
 
 def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
@@ -1278,32 +1365,88 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
             for rank_i, rc in enumerate(ranked_chs[:5], 1):
                 print(f'        {rank_i}. {rc}  {scores[rc]:.2f} µV')
 
-            best_chs = ranked_chs[:N_BEST_CHANNELS]
+            best_ch   = ranked_chs[0]   # channel with highest ERP response
+            color     = '#4B7BE0' if group_label == 'sham' else '#E04B4B'
+            ylabel_erp = 'µV' if baseline_name != 'pre_zscore' else 'z-score'
 
-            # ── RESUME: build figure fname and skip if it exists
-            fname = (f'{participant_id}_{session_name}_{suffix}_'
-                     f'ERP_{group_label}_{baseline_name}.png')
-            if not _already_done(output_dir, fname):
-                fig, axes = plt.subplots(
-                    len(best_chs), 1,
-                    figsize=(14, 4 * len(best_chs)),
-                    sharex=True,
+            # ── Figure 1: ERP for EVERY channel (grid layout) ──────────────
+            fname_all = (f'{participant_id}_{session_name}_{suffix}_'
+                         f'ERP_{group_label}_{baseline_name}_all_channels.png')
+            if not _already_done(output_dir, fname_all):
+                ncols_erp = 3
+                nrows_erp = int(np.ceil(len(channels) / ncols_erp))
+                fig_all, axes_all = plt.subplots(
+                    nrows_erp, ncols_erp,
+                    figsize=(7 * ncols_erp, 4 * nrows_erp),
+                    sharex=True, squeeze=False,
                 )
-                if len(best_chs) == 1:
-                    axes = [axes]
-
-                color = '#4B7BE0' if group_label == 'sham' else '#E04B4B'
-                for ax, ch in zip(axes, best_chs):
-                    ch_idx_in_list = channels.index(ch)
-                    keep           = clean_masks[ch_idx_in_list]
-                    clean_trials   = _apply_erp_baseline(
+                for idx_ch, ch in enumerate(channels):
+                    r_i, c_i   = divmod(idx_ch, ncols_erp)
+                    ax          = axes_all[r_i][c_i]
+                    ch_idx_list = channels.index(ch)
+                    keep        = clean_masks[ch_idx_list]
+                    clean_trials = _apply_erp_baseline(
                         all_epochs[ch][group_label], pre_samples, baseline_mode
                     )[keep]
+                    mean_erp = mean_erps[ch_idx_list]
+                    sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
+                                if len(clean_trials) > 1 else np.zeros(n_samples))
+                    for trial in clean_trials:
+                        ax.plot(times, trial, color=color, alpha=0.10, lw=0.5)
+                    ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,
+                                    color=color, alpha=0.3)
+                    ax.plot(times, mean_erp, color=color, lw=1.8,
+                            label=f'n={len(clean_trials)}')
+                    ax.axvline(0, color='black', lw=0.9, ls='--', alpha=0.7)
+                    ax.axhline(0, color='grey',  lw=0.5, ls=':')
+                    ax.set_ylabel(ylabel_erp, fontsize=7)
+                    ax.tick_params(labelsize=6)
+                    rank_pos  = ranked_chs.index(ch) + 1
+                    is_best_ch = (ch == best_ch)
+                    ch_title  = f'★ {ch}  [#1 highest ERP]' if is_best_ch else f'{ch}  [rank #{rank_pos}]'
+                    ax.set_title(ch_title, fontsize=8,
+                                 fontweight='bold' if is_best_ch else 'normal',
+                                 color='#C0392B' if is_best_ch else 'black')
+                    ax.legend(fontsize=6, loc='upper right')
+                for idx_ch in range(len(channels), nrows_erp * ncols_erp):
+                    r_i, c_i = divmod(idx_ch, ncols_erp)
+                    axes_all[r_i][c_i].set_visible(False)
+                for ax_row in axes_all:
+                    for ax in ax_row:
+                        if ax.get_visible():
+                            ax.set_xlabel('Time (s)', fontsize=7)
+                fig_all.suptitle(
+                    f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
+                    f'[{freq_band[0]}–{freq_band[1]} Hz]  |  baseline: {baseline_name}\n'
+                    f'All channels  |  ★ = highest ERP response ({best_ch})',
+                    fontsize=11, fontweight='bold'
+                )
+                fig_all.tight_layout(rect=[0, 0, 1, 0.96])
+                fig_all.savefig(Path(output_dir) / fname_all, dpi=150, bbox_inches='tight')
+                plt.close(fig_all)
+                print(f'      Saved ERP (all channels): {fname_all}')
 
+            # ── Figure 2: top-10 channels by ERP response ──────────────────
+            top10_chs = ranked_chs[:10]
+            fname_top10 = (f'{participant_id}_{session_name}_{suffix}_'
+                           f'ERP_{group_label}_{baseline_name}_top10.png')
+            if not _already_done(output_dir, fname_top10):
+                fig10, axes10 = plt.subplots(
+                    len(top10_chs), 1,
+                    figsize=(14, 4 * len(top10_chs)),
+                    sharex=True,
+                )
+                if len(top10_chs) == 1:
+                    axes10 = [axes10]
+                for ax, ch in zip(axes10, top10_chs):
+                    ch_idx_list  = channels.index(ch)
+                    keep         = clean_masks[ch_idx_list]
+                    clean_trials = _apply_erp_baseline(
+                        all_epochs[ch][group_label], pre_samples, baseline_mode
+                    )[keep]
                     for trial in clean_trials:
                         ax.plot(times, trial, color=color, alpha=0.12, lw=0.6)
-
-                    mean_erp = mean_erps[ch_idx_in_list]
+                    mean_erp = mean_erps[ch_idx_list]
                     sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
                                 if len(clean_trials) > 1 else np.zeros(n_samples))
                     ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,
@@ -1313,46 +1456,45 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                     ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7, label='TUS onset')
                     ax.axvspan(-TUS_EPOCH_PRE_SEC, 0, color='grey', alpha=0.07, label='Baseline')
                     ax.axhline(0, color='grey', lw=0.6, ls=':')
-                    ax.set_ylabel('µV' if baseline_name != 'pre_zscore' else 'z-score')
-                    rank_pos = ranked_chs.index(ch) + 1
-                    ax.set_title(
-                        f'{ch}  [rank #{rank_pos} by peak |ERP|  |  n={len(clean_trials)} trials]',
-                        fontsize=10, fontweight='bold'
-                    )
+                    ax.set_ylabel(ylabel_erp)
+                    rank_pos  = ranked_chs.index(ch) + 1
+                    is_best_ch = (ch == best_ch)
+                    ch_title  = (f'★ {ch}  [rank #1 – highest ERP  |  n={len(clean_trials)} trials]'
+                                 if is_best_ch else
+                                 f'{ch}  [rank #{rank_pos}  |  n={len(clean_trials)} trials]')
+                    ax.set_title(ch_title, fontsize=10,
+                                 fontweight='bold' if is_best_ch else 'normal',
+                                 color='#C0392B' if is_best_ch else 'black')
                     ax.legend(fontsize=8, loc='upper right')
-
-                axes[-1].set_xlabel('Time (s)')
-                fig.suptitle(
+                axes10[-1].set_xlabel('Time (s)')
+                fig10.suptitle(
                     f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
                     f'[{freq_band[0]}–{freq_band[1]} Hz]  |  baseline: {baseline_name}\n'
-                    f'Individual trials shown for top {N_BEST_CHANNELS} channels by response amplitude',
+                    f'Top 10 channels by peak |ERP| response  |  ★ = {best_ch} (highest)',
                     fontsize=11, fontweight='bold'
                 )
-                fig.tight_layout()
-                fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
-                plt.close(fig)
-                print(f'      Saved ERP figure: {fname}')
+                fig10.tight_layout()
+                fig10.savefig(Path(output_dir) / fname_top10, dpi=150, bbox_inches='tight')
+                plt.close(fig10)
+                print(f'      Saved ERP top-10 figure: {fname_top10}')
 
-            trial_nums = all_trial_nums[group_label]
-            focus_ch   = focus_channel_by_condition.get('active', channels[0])
-            focus_idx  = channels.index(focus_ch)
-            keep_focus = clean_masks[focus_idx]
-
-            hab_amps = []
-            for t_idx in keep_focus:
-                corrected_trial = _apply_erp_baseline(
-                    all_epochs[focus_ch][group_label][[t_idx]], pre_samples, baseline_mode
-                )[0]
-                hab_amps.append(corrected_trial[hab_start:hab_end].mean())
-
-            if len(hab_amps) >= 3:
-                _habituation_plot(
-                    trial_amplitudes=np.array(hab_amps),
-                    trial_numbers=np.arange(1, len(hab_amps) + 1),
-                    ch_name=focus_ch, condition=group_label,
-                    session_name=session_name, participant_id=participant_id,
-                    output_dir=output_dir, suffix=f'{suffix}_{baseline_name}', kind='ERP'
-                )
+            # ── Figure 3: habituation for ALL channels ──────────────────────
+            _habituation_plot_all_channels(
+                all_epochs=all_epochs,
+                channels=channels,
+                pre_samples=pre_samples,
+                baseline_mode=baseline_mode,
+                hab_start=hab_start,
+                hab_end=hab_end,
+                clean_masks=clean_masks,
+                condition=group_label,
+                session_name=session_name,
+                participant_id=participant_id,
+                output_dir=output_dir,
+                suffix=f'{suffix}_{baseline_name}',
+                kind='ERP',
+                best_channel=best_ch,
+            )
 
             if info_topo is not None:
                 _erp_topomap(
