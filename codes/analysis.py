@@ -1,5 +1,5 @@
 """
-analyze.py — TUNES Stage 2: Preprocessed .fif → Features + Visualisations
+analysis.py — TUNES Stage 2: Preprocessed .fif → Features + Visualisations
 
 What this script does
 ---------------------
@@ -14,9 +14,6 @@ full analysis pipeline
   6.  Burst-level (pulse-level) analysis + MNE Epochs .fif
   7.  Visualisations: raw-vs-preprocessed, spectrogram, topoplots,
       boxplots, violins, ERPs, TFRs
-  8.  Response neural profile (build_response_profile / run_response_statistics
-      / plot_response_profile) — runs automatically once all participants
-      have been processed.
 
 Note: sleep staging and all analyses are performed directly from the
 preprocessed .fif files. No raw .vhdr files are ever loaded here.
