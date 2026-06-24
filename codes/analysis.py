@@ -46,7 +46,7 @@ from scipy.signal import welch
 from scipy.signal import spectrogram as scipy_spectrogram
 from scipy import stats as sp_stats
 from scipy.signal import butter, filtfilt
-
+from scipy.stats import linregress
 mne.set_log_level('WARNING')
 
 
@@ -1020,41 +1020,76 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
     fname = f'{participant_id}_{session_name}_spectrogram.png'
     if _already_done(output_dir, fname):
         return
-
+ 
     channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
     if not channels:
         return
+ 
     sfreq = raw.info['sfreq']
     n_fft = int(sfreq * 4)
     hop   = int(sfreq * 2)
-    fig, axes = plt.subplots(len(channels), 1, figsize=(16, 3.5 * len(channels)), sharex=True)
-    if len(channels) == 1:
-        axes = [axes]
-    for ax, ch in zip(axes, channels):
+    n_ch  = len(channels)
+ 
+    # grid dimensions 
+    ncols = 6
+    nrows = int(np.ceil(n_ch / ncols))
+ 
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(ncols * 4.5, nrows * 2.8),
+        sharex=True, sharey=True,
+    )
+    axes_flat = np.array(axes).ravel()
+ 
+    for idx, ch in enumerate(channels):
+        ax   = axes_flat[idx]
         data = raw.get_data(picks=[ch])[0]
         freqs, times, Sxx = scipy_spectrogram(
             data, fs=sfreq, nperseg=n_fft, noverlap=n_fft - hop, scaling='density'
         )
         fmask  = freqs <= 30.0
         Sxx_db = 10 * np.log10(Sxx[fmask] + 1e-30)
-        pcm    = ax.pcolormesh(times / 60, freqs[fmask], Sxx_db,
-                               cmap='inferno', shading='gouraud',
-                               vmin=np.percentile(Sxx_db, 5),
-                               vmax=np.percentile(Sxx_db, 98))
+        pcm = ax.pcolormesh(
+            times / 60, freqs[fmask], Sxx_db,
+            cmap='inferno', shading='gouraud',
+            vmin=np.percentile(Sxx_db, 5),
+            vmax=np.percentile(Sxx_db, 98),
+        )
         del data, Sxx, Sxx_db
         gc.collect()
-        fig.colorbar(pcm, ax=ax, label='dB/Hz', pad=0.01)
+ 
         if hypno_int is not None:
             for ei, stage in enumerate(hypno_int):
                 if stage in NREM_STAGES:
-                    ax.axvspan(ei * 30 / 60, (ei + 1) * 30 / 60, color='cyan', alpha=0.12)
-        ax.axhline(SPINDLE_FREQ_DEFAULT[0], color='white', lw=0.8, ls='--', alpha=0.6)
-        ax.axhline(SPINDLE_FREQ_DEFAULT[1], color='white', lw=0.8, ls='--', alpha=0.6, label='spindle band')
-        ax.set_ylabel('Hz')
-        ax.set_title(ch, fontsize=10)
-    axes[-1].set_xlabel('Time (min)')
-    fig.suptitle(f'{participant_id} – {session_name}: spectrogram  [cyan = NREM]',
-                 fontsize=12, fontweight='bold')
+                    ax.axvspan(ei * 30 / 60, (ei + 1) * 30 / 60,
+                               color='cyan', alpha=0.10)
+ 
+        ax.axhline(SPINDLE_FREQ_DEFAULT[0], color='white', lw=0.7, ls='--', alpha=0.55)
+        ax.axhline(SPINDLE_FREQ_DEFAULT[1], color='white', lw=0.7, ls='--', alpha=0.55)
+        ax.set_title(ch, fontsize=8)
+        ax.tick_params(labelsize=6)
+ 
+        # y-label only on leftmost column
+        if idx % ncols == 0:
+            ax.set_ylabel('Hz', fontsize=7)
+        # x-label only on bottom row
+        if idx >= ncols * (nrows - 1):
+            ax.set_xlabel('Time (min)', fontsize=7)
+ 
+        # One shared colorbar per row (rightmost visible panel in each row)
+        row_i   = idx // ncols
+        row_end = min((row_i + 1) * ncols, n_ch) - 1
+        if idx == row_end:
+            fig.colorbar(pcm, ax=ax, label='dB/Hz', pad=0.02, fraction=0.046)
+ 
+    # Hide unused axes
+    for idx in range(n_ch, nrows * ncols):
+        axes_flat[idx].set_visible(False)
+ 
+    fig.suptitle(
+        f'{participant_id} – {session_name}: spectrogram  [cyan = NREM]',
+        fontsize=12, fontweight='bold',
+    )
     fig.tight_layout()
     fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -1156,83 +1191,91 @@ def _habituation_plot_all_channels(
         condition, session_name, participant_id,
         output_dir, suffix, kind,
         best_channel=None):
-    """
-    Plot one habituation subplot per channel (amplitude vs trial number with
-    linear regression).  The channel with the highest ERP response
-    (``best_channel``) is flagged in its subplot title with a star and
-    'highest ERP response' note so it can still be identified at a glance.
-    """
-    from scipy.stats import linregress
+ 
 
+ 
     fname = (f'{participant_id}_{session_name}_{suffix}_'
              f'habituation_{kind}_{condition}_all_channels.png')
     if _already_done(output_dir, fname):
         return
-
+ 
     n_ch  = len(channels)
-    ncols = 3
+    ncols = 4                                     
     nrows = int(np.ceil(n_ch / ncols))
-    fig, axes = plt.subplots(nrows, ncols,
-                             figsize=(6 * ncols, 4 * nrows),
-                             squeeze=False)
 
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(ncols * 3.2, nrows * 2.8),
+        squeeze=False,
+    )
+ 
     ylabel = 'Mean amplitude (µV)' if kind == 'ERP' else f'Mean {kind} power (dB)'
-
+ 
     for idx, ch in enumerate(channels):
         row_i, col_i = divmod(idx, ncols)
         ax = axes[row_i][col_i]
-
+ 
         raw_trials = all_epochs[ch][condition].copy()
         corrected  = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode)
         keep       = clean_masks[idx]
         clean      = corrected[keep]
-
+ 
         hab_amps   = np.array([t[hab_start:hab_end].mean() for t in clean])
         trial_nums = np.arange(1, len(hab_amps) + 1)
-
+ 
         valid = ~np.isnan(hab_amps)
         x, y  = trial_nums[valid], hab_amps[valid]
-
+ 
         is_best = (ch == best_channel)
-        color   = '#E04B4B' if is_best else 'steelblue'
-
+        scatter_color = '#C0392B' if is_best else '#2C7BB6'
+        line_color    = '#922B21' if is_best else '#1A5276'
+ 
         if len(x) >= 3:
             slope, intercept, r, p, _ = linregress(x, y)
-            ax.scatter(x, y, color=color, s=20, alpha=0.65, zorder=3)
-            ax.plot(x, slope * x + intercept, color='crimson', lw=1.6,
-                    label=f'slope={slope:.4f}  R²={r**2:.3f}  p={p:.3f}')
-            ax.legend(fontsize=6.5, loc='upper right')
+            ax.scatter(x, y, color=scatter_color, s=12, alpha=0.6, zorder=3,
+                       linewidths=0)
+            ax.plot(x, slope * x + intercept, color=line_color, lw=1.4,
+                    label=f'R²={r**2:.2f}  p={p:.3f}')
+            ax.legend(fontsize=6, loc='upper right', framealpha=0.7,
+                      borderpad=0.3, handlelength=1.2)
         else:
-            ax.scatter(x, y, color=color, s=20, alpha=0.65, zorder=3)
+            ax.scatter(x, y, color=scatter_color, s=12, alpha=0.6, zorder=3,
+                       linewidths=0)
             ax.text(0.5, 0.5, 'too few trials', transform=ax.transAxes,
-                    ha='center', va='center', color='grey', fontsize=8)
-
+                    ha='center', va='center', color='grey', fontsize=7)
+ 
         ax.axhline(0, color='grey', lw=0.6, ls='--', alpha=0.5)
-        ax.set_xlabel('Trial number', fontsize=8)
-        ax.set_ylabel(ylabel, fontsize=8)
-        ax.tick_params(labelsize=7)
-
-        title_str = ch
-        if is_best:
-            title_str = f'★ {ch}  [highest ERP response]'
-        ax.set_title(title_str, fontsize=9,
+ 
+        # Axis labels only on edges
+        if col_i == 0:
+            ax.set_ylabel(ylabel, fontsize=7, labelpad=2)
+        if row_i == nrows - 1:
+            ax.set_xlabel('Trial number', fontsize=7, labelpad=2)
+ 
+        ax.tick_params(labelsize=6, length=3, pad=2)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+ 
+        title_str = f'★ {ch}' if is_best else ch
+        ax.set_title(title_str, fontsize=8,
                      fontweight='bold' if is_best else 'normal',
-                     color='#C0392B' if is_best else 'black')
-
-    # Hide any unused axes
+                     color='#C0392B' if is_best else 'black',
+                     pad=3)
+ 
+    # Hide unused axes
     for idx in range(n_ch, nrows * ncols):
         row_i, col_i = divmod(idx, ncols)
         axes[row_i][col_i].set_visible(False)
-
-    best_note = f'  |  ★ = {best_channel} (highest ERP response)' if best_channel else ''
+ 
+    best_note = f'  |  ★ = {best_channel}' if best_channel else ''
+    condition_label = condition.upper()
     fig.suptitle(
-        f'{participant_id} – {session_name}  |  {kind} habituation/drift  '
-        f'[{condition.upper()}]  –  all channels{best_note}\n'
-        f'Each panel: mean post-stimulus amplitude vs trial number',
-        fontsize=11, fontweight='bold'
+        f'{participant_id} – {session_name}  |  {kind} habituation  '
+        f'[{condition_label}]{best_note}',
+        fontsize=10, fontweight='bold', y=1.01,
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.96])
-    fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
+    fig.tight_layout(rect=[0, 0, 1, 0.99])
+    fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
     plt.close(fig)
     print(f'      Saved habituation plot (all channels): {fname}')
 
@@ -1265,36 +1308,32 @@ def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
     print(f'      Saved ERP topomap: {fname}')
 
 
-def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
-              output_dir, suffix=''):
-    # ── FIX: the per-pulse CSV stores burst time as 'burst_time_s', not 'time_sec'
+def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_dir, suffix=''):
+
     if 'burst_time_s' not in bursts_df.columns:
         print('    plot_erps: burst_time_s column missing — skipping')
         return None
-    bursts_df['burst_time_s'] = pd.to_numeric(
-    bursts_df['burst_time_s'],
-    errors='coerce')
-
+    bursts_df['burst_time_s'] = pd.to_numeric(bursts_df['burst_time_s'], errors='coerce')
     bursts_df = bursts_df.dropna(subset=['burst_time_s'])
-
+ 
     channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
     if not channels or bursts_df.empty:
         return None
-
+ 
     sfreq        = raw.info['sfreq']
     pre_samples  = int(TUS_EPOCH_PRE_SEC * sfreq)
     post_samples = int(TUS_EPOCH_POST_SEC * sfreq)
     n_samples    = pre_samples + post_samples
     times        = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples)
-
+ 
     post_start_idx = pre_samples
     hab_start      = pre_samples + int(HABITUATION_WINDOW_SEC[0] * sfreq)
     hab_end        = pre_samples + int(HABITUATION_WINDOW_SEC[1] * sfreq)
-
+ 
     def bandpass(data, low, high, fs):
         b, a = butter(4, [low / (fs / 2), high / (fs / 2)], btype='band')
         return filtfilt(b, a, data)
-
+ 
     montage   = mne.channels.make_standard_montage('standard_1020')
     known_chs = set(montage.ch_names)
     topo_chs  = [ch for ch in channels if ch in known_chs]
@@ -1302,21 +1341,20 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
     if len(topo_chs) >= 3:
         info_topo = mne.create_info(topo_chs, sfreq=sfreq, ch_types='eeg')
         info_topo.set_montage(montage, on_missing='ignore')
-
+ 
     all_epochs     = {ch: {} for ch in channels}
     all_trial_nums = {}
-
+ 
     for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
-        mask     = bursts_df['condition'].isin(condition_set)
-        group_df = bursts_df[mask].reset_index(drop=True)
+        mask       = bursts_df['condition'].isin(condition_set)
+        group_df   = bursts_df[mask].reset_index(drop=True)
         trial_nums = np.arange(1, len(group_df) + 1)
         all_trial_nums[group_label] = trial_nums
-
+ 
         for ch in channels:
             ch_idx = raw.ch_names.index(ch)
             trials = []
             for _, burst in group_df.iterrows():
-                # ── FIX: was burst['time_sec'] — now correctly burst['burst_time_s']
                 center = int(burst['burst_time_s'] * sfreq)
                 start, stop = center - pre_samples, center + post_samples
                 if start < 0 or stop > raw.n_times:
@@ -1329,20 +1367,20 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                     pass
                 trials.append(trial)
             all_epochs[ch][group_label] = np.array(trials)
-
+ 
     focus_channel_by_condition = {}
-
+ 
     for baseline_name, baseline_mode in ERP_BASELINES.items():
         print(f'\n    ERP baseline: {baseline_name}')
-        mean_erps_by_condition     = {}
-        peak_amp_by_condition      = {}
-
+        mean_erps_by_condition = {}
+        peak_amp_by_condition  = {}
+ 
         for group_label in ('sham', 'active'):
             mean_erps   = []
             clean_masks = []
             for ch in channels:
-                raw_trials = all_epochs[ch][group_label].copy()
-                corrected  = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode)
+                raw_trials  = all_epochs[ch][group_label].copy()
+                corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode)
                 finite_mask = np.all(np.isfinite(corrected), axis=1)
                 noise_mask  = _exclude_noisy_trials(
                     corrected[finite_mask], TRIAL_NOISE_THRESHOLD_UV
@@ -1350,23 +1388,25 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                 keep  = np.where(finite_mask)[0][noise_mask]
                 clean = corrected[keep]
                 clean_masks.append(keep)
-                mean_erps.append(clean.mean(axis=0) if len(clean) else np.full(n_samples, np.nan))
-
+                mean_erps.append(
+                    clean.mean(axis=0) if len(clean) else np.full(n_samples, np.nan)
+                )
+ 
             mean_erps_by_condition[group_label] = mean_erps
             ranked_chs, scores = _rank_channels_by_erp(mean_erps, channels, post_start_idx)
             if group_label == 'active':
                 focus_channel_by_condition['active'] = ranked_chs[0]
             peak_amp_by_condition[group_label] = {ch: scores[ch] for ch in channels}
-
+ 
             print(f'      [{group_label}] Channel ranking (peak |ERP|, 0–end):')
             for rank_i, rc in enumerate(ranked_chs[:5], 1):
                 print(f'        {rank_i}. {rc}  {scores[rc]:.2f} µV')
-
-            best_ch   = ranked_chs[0]   # channel with highest ERP response
-            color     = '#4B7BE0' if group_label == 'sham' else '#E04B4B'
+ 
+            best_ch    = ranked_chs[0]
+            color      = '#4B7BE0' if group_label == 'sham' else '#E04B4B'
             ylabel_erp = 'µV' if baseline_name != 'pre_zscore' else 'z-score'
-
-            # ── Figure 1: ERP for EVERY channel (grid layout) ──────────────
+ 
+            # Figure 1: all channels (3-col grid) 
             fname_all = (f'{participant_id}_{session_name}_{suffix}_'
                          f'ERP_{group_label}_{baseline_name}_all_channels.png')
             if not _already_done(output_dir, fname_all):
@@ -1378,11 +1418,11 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                     sharex=True, squeeze=False,
                 )
                 for idx_ch, ch in enumerate(channels):
-                    r_i, c_i   = divmod(idx_ch, ncols_erp)
-                    ax          = axes_all[r_i][c_i]
-                    ch_idx_list = channels.index(ch)
-                    keep        = clean_masks[ch_idx_list]
-                    clean_trials = _apply_erp_baseline(
+                    r_i, c_i     = divmod(idx_ch, ncols_erp)
+                    ax            = axes_all[r_i][c_i]
+                    ch_idx_list   = channels.index(ch)
+                    keep          = clean_masks[ch_idx_list]
+                    clean_trials  = _apply_erp_baseline(
                         all_epochs[ch][group_label], pre_samples, baseline_mode
                     )[keep]
                     mean_erp = mean_erps[ch_idx_list]
@@ -1398,9 +1438,10 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                     ax.axhline(0, color='grey',  lw=0.5, ls=':')
                     ax.set_ylabel(ylabel_erp, fontsize=7)
                     ax.tick_params(labelsize=6)
-                    rank_pos  = ranked_chs.index(ch) + 1
+                    rank_pos   = ranked_chs.index(ch) + 1
                     is_best_ch = (ch == best_ch)
-                    ch_title  = f'★ {ch}  [#1 highest ERP]' if is_best_ch else f'{ch}  [rank #{rank_pos}]'
+                    ch_title   = (f'★ {ch}  [#1 highest ERP]' if is_best_ch
+                                  else f'{ch}  [rank #{rank_pos}]')
                     ax.set_title(ch_title, fontsize=8,
                                  fontweight='bold' if is_best_ch else 'normal',
                                  color='#C0392B' if is_best_ch else 'black')
@@ -1422,60 +1463,75 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                 fig_all.savefig(Path(output_dir) / fname_all, dpi=150, bbox_inches='tight')
                 plt.close(fig_all)
                 print(f'      Saved ERP (all channels): {fname_all}')
-
-            # ── Figure 2: top-10 channels by ERP response ──────────────────
-            top10_chs = ranked_chs[:10]
+ 
+            # Figure 2: top-10 
+            top10_chs   = ranked_chs[:10]
             fname_top10 = (f'{participant_id}_{session_name}_{suffix}_'
                            f'ERP_{group_label}_{baseline_name}_top10.png')
             if not _already_done(output_dir, fname_top10):
+                ncols_top = 2
+                nrows_top = 5          # always 5 rows for exactly 10 channels
                 fig10, axes10 = plt.subplots(
-                    len(top10_chs), 1,
-                    figsize=(14, 4 * len(top10_chs)),
-                    sharex=True,
+                    nrows_top, ncols_top,
+                    figsize=(14, 4 * nrows_top),   # same height-per-panel as before
+                    sharex=True, sharey=False,      # independent y per panel
+                    squeeze=False,
                 )
-                if len(top10_chs) == 1:
-                    axes10 = [axes10]
-                for ax, ch in zip(axes10, top10_chs):
+                axes10_flat = axes10.ravel()
+ 
+                for panel_idx, ch in enumerate(top10_chs):
+                    ax           = axes10_flat[panel_idx]
                     ch_idx_list  = channels.index(ch)
                     keep         = clean_masks[ch_idx_list]
                     clean_trials = _apply_erp_baseline(
                         all_epochs[ch][group_label], pre_samples, baseline_mode
                     )[keep]
-                    for trial in clean_trials:
-                        ax.plot(times, trial, color=color, alpha=0.12, lw=0.6)
                     mean_erp = mean_erps[ch_idx_list]
                     sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
                                 if len(clean_trials) > 1 else np.zeros(n_samples))
+ 
+                    for trial in clean_trials:
+                        ax.plot(times, trial, color=color, alpha=0.12, lw=0.6)
                     ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,
                                     color=color, alpha=0.3)
                     ax.plot(times, mean_erp, color=color, lw=2.0,
                             label=f'Mean (n={len(clean_trials)})')
-                    ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7, label='TUS onset')
-                    ax.axvspan(-TUS_EPOCH_PRE_SEC, 0, color='grey', alpha=0.07, label='Baseline')
+                    ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7,
+                               label='TUS onset')
+                    ax.axvspan(-TUS_EPOCH_PRE_SEC, 0, color='grey', alpha=0.07,
+                               label='Baseline')
                     ax.axhline(0, color='grey', lw=0.6, ls=':')
-                    ax.set_ylabel(ylabel_erp)
-                    rank_pos  = ranked_chs.index(ch) + 1
+                    ax.set_ylabel(ylabel_erp, fontsize=8)
+ 
+                    rank_pos   = ranked_chs.index(ch) + 1
                     is_best_ch = (ch == best_ch)
-                    ch_title  = (f'★ {ch}  [rank #1 – highest ERP  |  n={len(clean_trials)} trials]'
-                                 if is_best_ch else
-                                 f'{ch}  [rank #{rank_pos}  |  n={len(clean_trials)} trials]')
-                    ax.set_title(ch_title, fontsize=10,
+                    ch_title   = (
+                        f'★ {ch}  [rank #1 – highest ERP  |  n={len(clean_trials)} trials]'
+                        if is_best_ch else
+                        f'{ch}  [rank #{rank_pos}  |  n={len(clean_trials)} trials]'
+                    )
+                    ax.set_title(ch_title, fontsize=9,
                                  fontweight='bold' if is_best_ch else 'normal',
                                  color='#C0392B' if is_best_ch else 'black')
-                    ax.legend(fontsize=8, loc='upper right')
-                axes10[-1].set_xlabel('Time (s)')
+                    ax.legend(fontsize=7, loc='upper right')
+                    ax.tick_params(labelsize=7)
+ 
+                    # x-axis label only on the bottom row
+                    if panel_idx >= ncols_top * (nrows_top - 1):
+                        ax.set_xlabel('Time (s)', fontsize=8)
+ 
                 fig10.suptitle(
                     f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
                     f'[{freq_band[0]}–{freq_band[1]} Hz]  |  baseline: {baseline_name}\n'
                     f'Top 10 channels by peak |ERP| response  |  ★ = {best_ch} (highest)',
                     fontsize=11, fontweight='bold'
                 )
-                fig10.tight_layout()
+                fig10.tight_layout(rect=[0, 0, 1, 0.96])
                 fig10.savefig(Path(output_dir) / fname_top10, dpi=150, bbox_inches='tight')
                 plt.close(fig10)
                 print(f'      Saved ERP top-10 figure: {fname_top10}')
-
-            # ── Figure 3: habituation for ALL channels ──────────────────────
+ 
+            # Figure 3: habituation for ALL channels 
             _habituation_plot_all_channels(
                 all_epochs=all_epochs,
                 channels=channels,
@@ -1492,7 +1548,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                 kind='ERP',
                 best_channel=best_ch,
             )
-
+ 
             if info_topo is not None:
                 _erp_topomap(
                     peak_amp_by_condition[group_label],
@@ -1500,7 +1556,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id,
                     session_name, participant_id, output_dir,
                     suffix, group_label, baseline_name
                 )
-
+ 
     return focus_channel_by_condition.get('active', channels[0] if channels else None)
 
 
@@ -1751,67 +1807,78 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
 def plot_spindle_boxplots(pulse_df, session_info, output_dir, suffix=''):
     pid     = session_info['participant_id']
     session = session_info['session_name']
-
+ 
     fname  = f'{pid}_{session}_{suffix}_spindle_prepost_boxplots.png'
     fname2 = f'{pid}_{session}_{suffix}_spindle_change_boxplots.png'
     both_done = _already_done(output_dir, fname) and _already_done(output_dir, fname2)
     if both_done:
         return
-
+ 
     if pulse_df is None or pulse_df.empty:
         return
-
+ 
     channels = sorted({
         col.split('_')[0] for col in pulse_df.columns
         if col.endswith('_pre_sigma_power') or col.endswith('_post_sigma_power')
     })
     if not channels:
         return
-
+ 
     pre_post_pairs = [
         ('pre_sigma_power',  'post_sigma_power',  'Sigma power'),
         ('pre_delta_power',  'post_delta_power',  'Delta power'),
     ]
-    nrow = len(channels)
-    ncol = len(pre_post_pairs)
+ 
+    # Palette — sham: blue family, active: red family
     colors = {
-        'sham_pre':    '#90B4E8',
-        'sham_post':   '#1E50A2',
-        'active_pre':  '#F0A0A0',
-        'active_post': '#C0152A',
+        'sham_pre':    '#A8C8E8',
+        'sham_post':   '#1A5276',
+        'active_pre':  '#F5B8B8',
+        'active_post': '#922B21',
     }
     labels_order = ['sham_pre', 'sham_post', 'active_pre', 'active_post']
     tick_labels  = ['Sham\nPre', 'Sham\nPost', 'Active\nPre', 'Active\nPost']
-
+ 
+    # ── Figure 1: pre vs post ──────────────────────────────────────────────
     if not _already_done(output_dir, fname):
-        fig, axes = plt.subplots(nrow, ncol,
-                                 figsize=(ncol * 4.5, nrow * 3.8),
-                                 squeeze=False)
-
+        nrow = len(channels)
+        ncol = len(pre_post_pairs)
+        fig, axes = plt.subplots(
+            nrow, ncol,
+            figsize=(ncol * 3.6, nrow * 3.2),
+            squeeze=False,
+        )
+ 
         for row_idx, ch in enumerate(channels):
             for col_idx, (pre_feat, post_feat, feat_label) in enumerate(pre_post_pairs):
                 ax = axes[row_idx][col_idx]
                 groups_data = []
                 for key in labels_order:
                     condition, timing = key.split('_', 1)
-                    col_name = f'{ch}_{pre_feat}' if timing == 'pre' else f'{ch}_{post_feat}'
+                    col_name = (f'{ch}_{pre_feat}' if timing == 'pre'
+                                else f'{ch}_{post_feat}')
                     mask = pulse_df['group'] == condition
                     groups_data.append(
                         pulse_df.loc[mask, col_name].dropna().values
                         if col_name in pulse_df.columns else np.array([])
                     )
-
+ 
                 bp = ax.boxplot(
-                    groups_data, patch_artist=True, widths=0.55,
-                    medianprops=dict(color='white', linewidth=2.5),
-                    whiskerprops=dict(linewidth=1.2),
-                    capprops=dict(linewidth=1.2),
-                    flierprops=dict(marker='o', markersize=3, alpha=0.4, linestyle='none')
+                    groups_data,
+                    patch_artist=True,
+                    widths=0.50,
+                    medianprops=dict(color='white', linewidth=2.0),
+                    whiskerprops=dict(linewidth=1.0, color='#444'),
+                    capprops=dict(linewidth=1.0, color='#444'),
+                    flierprops=dict(marker='o', markersize=2.5, alpha=0.35,
+                                    linestyle='none', markerfacecolor='#666'),
+                    boxprops=dict(linewidth=0.8),
                 )
                 for patch, key in zip(bp['boxes'], labels_order):
                     patch.set_facecolor(colors[key])
-                    patch.set_alpha(0.9)
-
+                    patch.set_alpha(0.88)
+ 
+                # Median connector lines
                 for x_pre, x_post, condition in [(1, 2, 'sham'), (3, 4, 'active')]:
                     pre_col  = f'{ch}_{pre_feat}'
                     post_col = f'{ch}_{post_feat}'
@@ -1820,73 +1887,105 @@ def plot_spindle_boxplots(pulse_df, session_info, output_dir, suffix=''):
                         pre_med  = pulse_df.loc[mask, pre_col].median()
                         post_med = pulse_df.loc[mask, post_col].median()
                         ax.plot([x_pre, x_post], [pre_med, post_med],
-                                color='black', linewidth=1.5,
-                                linestyle='--', alpha=0.6, zorder=5)
-
-                ax.axvline(2.5, color='grey', linewidth=1.0, linestyle=':', alpha=0.7)
+                                color='#333', lw=1.2, ls='--',
+                                alpha=0.65, zorder=5)
+ 
+                ax.axvline(2.5, color='#AAAAAA', lw=0.8, ls=':', alpha=0.8)
                 ax.set_xticks([1, 2, 3, 4])
                 ax.set_xticklabels(tick_labels, fontsize=8)
-                ax.set_title(f'{ch} — {feat_label}', fontsize=10, fontweight='bold')
-                ax.axhline(0, color='grey', linewidth=0.6, linestyle='--', alpha=0.5)
-                for x_center, lbl in [(1.5, 'Sham'), (3.5, 'Active')]:
-                    ax.text(x_center, -0.18, lbl,
-                            transform=ax.get_xaxis_transform(),
-                            ha='center', fontsize=9, color='grey')
-
-        baseline_note = (
-            f'Baseline (pre): −3 to 0 s  |  Response (post): 0 to +5 s  '
-            f'relative to TUS burst onset'
-        )
+                ax.axhline(0, color='grey', lw=0.6, ls='--', alpha=0.5)
+                ax.tick_params(labelsize=7, length=3, pad=2)
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+ 
+                # y-label only on left column
+                if col_idx == 0:
+                    ax.set_ylabel(f'{ch}', fontsize=8, fontweight='bold', labelpad=4)
+ 
+                # Panel title only on top row
+                if row_idx == 0:
+                    ax.set_title(feat_label, fontsize=9, fontweight='bold', pad=5)
+ 
+                # Sham / Active group labels below x-axis on bottom row
+                if row_idx == nrow - 1:
+                    for x_center, lbl in [(1.5, 'Sham'), (3.5, 'Active')]:
+                        ax.text(x_center, -0.22, lbl,
+                                transform=ax.get_xaxis_transform(),
+                                ha='center', fontsize=8, color='#555')
+ 
         fig.suptitle(
             f'{pid} – {session}: pre vs post power  [Sham | Active]\n'
-            f'{baseline_note}',
-            fontsize=11, fontweight='bold', y=1.02
+            f'Baseline: −3 to 0 s  |  Response: 0 to +5 s  (re: TUS onset)',
+            fontsize=10, fontweight='bold', y=1.01,
         )
-        fig.tight_layout()
-        fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
+        fig.tight_layout(rect=[0, 0, 1, 0.99])
+        fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
         plt.close(fig)
         print(f'    Saved pre/post boxplots: {fname}')
-
+ 
+    # ── Figure 2: change metrics ───────────────────────────────────────────
     ratio_features = [
-        ('sigma_power_change', 'Sigma power change\n(post−pre)/pre'),
+        ('sigma_power_change', 'Sigma power change\n(post−pre) / pre'),
         ('post_ptp_uv',        'Post-pulse peak-to-peak (µV)'),
     ]
-
+ 
     if not _already_done(output_dir, fname2):
-        fig2, axes2 = plt.subplots(len(channels), len(ratio_features),
-                                   figsize=(len(ratio_features) * 4.5,
-                                            len(channels) * 3.8),
-                                   squeeze=False)
+        nrow2 = len(channels)
+        ncol2 = len(ratio_features)
+        fig2, axes2 = plt.subplots(
+            nrow2, ncol2,
+            figsize=(ncol2 * 3.6, nrow2 * 3.2),
+            squeeze=False,
+        )
+ 
+        condition_colors = {'sham': '#2C7BB6', 'active': '#C0392B'}
+ 
         for row_idx, ch in enumerate(channels):
             for col_idx, (feat_suffix, feat_label) in enumerate(ratio_features):
                 ax       = axes2[row_idx][col_idx]
                 col_name = f'{ch}_{feat_suffix}'
-                sham_vals   = (pulse_df.loc[pulse_df['group'] == 'sham',   col_name].dropna().values
+                sham_vals   = (pulse_df.loc[pulse_df['group'] == 'sham',   col_name]
+                               .dropna().values
                                if col_name in pulse_df.columns else np.array([]))
-                active_vals = (pulse_df.loc[pulse_df['group'] == 'active', col_name].dropna().values
+                active_vals = (pulse_df.loc[pulse_df['group'] == 'active', col_name]
+                               .dropna().values
                                if col_name in pulse_df.columns else np.array([]))
-
+ 
                 bp = ax.boxplot(
-                    [sham_vals, active_vals], patch_artist=True, widths=0.5,
-                    medianprops=dict(color='white', linewidth=2.5),
-                    whiskerprops=dict(linewidth=1.2),
-                    capprops=dict(linewidth=1.2),
-                    flierprops=dict(marker='o', markersize=3, alpha=0.4, linestyle='none')
+                    [sham_vals, active_vals],
+                    patch_artist=True,
+                    widths=0.45,
+                    medianprops=dict(color='white', linewidth=2.0),
+                    whiskerprops=dict(linewidth=1.0, color='#444'),
+                    capprops=dict(linewidth=1.0, color='#444'),
+                    flierprops=dict(marker='o', markersize=2.5, alpha=0.35,
+                                    linestyle='none', markerfacecolor='#666'),
+                    boxprops=dict(linewidth=0.8),
                 )
-                bp['boxes'][0].set_facecolor('#4B7BE0'); bp['boxes'][0].set_alpha(0.88)
-                bp['boxes'][1].set_facecolor('#E04B4B'); bp['boxes'][1].set_alpha(0.88)
+                bp['boxes'][0].set_facecolor(condition_colors['sham'])
+                bp['boxes'][0].set_alpha(0.85)
+                bp['boxes'][1].set_facecolor(condition_colors['active'])
+                bp['boxes'][1].set_alpha(0.85)
+ 
                 ax.set_xticks([1, 2])
-                ax.set_xticklabels(['Sham', 'Active'], fontsize=10)
-                ax.set_title(f'{ch} — {feat_label}', fontsize=10, fontweight='bold')
-                ax.axhline(0, color='grey', linewidth=0.8, linestyle='--', alpha=0.6)
-
+                ax.set_xticklabels(['Sham', 'Active'], fontsize=9)
+                ax.axhline(0, color='grey', lw=0.7, ls='--', alpha=0.6)
+                ax.tick_params(labelsize=7, length=3, pad=2)
+                ax.spines['top'].set_visible(False)
+                ax.spines['right'].set_visible(False)
+ 
+                if col_idx == 0:
+                    ax.set_ylabel(f'{ch}', fontsize=8, fontweight='bold', labelpad=4)
+                if row_idx == 0:
+                    ax.set_title(feat_label, fontsize=9, fontweight='bold', pad=5)
+ 
         fig2.suptitle(
             f'{pid} – {session}: sigma change & amplitude  [Sham vs Active]\n'
-            f'Baseline: −3 to 0 s | Response: 0 to +5 s (re: TUS burst onset)',
-            fontsize=11, fontweight='bold', y=1.02
+            f'Baseline: −3 to 0 s  |  Response: 0 to +5 s  (re: TUS onset)',
+            fontsize=10, fontweight='bold', y=1.01,
         )
-        fig2.tight_layout()
-        fig2.savefig(Path(output_dir) / fname2, dpi=150, bbox_inches='tight')
+        fig2.tight_layout(rect=[0, 0, 1, 0.99])
+        fig2.savefig(Path(output_dir) / fname2, dpi=200, bbox_inches='tight')
         plt.close(fig2)
         print(f'    Saved change boxplots: {fname2}')
 
@@ -1894,37 +1993,43 @@ def plot_spindle_boxplots(pulse_df, session_info, output_dir, suffix=''):
 def plot_spindle_violins(pulse_df, session_info, output_dir, suffix=''):
     pid     = session_info['participant_id']
     session = session_info['session_name']
-
+ 
     fname = f'{pid}_{session}_{suffix}_spindle_change_violins.png'
     if _already_done(output_dir, fname):
         return
-
+ 
     if pulse_df is None or pulse_df.empty:
         return
-
+ 
     channels = sorted({
         col.split('_')[0] for col in pulse_df.columns
         if col.endswith('_sigma_power_change') or col.endswith('_post_ptp_uv')
     })
     if not channels:
         return
-
+ 
     ratio_features = [
-        ('sigma_power_change', 'Sigma power change\n(post−pre)/pre'),
+        ('sigma_power_change', 'Sigma power change\n(post−pre) / pre'),
         ('post_ptp_uv',        'Post-pulse peak-to-peak (µV)'),
     ]
-    palette = {'sham': '#4B7BE0', 'active': '#E04B4B'}
-
-    fig, axes = plt.subplots(len(channels), len(ratio_features),
-                             figsize=(len(ratio_features) * 4.5, len(channels) * 4.0),
-                             squeeze=False)
-
+    palette = {'sham': '#2C7BB6', 'active': '#C0392B'}
+ 
+    nrow = len(channels)
+    ncol = len(ratio_features)
+    fig, axes = plt.subplots(
+        nrow, ncol,
+        figsize=(ncol * 3.6, nrow * 3.4),
+        squeeze=False,
+    )
+ 
+    rng = np.random.default_rng(42)
+ 
     for row_idx, ch in enumerate(channels):
         for col_idx, (feat_suffix, feat_label) in enumerate(ratio_features):
             ax       = axes[row_idx][col_idx]
             col_name = f'{ch}_{feat_suffix}'
             groups_data, positions, colors_list = [], [], []
-
+ 
             for pos, group in enumerate(['sham', 'active'], start=1):
                 vals = (pulse_df.loc[pulse_df['group'] == group, col_name]
                         .dropna().astype(float).values
@@ -1932,53 +2037,71 @@ def plot_spindle_violins(pulse_df, session_info, output_dir, suffix=''):
                 groups_data.append(vals)
                 positions.append(pos)
                 colors_list.append(palette[group])
-
+ 
+            # Violin body
             has_data = [len(d) >= 3 for d in groups_data]
             if any(has_data):
                 parts = ax.violinplot(
-                    [d if ok else [np.nan] for d, ok in zip(groups_data, has_data)],
+                    [d if ok else [np.nan]
+                     for d, ok in zip(groups_data, has_data)],
                     positions=positions,
-                    showmedians=False, showextrema=False
+                    showmedians=False,
+                    showextrema=False,
+                    widths=0.65,
                 )
                 for body, color in zip(parts['bodies'], colors_list):
                     body.set_facecolor(color)
-                    body.set_alpha(0.55)
+                    body.set_alpha(0.40)
                     body.set_edgecolor('none')
-
+ 
+            # Overlaid boxplot
             bp = ax.boxplot(
-                groups_data, positions=positions,
-                widths=0.18, patch_artist=True,
+                groups_data,
+                positions=positions,
+                widths=0.14,
+                patch_artist=True,
                 medianprops=dict(color='white', linewidth=2.0),
-                whiskerprops=dict(linewidth=1.0, color='#444'),
-                capprops=dict(linewidth=1.0, color='#444'),
-                flierprops=dict(marker='o', markersize=2.5, alpha=0.35,
-                                linestyle='none', markerfacecolor='#555')
+                whiskerprops=dict(linewidth=0.9, color='#333'),
+                capprops=dict(linewidth=0.9, color='#333'),
+                flierprops=dict(marker='o', markersize=2.0, alpha=0.30,
+                                linestyle='none', markerfacecolor='#555'),
+                boxprops=dict(linewidth=0.7),
             )
             for patch, color in zip(bp['boxes'], colors_list):
                 patch.set_facecolor(color)
-                patch.set_alpha(0.9)
-
-            rng = np.random.default_rng(42)
+                patch.set_alpha(0.92)
+ 
+            # Jittered individual points
             for pos, vals, color in zip(positions, groups_data, colors_list):
                 if len(vals):
-                    jitter = rng.uniform(-0.06, 0.06, len(vals))
-                    ax.scatter(pos + jitter, vals, s=8, color=color,
-                               alpha=0.4, zorder=3, linewidths=0)
-
+                    jitter = rng.uniform(-0.055, 0.055, len(vals))
+                    ax.scatter(pos + jitter, vals,
+                               s=6, color=color, alpha=0.35,
+                               zorder=3, linewidths=0)
+ 
+            ax.axhline(0, color='grey', lw=0.7, ls='--', alpha=0.6)
             ax.set_xticks(positions)
-            ax.set_xticklabels(['Sham', 'Active'], fontsize=10)
-            ax.set_title(f'{ch} — {feat_label}', fontsize=10, fontweight='bold')
-            ax.axhline(0, color='grey', linewidth=0.8, linestyle='--', alpha=0.6)
-
+            ax.set_xticklabels(['Sham', 'Active'], fontsize=9)
+            ax.tick_params(labelsize=7, length=3, pad=2)
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+ 
+            # Labels only on edges
+            if col_idx == 0:
+                ax.set_ylabel(f'{ch}', fontsize=8, fontweight='bold', labelpad=4)
+            if row_idx == 0:
+                ax.set_title(feat_label, fontsize=9, fontweight='bold', pad=5)
+ 
     fig.suptitle(
         f'{pid} – {session}: sigma change & amplitude  [violin + box]\n'
-        f'Baseline: −3 to 0 s | Response: 0 to +5 s (re: TUS burst onset)',
-        fontsize=11, fontweight='bold', y=1.02
+        f'Baseline: −3 to 0 s  |  Response: 0 to +5 s  (re: TUS onset)',
+        fontsize=10, fontweight='bold', y=1.01,
     )
-    fig.tight_layout()
-    fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
+    fig.tight_layout(rect=[0, 0, 1, 0.99])
+    fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
     plt.close(fig)
     print(f'    Saved violin plots: {fname}')
+ 
 
 
 # =============================================================================
