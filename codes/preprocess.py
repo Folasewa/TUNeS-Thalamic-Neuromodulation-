@@ -123,6 +123,9 @@ def preprocess(raw):
     )
     raw.filter(BANDPASS_LOW, BANDPASS_HIGH, verbose=False)
     raw.notch_filter(NOTCH_FREQ, verbose=False)
+    # Re-reference to average
+    raw.set_eeg_reference('average', projection=False, verbose=False)
+    print('Re-referenced to Average')
  
     ART_THRESHOLD_UV = 150.0
     eeg_chs = [ch for idx, ch in enumerate(raw.ch_names)
