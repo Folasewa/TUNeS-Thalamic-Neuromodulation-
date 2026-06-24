@@ -123,6 +123,8 @@ def preprocess(raw):
     )
     raw.filter(BANDPASS_LOW, BANDPASS_HIGH, verbose=False)
     raw.notch_filter(NOTCH_FREQ, verbose=False)
+    #mark tp9 and tp10 as non-eeg since we used them as physical reference
+    raw.set_channel_types({'TP9': 'misc', 'TP10': 'misc'})
     # Re-reference to average
     raw.set_eeg_reference('average', projection=False, verbose=False)
     print('Re-referenced to Average')
