@@ -94,6 +94,7 @@ import scipy.stats as sp_stats
 from scipy.stats import pearsonr, spearmanr, ttest_1samp
 from statsmodels.stats.multitest import multipletests
 
+
 # =============================================================================
 # USER CONFIGURATION
 # =============================================================================
@@ -113,18 +114,48 @@ MIN_N = 4
 
 # Which acoustic columns to treat as dose metrics (must exist in enriched CSV)
 DOSE_METRICS = [
-    'OnTarget_6dB_percent',           # PRIMARY — % of focal volume on target
-    'OnTarget_3dB_percent',
-    'TargetCoverage_6dB_percent',     # % of target volume covered by focus
-    'TargetCoverage_3dB_percent',
-    'OffTarget_6dB_percent',          # spillover (expected negative correlation)
-    'OffTarget_3dB_percent',
-    'FocalVolume_6dB_mm3',
-    'FocalVolume_3dB_mm3',
+    'OnTarget_6dB_pct',           # PRIMARY
+    'OnTarget_3dB_pct',
+    'Coverage_6dB_pct',
+    'Coverage_3dB_pct',
+    'OffTarget_6dB_pct',
+    'OffTarget_3dB_pct',
+    'FocusVol_6dB_mm3',
+    'FocusVol_3dB_mm3',
     'PeakPressure_Target_kPa',
-    'MeanIntensity_TargetOverlap_6dB_Wcm2',
+    'MeanInt_Overlap_6dB_Wcm2',
     'MI',
+    'PeakP_Overlap_6dB_kPa',      # pressure specifically in the focal overlap zone
+    'MeanP_Overlap_6dB_kPa',
+    'fwhm_axial_mm',               # beam dimensions — dose shape, not just magnitude
+    'fwhm_lat_mean_mm',
+    'skull_thickness_mm',          # beam path difficulty covariate
+    'prefocal_ratio',              # pre-focal energy ratio — safety/specificity covariate
+    'peak_axial_offset_mm',        # targeting error
+    'peak_lateral_mm',
 ]
+
+BEAM_METRICS = [
+    'skull_thickness_mm',
+    'path_length_mm',
+    'peak_axial_offset_mm',
+    'peak_lateral_mm',
+    'fwhm_axial_mm',
+    'fwhm_lat_mean_mm',
+    'elongation',
+    'prefocal_ratio',
+    'prefocal_brain_peak',
+    'prefocal_brain_pos_mm',
+    'Isppa_global',
+    'Isppa_brain',
+    'dT_peak',
+    'max_MI',
+]
+
+TARGET_NAME_MAP = {
+    'thalamus': 'Left_Thalamus',
+    'ventricle': 'Left_Lateral_Ventricle',
+}
 
 # Neural features to highlight in the Key Thesis Figure (Comp3 × OnTarget)
 # These are the stems — e.g. 'spindle_rate_per_burst' maps to
@@ -188,6 +219,28 @@ def _sig_stars(p: float) -> str:
 def _already_exists(path: Path) -> bool:
     return path.exists()
 
+def _best_row(df, target_name, tier='Tier2_Nuclei'):
+    """Select the best sonication row for a given target from a v4 CSV."""
+    sub = df[
+        (df['ReportingTier'] == tier) &
+        (df['TargetName'].str.lower().str.contains(target_name.lower(), na=False))
+    ]
+    if sub.empty:
+        return None
+    # Best = highest on-target coverage (same logic as before)
+    coverage_col = 'OnTarget_6dB_pct' if 'OnTarget_6dB_pct' in sub.columns else sub.columns[0]
+    return sub.sort_values(coverage_col, ascending=False).iloc[0]
+
+def _spillover_row(df, spillover_name, tier='Tier2_Nuclei'):
+    """Select the spillover row — structure the beam crosses on the way in."""
+    sub = df[
+        (df['ReportingTier'] == tier) &
+        (df['TargetName'].str.lower().str.contains(spillover_name.lower(), na=False)) &
+        (df['BeamZone'].isin(['pre-focal', 'at focus']))
+    ]
+    if sub.empty:
+        return None
+    return sub.sort_values('Isppa_Target_Wcm2', ascending=False).iloc[0]
 
 # =============================================================================
 # STEP 1 — Build response profile
@@ -385,82 +438,164 @@ def run_response_statistics(profile_df: pd.DataFrame,
 def load_and_link_acoustic(profile_df: pd.DataFrame,
                            results_root: str,
                            output_dir: str) -> pd.DataFrame:
-    """
-    Collect Level 1 enriched acoustic CSVs from participant sub-folders and
-    pivot them wide (one column per target × dose metric), then join to the
-    response profile on participant_id.
 
-    The enriched CSV already has participant_id (added by Level 1's
-    build_acoustic_report()).  If multiple sonication rows exist for one
-    session, the row with the highest OnTarget_6dB_percent is selected —
-    this corresponds to the sonication you actually used clinically.
-
-    Saves: dose_response_linked.csv
-    """
     print('\n[Step 3] Loading & linking acoustic dose data …')
 
-    targets       = ['thalamus', 'ventricle']
-    acoustic_rows = []
-    root_path     = Path(results_root)
-
+    targets         = ['thalamus', 'ventricle']
+    acoustic_rows   = []   # per-region rows (one row per region per sonication)
+    summary_rows    = []   # sonication-level rows (one row per sonication)
+    root_path       = Path(results_root)
     pids_in_profile = set(profile_df['participant_id'].astype(str).tolist())
 
-    for pid_dir in sorted(root_path.iterdir()):
-        if not pid_dir.is_dir():
-            continue
-        pid = str(pid_dir.name)
-        for target in targets:
-            csv_path = pid_dir / f'{pid}_{target}_acoustic_report_enriched.csv'
-            if not csv_path.exists():
+    # ── 1. Load both CSV types for each participant × target ──────────────────
+    for target in targets:
+        for csv_path in sorted(root_path.glob(f'*_{target}_analysis.csv')):
+            pid = csv_path.stem.replace(f'_{target}_analysis', '')
+            if pid not in pids_in_profile:
                 continue
+
+            # ── Per-region CSV (has OnTarget_6dB_pct, Coverage_*, MI, etc.) ──
             df_a = pd.read_csv(csv_path)
-            # Select best-coverage sonication if multiple rows
-            if len(df_a) > 1 and 'OnTarget_6dB_percent' in df_a.columns:
+
+            # Keep only Tier2 nucleus rows — that's where on-target dose lives.
+            # Tier1 tissue rows and Tier3 atlas rows would pollute the selection.
+            if 'ReportingTier' in df_a.columns:
+                df_a = df_a[df_a['ReportingTier'] == 'Tier2_Nuclei'].copy()
+
+            # Within Tier2, keep only the row whose TargetName matches this target
+            # (e.g. thalamus session → the Left_Thalamus or Right_Thalamus row)
+            if 'TargetName' in df_a.columns:
+                exact_name = TARGET_NAME_MAP.get(target)
+                df_a_exact = df_a[df_a['TargetName'] == exact_name].copy()
+
+                # If exact match finds nothing (naming inconsistency across
+                # participants), warn and fall back to substring so you don't
+                # silently drop the participant entirely
+                if df_a_exact.empty:
+                    print(f'    [WARN] {pid} / {target}: exact TargetName '
+                          f'"{exact_name}" not found — '
+                          f'available: {df_a["TargetName"].unique().tolist()} '
+                          f'— falling back to substring match')
+                    df_a_exact = df_a[
+                        df_a['TargetName'].str.lower().str.contains(
+                            target[:4], na=False)
+                    ].copy()
+
+                df_a = df_a_exact
+
+            # If multiple sonications remain, take the best-coverage one —
+            # that's the placement you actually used clinically
+            if len(df_a) > 1 and 'OnTarget_6dB_pct' in df_a.columns:
                 df_a = (df_a
-                        .sort_values('OnTarget_6dB_percent', ascending=False)
+                        .sort_values('OnTarget_6dB_pct', ascending=False)
                         .head(1)
                         .reset_index(drop=True))
+
+            df_a['_target'] = target   # tag so we know which session this came from
             acoustic_rows.append(df_a)
+
+            # ── Sonication summary CSV (has skull_mm, FWHM, prefocal_ratio, etc.) ──
+            # Named: {pid}_{target}_sonication_summary.csv
+            # This is the file you add to v4's write_sonication_summary()
+            summary_path = root_path / f'{pid}_{target}_sonication_summary.csv'
+            if summary_path.exists():
+                df_s = pd.read_csv(summary_path)
+
+                # Same logic: best sonication = highest coverage
+                if len(df_s) > 1 and 'coverage_6dB_pct' in df_s.columns:
+                    df_s = (df_s
+                            .sort_values('coverage_6dB_pct', ascending=False)
+                            .head(1)
+                            .reset_index(drop=True))
+
+                df_s['_target'] = target
+                summary_rows.append(df_s)
+            else:
+                print(f'    [WARN] No sonication summary for {pid} / {target} '
+                      f'— beam metrics will be missing for this session')
 
     if not acoustic_rows:
         print('    [WARN] No acoustic CSVs found — dose–response steps will be skipped.')
-        print(f'    Expected pattern: {results_root}/{{pid}}/{{pid}}_{{target}}_acoustic_report_enriched.csv')
+        print(f'    Expected pattern: {results_root}/{{pid}}_{{target}}_analysis.csv')
         return profile_df.copy()
 
+    # ── 2. Stack and check coverage ───────────────────────────────────────────
     acoustic_df = pd.concat(acoustic_rows, ignore_index=True)
-    print(f'    Found {len(acoustic_df)} acoustic session rows '
+    print(f'    Per-region rows loaded: {len(acoustic_df)} '
           f'({acoustic_df["participant_id"].nunique()} participants)')
 
-    # Check overlap
+    has_summary = bool(summary_rows)
+    if has_summary:
+        summary_df = pd.concat(summary_rows, ignore_index=True)
+        print(f'    Sonication summary rows loaded: {len(summary_df)}')
+    else:
+        summary_df = pd.DataFrame()
+        print('    [WARN] No sonication summary CSVs found — '
+              'FWHM / skull / prefocal columns will be absent from linked table')
+
     acoustic_pids = set(acoustic_df['participant_id'].astype(str).tolist())
     missing_acoustic = pids_in_profile - acoustic_pids
     if missing_acoustic:
         print(f'    [WARN] No acoustic data for: {sorted(missing_acoustic)}')
 
-    # Pivot acoustic wide: thalamus_OnTarget_6dB_percent, ventricle_OnTarget_6dB_percent, …
+    # ── 3. Check which dose columns are actually present ──────────────────────
     available_dose = [c for c in DOSE_METRICS if c in acoustic_df.columns]
     missing_dose   = set(DOSE_METRICS) - set(available_dose)
     if missing_dose:
-        print(f'    [WARN] Dose metric columns not found in acoustic CSV: {missing_dose}')
+        print(f'    [WARN] Dose metric columns not found in per-region CSV: {missing_dose}')
 
+    available_beam = ([c for c in BEAM_METRICS if c in summary_df.columns]
+                      if has_summary else [])
+    missing_beam = set(BEAM_METRICS) - set(available_beam)
+    if missing_beam and has_summary:
+        print(f'    [WARN] Beam metric columns not found in summary CSV: {missing_beam}')
+
+    # ── 4. Pivot both wide — one column per target × metric ──────────────────
+    # Both acoustic_df and summary_df are pivoted with the same pattern:
+    #   thalamus_OnTarget_6dB_pct, ventricle_OnTarget_6dB_pct
+    #   thalamus_skull_thickness_mm, ventricle_skull_thickness_mm  ← beam metrics
     pivot_rows = []
-    for pid, grp in acoustic_df.groupby('participant_id'):
+
+    all_pids = acoustic_df['participant_id'].unique()
+    for pid in all_pids:
         row = {'participant_id': str(pid)}
-        for _, sess in grp.iterrows():
-            tgt = str(sess.get('target', '')).lower()
+
+        # Per-region dose metrics
+        pid_acoustic = acoustic_df[acoustic_df['participant_id'] == pid]
+        for _, sess in pid_acoustic.iterrows():
+            tgt = str(sess.get('_target', '')).lower()
             if tgt not in targets:
                 continue
             for col in available_dose:
                 row[f'{tgt}_{col}'] = pd.to_numeric(sess.get(col), errors='coerce')
+
+        # Beam metrics from sonication summary
+        # These go in the SAME row dict — just different source dataframe
+        if has_summary:
+            pid_summary = summary_df[summary_df['participant_id'] == pid]
+            for _, sess in pid_summary.iterrows():
+                tgt = str(sess.get('_target', '')).lower()
+                if tgt not in targets:
+                    continue
+                for col in available_beam:
+                    row[f'{tgt}_{col}'] = pd.to_numeric(sess.get(col), errors='coerce')
+
         pivot_rows.append(row)
 
+    # ── 5. Merge everything onto the response profile ─────────────────────────
     acoustic_wide = pd.DataFrame(pivot_rows)
-
     linked = profile_df.merge(acoustic_wide, on='participant_id', how='left')
-    n_with_dose = linked[[f'thalamus_{c}' for c in available_dose
-                           if f'thalamus_{c}' in linked.columns]].notna().any(axis=1).sum()
+
+    n_with_dose = linked[
+        [f'thalamus_{c}' for c in available_dose if f'thalamus_{c}' in linked.columns]
+    ].notna().any(axis=1).sum()
+    n_with_beam = (linked[
+        [f'thalamus_{c}' for c in available_beam if f'thalamus_{c}' in linked.columns]
+    ].notna().any(axis=1).sum() if available_beam else 0)
+
     print(f'    Linked table: {len(linked)} participants '
-          f'| {n_with_dose} with acoustic dose data')
+          f'| {n_with_dose} with dose data '
+          f'| {n_with_beam} with beam metrics')
 
     out_path = Path(output_dir) / 'dose_response_linked.csv'
     linked.to_csv(out_path, index=False)
@@ -489,7 +624,7 @@ def run_dose_response_correlations(linked: pd.DataFrame,
     FDR correction within each comparison family, matching Step 2.
     Saves: dose_response_correlations.csv
     """
-    from statsmodels.stats.multitest import multipletests
+   
 
     # Check if any dose columns exist at all
     dose_cols_present = [c for c in linked.columns
@@ -810,7 +945,7 @@ def plot_all(profile_df: pd.DataFrame,
 
     # Fig A — Dose profile per participant
     print('    [Fig A] Dose profile per participant …')
-    primary_dose = 'OnTarget_6dB_percent'
+    primary_dose = 'OnTarget_6dB_pct'
     thal_d_col   = f'thalamus_{primary_dose}'
     vent_d_col   = f'ventricle_{primary_dose}'
 
@@ -1113,7 +1248,7 @@ def print_summary(stats_df: pd.DataFrame, corr_df: pd.DataFrame) -> None:
         print('\n  KEY THESIS: OnTarget_6dB_percent × Comp3_TargetSpecificity')
         key_sub = corr_df[
             (corr_df['comparison'] == 'Comp3_TargetSpecificity') &
-            (corr_df['dose_metric'] == 'OnTarget_6dB_percent')
+            (corr_df['dose_metric'] == 'OnTarget_6dB_pct')
         ].sort_values('pearson_r', key=abs, ascending=False)
         for _, r in key_sub.head(5).iterrows():
             print(f'    {_short(r["neural_feature"]):<30s}  '
