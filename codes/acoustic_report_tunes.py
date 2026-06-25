@@ -13,13 +13,13 @@ Inputs:
     - kPlan RESULTS.h5 file
     - SimNIBS segmentation (final_tissues.nii / .nii.gz)
     - Participant nuclei masks folder (one .nii.gz per nucleus)
-    - Harvard-Oxford cortical + subcortical atlases (via nilearn)
+    - Individualized cortical + subcortical atlases 
     - T1 MRI (optional, for visualization)
 
 Reporting tiers (all in one CSV):
     Tier 1 — Tissue safety   : skull, scalp, eyes (MI flagged), brain (SimNIBS)
     Tier 2 — Nuclei targets  : all masks in TARGET_MASK_FOLDER
-    Tier 3 — Brain regions   : Harvard-Oxford cortical + subcortical regions
+    Tier 3 — Brain regions   : Individualized cortical and subcortical regions
 
 Focal zone definition:
     - Intensity field (W/cm²) computed from pressure
@@ -45,7 +45,6 @@ import numpy as np
 import pandas as pd
 import nibabel as nib
 from nilearn.image import resample_img
-from nilearn import datasets as nilearn_datasets
 import matplotlib
 #matplotlib.use("Agg")                   # non-interactive backend
 import matplotlib.pyplot as plt
@@ -65,7 +64,7 @@ SIMNIBS_PATH        = "/content/drive/MyDrive/TUNES/final_tissues.nii.gz"
 T1_PATH             = "/content/drive/MyDrive/TUNES/T1.nii.gz"
 TARGET_MASK_FOLDER  = "/content/drive/MyDrive/TUNES/participant_nuclei"
 OUTPUT_DIR          = "/content/drive/MyDrive/TUNES/results/150"
-
+INDIVIDUALIZED_CORTICAL_SUBCORTICAL_MASKS = "/content/drive/MyDrive/TUNES/ho_masks"
 # SimNIBS tissue label definitions
 
 TISSUE_GROUPS = {
@@ -88,10 +87,6 @@ INTENDED_TARGET = 'thalamus'
 
 # Acoustic impedance of tissue (Pa·s/m) — standard value used in kPlan
 RHO_C = 1.5e6
-
-# Atlas toggle
-USE_HARVARD_OXFORD = True
-
 
 # ════════════════════════════════════════════════════════════════════════════════
 # build_affine
@@ -386,99 +381,9 @@ def make_tissue_masks(seg_path, affine_sim, grid_shape):
     return tissue_masks
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# FUNCTION 4: load_harvard_oxford_atlas
-# ════════════════════════════════════════════════════════════════════════════════
-
-def load_harvard_oxford_atlas(affine_sim, grid_shape, simnibs_path=None, t1_path=None):
-    """
-    Load Harvard-Oxford atlases, resampling first to a native-space reference
-    (SimNIBS seg or T1), then into simulation grid space.
-
-    Direct atlas → sim-grid resampling fails because the kPlan grid affine
-    describes a small local volume that doesn't overlap MNI bounding boxes.
-    """
-    print("  [atlas] Loading Harvard-Oxford atlases via nilearn...")
-    atlas_cort = nilearn_datasets.fetch_atlas_harvard_oxford("cort-maxprob-thr25-1mm")
-    atlas_sub  = nilearn_datasets.fetch_atlas_harvard_oxford("sub-maxprob-thr25-1mm")
-
-    # Build a native-space reference image to bridge MNI → native → sim-grid
-    # Use SimNIBS seg if available, otherwise T1, otherwise skip bridging
-    ref_img = None
-    if simnibs_path and os.path.exists(simnibs_path):
-        ref_img = nib.load(simnibs_path)
-        print("  [atlas] Using SimNIBS seg as native reference for atlas resampling.")
-    elif t1_path and os.path.exists(t1_path):
-        ref_img = nib.load(t1_path)
-        print("  [atlas] Using T1 as native reference for atlas resampling.")
-    else:
-        print("  [atlas] WARNING: No native reference found. Atlas resampling may fail.")
-
-    atlas_masks = {}
-
-    def extract(atlas_obj, prefix):
-        atlas_img  = atlas_obj.maps
-        atlas_data = np.round(atlas_img.get_fdata()).astype(np.int16)
-        labels     = atlas_obj.labels
-
-        for idx, name in enumerate(labels):
-            if not name or name.strip().lower() == "background":
-                continue
-
-            region_data = (atlas_data == idx).astype(np.uint8)
-            if region_data.sum() == 0:
-                continue
-
-            region_img_mni = nib.Nifti1Image(region_data, atlas_img.affine)
-
-            # Step 1: MNI → native space (SimNIBS/T1)
-            if ref_img is not None:
-                try:
-                    region_native = resample_img(
-                        region_img_mni,
-                        target_affine=ref_img.affine,
-                        target_shape=ref_img.shape[:3],
-                        interpolation="nearest",
-                    )
-                except Exception:
-                    continue  # region genuinely outside native FOV
-            else:
-                region_native = region_img_mni  # hope for the best
-
-            # Step 2: native → simulation grid
-            try:
-                resampled = resample_img(
-                    region_native,
-                    target_affine=affine_sim,
-                    target_shape=grid_shape,
-                    interpolation="nearest",
-                )
-            except Exception:
-                continue  # sim grid doesn't overlap this region
-
-            resampled_data = match_shape(
-                np.squeeze(resampled.get_fdata()).astype(np.uint8),
-                grid_shape,
-            )
-
-            if resampled_data.sum() == 0:
-                continue  # region outside sim grid after resampling
-
-            clean = (name.replace(",", "").replace("(", "")
-                        .replace(")", "").replace("/", "_"))
-            clean = "_".join(clean.split())
-            atlas_masks[f"{prefix}{clean}"] = resampled_data
-
-        n = sum(1 for k in atlas_masks if k.startswith(prefix))
-        print(f"  [atlas] {prefix.rstrip('_')}: {n} regions loaded")
-
-    extract(atlas_cort, "HO_Cort_")
-    extract(atlas_sub,  "HO_Sub_")
-    return atlas_masks
-
 
 # ════════════════════════════════════════════════════════════════════════════════
-# FUNCTION 5: make_row  — unified metrics for any binary region mask
+# FUNCTION 4: make_row  — unified metrics for any binary region mask
 # ════════════════════════════════════════════════════════════════════════════════
 
 def make_row(
@@ -722,7 +627,7 @@ def make_row(
     }
 
 # ════════════════════════════════════════════════════════════════════════════════
-# FUNCTION 6: visualize_fus
+# FUNCTION 5: visualize_fus
 # ════════════════════════════════════════════════════════════════════════════════
 
 def get_background(t1_path, affine_sim, grid_shape, pressure_pa):
@@ -1099,7 +1004,7 @@ def panel_C_MI_safety(sonication_index,df_results,output_dir):
     tier_colors = {
         "Tier1_Tissue":            "#5588bb",
         "Tier2_ParticipantNuclei": "#55bb88",
-        "Tier3_HarvardOxford":     "#bb8855",
+        "Tier3_cortical_subcortical_atlas":     "#bb8855",
     }
     bar_colors = []
     for _, row in df_son.iterrows():
@@ -1371,7 +1276,7 @@ def visualize_fus(
     print(f"[visualize_fus] Done.")
 
 # ════════════════════════════════════════════════════════════════════════════════
-# FUNCTION 7: run_pipeline
+# FUNCTION 6: run_pipeline
 # ════════════════════════════════════════════════════════════════════════════════
 
 def run_pipeline():
@@ -1420,10 +1325,23 @@ def run_pipeline():
         # Load atlas once per H5 (resampling is slow)
         # We need grid info first, so load from sonication 1
         _, affine_sim_ref, grid_shape_ref, _ = load_pressure(h5_path, 1)
+       # Using individualized cortical and subcortical masks
         atlas_masks = {}
-        if USE_HARVARD_OXFORD:
-            atlas_masks = load_harvard_oxford_atlas(affine_sim_ref, grid_shape_ref,simnibs_path=SIMNIBS_PATH, t1_path=T1_PATH)
-
+        atlas_paths = sorted(glob.glob(os.path.join(INDIVIDUALIZED_CORTICAL_SUBCORTICAL_MASKS, "*.nii.gz")) +
+                        glob.glob(os.path.join(INDIVIDUALIZED_CORTICAL_SUBCORTICAL_MASKS, "*.nii")))
+        for p in atlas_paths:
+            mname = os.path.basename(p).replace(".nii.gz", "").replace(".nii", "")
+            img = nib.load(p)
+            res = resample_img(
+                img,
+                target_affine=affine_sim_ref,
+                target_shape=grid_shape_ref,
+                interpolation="nearest",
+            ).get_fdata()
+            m = match_shape((np.squeeze(res) > 0).astype(np.uint8), grid_shape_ref)
+            if m.sum() > 0:
+                atlas_masks[mname] = m
+        print(f"  [Atlas] {len(atlas_masks)} individualized regions loaded")
         # Loop over sonications
         for son_i in range(1, n_sonications + 1):
             print(f"\n  --- Sonication {son_i}/{n_sonications} ---")
@@ -1529,16 +1447,16 @@ def run_pipeline():
                     all_rows.append(row)
             print("done")
 
-            # Harvard-Oxford regions
-            if USE_HARVARD_OXFORD and atlas_masks:
-                print(f"     Tier 3: Harvard-Oxford ({len(atlas_masks)} regions)...",
+            # Individualized cortical and subcortical regions
+            if atlas_masks:
+                print(f"     Tier 3: Individualized cortical and subcortical masks({len(atlas_masks)} regions)...",
                       end=" ", flush=True)
                 for rname, rmask in atlas_masks.items():
                     row = make_row(
                         region_mask = rmask,
                         target_name = rname,
-                        target_path = f"HarvardOxford/{rname}",
-                        tier_label  = "Tier3_HarvardOxford",
+                        target_path = f"IndividualizedAtlas/{rname}",
+                        tier_label  = "Tier3_cortical_subcortical_atlas",
                         **row_kwargs,
                     )
                     if row:
