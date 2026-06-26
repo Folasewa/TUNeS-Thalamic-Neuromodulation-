@@ -53,13 +53,13 @@ mne.set_log_level('WARNING')
 # =============================================================================
 # Settings — edit these paths
 # =============================================================================
-PREPROCESSED_DIR = '/Users/folasewaabdulsalam/Downloads/TUNES/preprocessed'
+PREPROCESSED_DIR = '/home/e_fabdulsa/Desktop/TUNeS_sharbie/preprocessed'
 # MARKERS_ROOT is the ONLY path to raw data still needed in analysis.py.
 # It is used solely to locate the .vmrk marker files for TUS burst/pulse
 # timing.  No .vhdr or EEG signal data are ever loaded from here.
-MARKERS_ROOT     = '/Users/folasewaabdulsalam/Downloads/TUNES/subjects'
-OUTPUT_DIR       = '/Users/folasewaabdulsalam/Downloads/TUNES/results'
-PARTICIPANTS     = ['03', '06', '08']
+MARKERS_ROOT     = '/home/e_fabdulsa/Desktop/TUNeS_sharbie/subjects'
+OUTPUT_DIR       = '/home/e_fabdulsa/Desktop/TUNeS_sharbie/results'
+PARTICIPANTS     = ['02', '03', '06', '08']
 
 RESAMPLE_FREQ  = 500
 STAGING_FREQ   = 100
@@ -1522,7 +1522,7 @@ def _plot_erp_difference(mean_erps_active, mean_erps_sham, channels, times,
         ax.axvline(0,  color='black', lw=0.9, ls='--', alpha=0.7)
         ax.axhline(0,  color='grey',  lw=0.6, ls=':')
         ax.axvspan(-TUS_EPOCH_PRE_SEC, 0, color='grey', alpha=0.06)
-
+        ax.set_xlim(-1.0, TUS_EPOCH_POST_SEC)
         ax.set_ylabel('µV (active − sham)', fontsize=7)
         ax.set_title(ch, fontsize=8)
         ax.tick_params(labelsize=6)
@@ -1717,6 +1717,8 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                             label=f'n={len(clean_trials)}')
                     ax.axvline(0, color='black', lw=0.9, ls='--', alpha=0.7)
                     ax.axhline(0, color='grey',  lw=0.5, ls=':')
+                    ax.axvspan(-ERP_BASELINE_SEC, 0, color='grey', alpha=0.07, label='Baseline' if idx_ch == 0 else '_')
+                    ax.set_xlim(-1.0, TUS_EPOCH_POST_SEC)
                     ax.set_ylabel(ylabel_erp, fontsize=7)
                     ax.tick_params(labelsize=6)
                     rank_pos   = ranked_chs.index(ch) + 1
@@ -1775,9 +1777,9 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                             label=f'Mean (n={len(clean_trials)})')
                     ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7,
                                label='TUS onset')
-                    ax.axvspan(-TUS_EPOCH_PRE_SEC, 0, color='grey', alpha=0.07,
-                               label='Baseline')
+                    ax.axvspan(-ERP_BASELINE_SEC, 0, color='grey', alpha=0.07, label='Baseline')
                     ax.axhline(0, color='grey', lw=0.6, ls=':')
+                    ax.set_xlim(-1.0, TUS_EPOCH_POST_SEC)
                     ax.set_ylabel(ylabel_erp, fontsize=8)
                     rank_pos   = ranked_chs.index(ch) + 1
                     is_best_ch = (ch == best_ch)
@@ -1827,9 +1829,9 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                                     color=color, alpha=0.3)
                     ax.plot(times, mean_erp, color=color, lw=2,
                             label=f'Mean ± SEM  (n={n_tr})' if panel_idx == 0 else f'n={n_tr}')
-                    ax.axvline(0, color='black', lw=1.2, ls='--',
-                               label='TUS onset' if panel_idx == 0 else '_')
+                    ax.axvspan(-ERP_BASELINE_SEC, 0, color='grey', alpha=0.08, label='Baseline' if panel_idx == 0 else '_')
                     ax.axhline(0, color='grey', lw=0.6, ls=':')
+                    ax.set_xlim(-1.0, TUS_EPOCH_POST_SEC)
                     ax.set_ylabel(ylabel_erp, fontsize=9)
                     ax.set_title(
                         f'{ch}  [rank #{panel_idx + 1}  |  n={n_tr} trials]',
