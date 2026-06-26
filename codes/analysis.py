@@ -1024,23 +1024,47 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
     channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
     if not channels:
         return
- 
+    
     sfreq = raw.info['sfreq']
     n_fft = int(sfreq * 4)
     hop   = int(sfreq * 2)
     n_ch  = len(channels)
- 
-    # grid dimensions 
+
+    # grid dimensions
     ncols = 6
     nrows = int(np.ceil(n_ch / ncols))
- 
+
+    # --- compute a single global colour scale across all channels ---
+    print('    Computing global spectrogram scale ...')
+    _all_db = []
+    for ch in channels:
+        _d = raw.get_data(picks=[ch])[0]
+        _, _, _S = scipy_spectrogram(_d, fs=sfreq, nperseg=n_fft,
+                                     noverlap=n_fft - hop, scaling='density')
+        _fm = _ <= 30.0   # _ is freqs here; reuse variable to avoid shadowing
+        _, _, _S = scipy_spectrogram(_d, fs=sfreq, nperseg=n_fft,
+                                     noverlap=n_fft - hop, scaling='density')
+        _freqs_tmp, _, _S = scipy_spectrogram(_d, fs=sfreq, nperseg=n_fft,
+                                              noverlap=n_fft - hop, scaling='density')
+        _fm = _freqs_tmp <= 30.0
+        _db = 10 * np.log10(_S[_fm] + 1e-30)
+        _all_db.append(_db.ravel())
+        del _d, _S, _db
+    _all_db_flat = np.concatenate(_all_db)
+    global_vmin  = float(np.percentile(_all_db_flat, 5))
+    global_vmax  = float(np.percentile(_all_db_flat, 98))
+    del _all_db, _all_db_flat
+    gc.collect()
+    print(f'    Global scale: {global_vmin:.1f} – {global_vmax:.1f} dB/Hz')
+
     fig, axes = plt.subplots(
         nrows, ncols,
         figsize=(ncols * 4.5, nrows * 2.8),
         sharex=True, sharey=True,
     )
     axes_flat = np.array(axes).ravel()
- 
+
+    last_pcm = None
     for idx, ch in enumerate(channels):
         ax   = axes_flat[idx]
         data = raw.get_data(picks=[ch])[0]
@@ -1052,12 +1076,12 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
         pcm = ax.pcolormesh(
             times / 60, freqs[fmask], Sxx_db,
             cmap='inferno', shading='gouraud',
-            vmin=np.percentile(Sxx_db, 5),
-            vmax=np.percentile(Sxx_db, 98),
+            vmin=global_vmin, vmax=global_vmax,
         )
+        last_pcm = pcm
         del data, Sxx, Sxx_db
         gc.collect()
- 
+
         if hypno_int is not None:
             for ei, stage in enumerate(hypno_int):
                 if stage in NREM_STAGES:
@@ -1076,15 +1100,13 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
         if idx >= ncols * (nrows - 1):
             ax.set_xlabel('Time (min)', fontsize=7)
  
-        # One shared colorbar per row (rightmost visible panel in each row)
-        row_i   = idx // ncols
-        row_end = min((row_i + 1) * ncols, n_ch) - 1
-        if idx == row_end:
-            fig.colorbar(pcm, ax=ax, label='dB/Hz', pad=0.02, fraction=0.046)
- 
     # Hide unused axes
     for idx in range(n_ch, nrows * ncols):
         axes_flat[idx].set_visible(False)
+    # One shared colorbar for the whole figure
+    if last_pcm is not None:
+        fig.colorbar(last_pcm, ax=axes_flat[:n_ch].tolist(),
+                     label='dB/Hz', shrink=0.6, pad=0.01)
  
     fig.suptitle(
         f'{participant_id} – {session_name}: spectrogram  [cyan = NREM]',
@@ -1278,25 +1300,35 @@ def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
         return
 
     vals = np.array([mean_amp_by_channel.get(ch, np.nan) for ch in ch_names_topo])
-    if np.all(np.isnan(vals)):
+    valid_mask = ~np.isnan(vals)
+    if not valid_mask.any():
         return
+
+    vals_valid   = vals[valid_mask]
+    chs_valid    = [ch for ch, ok in zip(ch_names_topo, valid_mask) if ok]
+    info_valid   = mne.create_info(chs_valid, sfreq=info_topo['sfreq'], ch_types='eeg')
+    montage      = mne.channels.make_standard_montage('standard_1020')
+    info_valid.set_montage(montage, on_missing='ignore')
+
+    vlim_val = np.nanpercentile(np.abs(vals_valid), 95)
+    vlim_val = vlim_val if vlim_val > 0 else 1.0
+
     fig, ax = plt.subplots(figsize=(5, 4))
-    mne.viz.plot_topomap(
-        np.nan_to_num(vals), info_topo,
+    im, _ = mne.viz.plot_topomap(
+        vals_valid, info_valid,
         axes=ax, show=False, cmap='RdBu_r',
-        vlim=(-np.nanpercentile(np.abs(vals), 95),
-               np.nanpercentile(np.abs(vals), 95)),
+        vlim=(-vlim_val, vlim_val),
     )
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='RMS µV (post-stimulus)')
     ax.set_title(
-        f'{condition}  |  ERP peak |amplitude| (0–1 s)\n'
-        f'baseline: {baseline_name}',
+        f'{condition}  |  ERP post-stimulus RMS (0–{TUS_EPOCH_POST_SEC:.0f} s)\n'
+        f'baseline: {baseline_name}  |  n={valid_mask.sum()} channels',
         fontsize=9
     )
     fig.tight_layout()
     fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'      Saved ERP topomap: {fname}')
-
 
 def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_dir, suffix=''):
 
@@ -1522,7 +1554,6 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 f'{participant_id}_{session_name}_{suffix}_'
                 f'ERP_{group_label}_{baseline_name}_top3.png'
             )
-
             if not _already_done(output_dir, fname_top3):
                 fig3, axes3 = plt.subplots(
                     3, 1,
@@ -1531,40 +1562,59 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 )
 
                 for panel_idx, ch in enumerate(top3_chs):
-                    ax = axes3[panel_idx]
+                    ax          = axes3[panel_idx]
                     ch_idx_list = channels.index(ch)
                     clean_trials = clean_trials_by_channel[ch_idx_list]
-                    mean_erp = mean_erps[ch_idx_list]
+                    mean_erp    = mean_erps[ch_idx_list]
+                    n_tr        = len(clean_trials)
 
                     sem_erp = (
-                        clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
-                        if len(clean_trials) > 1
+                        clean_trials.std(axis=0) / np.sqrt(n_tr)
+                        if n_tr > 1
                         else np.zeros(n_samples)
                     )
 
                     for trial in clean_trials:
-                        ax.plot(times, trial, color=color, alpha=0.12, lw=0.5)
+                        ax.plot(times, trial, color=color, alpha=0.10, lw=0.4)
 
+                    ax.axvspan(-TUS_EPOCH_PRE_SEC, 0,
+                               color='grey', alpha=0.08, label='Baseline' if panel_idx == 0 else '_')
                     ax.fill_between(
                         times,
                         mean_erp - sem_erp,
                         mean_erp + sem_erp,
-                        color=color,
-                        alpha=0.3
+                        color=color, alpha=0.3
                     )
+                    ax.plot(times, mean_erp, color=color, lw=2,
+                            label=f'Mean ± SEM  (n={n_tr})' if panel_idx == 0 else f'n={n_tr}')
+                    ax.axvline(0, color='black', lw=1.2, ls='--',
+                               label='TUS onset' if panel_idx == 0 else '_')
+                    ax.axhline(0, color='grey', lw=0.6, ls=':')
+                    ax.set_ylabel(ylabel_erp, fontsize=9)
+                    ax.set_title(
+                        f'{ch}  [rank #{panel_idx + 1}  |  n={n_tr} trials]',
+                        fontsize=10,
+                        fontweight='bold' if panel_idx == 0 else 'normal',
+                        color='#C0392B' if panel_idx == 0 else 'black',
+                    )
+                    ax.tick_params(labelsize=8)
+                    ax.spines['top'].set_visible(False)
+                    ax.spines['right'].set_visible(False)
+                    if panel_idx == 0:
+                        ax.legend(fontsize=8, loc='upper right')
 
-                    ax.plot(times, mean_erp, color=color, lw=2)
-                    ax.axvline(0, color='black', ls='--')
-                    ax.axhline(0, color='grey', ls=':')
-                    ax.set_title(f'{ch} (rank #{panel_idx+1})')
-
-                axes3[-1].set_xlabel('Time (s)')
-                fig3.tight_layout()
-                fig3.savefig(Path(output_dir) / fname_top3, dpi=150)
+                axes3[-1].set_xlabel('Time (s)', fontsize=9)
+                fig3.suptitle(
+                    f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
+                    f'[{freq_band[0]}–{freq_band[1]} Hz]  |  baseline: {baseline_name}\n'
+                    f'Top 3 channels by post-stimulus RMS',
+                    fontsize=11, fontweight='bold'
+                )
+                fig3.tight_layout(rect=[0, 0, 1, 0.95])
+                fig3.savefig(Path(output_dir) / fname_top3, dpi=150, bbox_inches='tight')
                 plt.close(fig3)
-
                 print(f'      Saved ERP top-3 figure: {fname_top3}')
- 
+
             # Figure 3: habituation for ALL channels 
             _habituation_plot_all_channels(
                 all_epochs=all_epochs,
@@ -1660,15 +1710,16 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
             ch_idx = raw.ch_names.index(ch)
             epochs = []
             for _, burst in group_df.iterrows():
-                # ── FIX: was burst['time_sec'] — now correctly burst['burst_time_s']
                 center = int(burst['burst_time_s'] * sfreq)
                 start, stop = center - pre_samples, center + post_samples
                 if start < 0 or stop > raw.n_times:
                     continue
-                epochs.append(raw.get_data(start=start, stop=stop)[ch_idx] * 1e6)
+                trial_uv = raw.get_data(start=start, stop=stop)[ch_idx] * 1e6
+                if np.ptp(trial_uv) > TRIAL_NOISE_THRESHOLD_UV:
+                    continue
+                epochs.append(trial_uv)
             if len(epochs) >= 2:
                 raw_power[(ch, group_label)] = morlet_tfr(np.array(epochs))
-
     for bl_name, (bl_start, bl_end) in TFR_BASELINES.items():
         print(f'\n    TFR baseline: {bl_name}  ({bl_start:.2f} to {bl_end:.2f} s)')
         band_power_rows = []
@@ -1807,25 +1858,36 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
                         topo_vals[ch] = float(
                             p3d[:, freq_mask, :][:, :, hab_start_idx:hab_end_idx].mean()
                         )
-                    vals_arr = np.array([topo_vals.get(ch, np.nan) for ch in topo_chs])
-                    if np.all(np.isnan(vals_arr)):
+                    vals_arr   = np.array([topo_vals.get(ch, np.nan) for ch in topo_chs])
+                    valid_mask = ~np.isnan(vals_arr)
+                    if not valid_mask.any():
                         continue
+
+                    vals_valid = vals_arr[valid_mask]
+                    chs_valid  = [ch for ch, ok in zip(topo_chs, valid_mask) if ok]
+                    info_valid = mne.create_info(chs_valid, sfreq=info_topo['sfreq'], ch_types='eeg')
+                    montage_t  = mne.channels.make_standard_montage('standard_1020')
+                    info_valid.set_montage(montage_t, on_missing='ignore')
+
+                    vlim_tfr = np.nanpercentile(np.abs(vals_valid), 95)
+                    vlim_tfr = vlim_tfr if vlim_tfr > 0 else 1.0
+
                     fig, ax = plt.subplots(figsize=(5, 4))
-                    mne.viz.plot_topomap(
-                        np.nan_to_num(vals_arr), info_topo,
+                    im, _ = mne.viz.plot_topomap(
+                        vals_valid, info_valid,
                         axes=ax, show=False, cmap='RdBu_r',
-                        vlim=(-np.nanpercentile(np.abs(vals_arr), 95),
-                               np.nanpercentile(np.abs(vals_arr), 95)),
+                        vlim=(-vlim_tfr, vlim_tfr),
                     )
+                    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='dB (re: baseline)')
                     ax.set_title(
-                        f'{group_label}  |  {band_name}  power (0–1 s)\n'
-                        f'baseline: {bl_name}', fontsize=9
+                        f'{group_label}  |  {band_name}  power (0–{HABITUATION_WINDOW_SEC[1]:.0f} s)\n'
+                        f'baseline: {bl_name}  |  n={valid_mask.sum()} channels',
+                        fontsize=9
                     )
                     fig.tight_layout()
                     fig.savefig(Path(output_dir) / fname_topo, dpi=150, bbox_inches='tight')
                     plt.close(fig)
                     print(f'      Saved TFR topomap: {fname_topo}')
-
         if band_power_rows:
             bp_df   = pd.DataFrame(band_power_rows)
             bp_csv  = (Path(output_dir) /
