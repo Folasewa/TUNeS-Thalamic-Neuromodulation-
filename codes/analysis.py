@@ -106,7 +106,7 @@ TUS_EPOCH_PRE_SEC  = 3.0
 TUS_EPOCH_POST_SEC = 5.0
 
 KNOWN_TARGETS = {'adapt', 'thalamus', 'ventricle', 'ventricles'}
-
+EXCLUDE_CHANNELS = {'TP9', 'TP10'}
 
 # =============================================================================
 # Resume helper
@@ -1338,7 +1338,8 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
     bursts_df['burst_time_s'] = pd.to_numeric(bursts_df['burst_time_s'], errors='coerce')
     bursts_df = bursts_df.dropna(subset=['burst_time_s'])
  
-    channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
+    channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)
+            if raw.ch_names[i] not in EXCLUDE_CHANNELS]
     if not channels or bursts_df.empty:
         return None
  
@@ -1656,7 +1657,8 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
 
     bursts_df = bursts_df.dropna(subset=['burst_time_s'])
 
-    channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
+    channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)
+            if raw.ch_names[i] not in EXCLUDE_CHANNELS]
     if not channels or bursts_df.empty:
         return
 
