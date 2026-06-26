@@ -1241,7 +1241,7 @@ def _plot_erp_topo_overlay(
     fig = plt.figure(figsize=(20, 16))
 
     # mini-axes width and height in figure fraction
-    ax_w, ax_h = 0.10, 0.07
+    ax_w, ax_h = 0.05, 0.04
 
     for i, ch in enumerate(valid_chs):
         x_fig = xy_norm[i, 0]
@@ -1550,7 +1550,6 @@ def _plot_erp_difference(mean_erps_active, mean_erps_sham, channels, times,
     plt.close(fig)
     print(f'      Saved ERP difference figure: {fname}')
 
-
 def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_dir, suffix=''):
 
     if 'burst_time_s' not in bursts_df.columns:
@@ -1558,22 +1557,22 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
         return None
     bursts_df['burst_time_s'] = pd.to_numeric(bursts_df['burst_time_s'], errors='coerce')
     bursts_df = bursts_df.dropna(subset=['burst_time_s'])
- 
+
     channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)
             if raw.ch_names[i] not in EXCLUDE_CHANNELS]
     if not channels or bursts_df.empty:
         return None
- 
+
     sfreq        = raw.info['sfreq']
     pre_samples  = int(TUS_EPOCH_PRE_SEC * sfreq)
     post_samples = int(TUS_EPOCH_POST_SEC * sfreq)
     n_samples    = pre_samples + post_samples
     times        = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples)
- 
+
     post_start_idx = pre_samples
     hab_start      = pre_samples + int(HABITUATION_WINDOW_SEC[0] * sfreq)
     hab_end        = pre_samples + int(HABITUATION_WINDOW_SEC[1] * sfreq)
- 
+
     montage   = mne.channels.make_standard_montage('standard_1020')
     known_chs = set(montage.ch_names)
     topo_chs  = [ch for ch in channels if ch in known_chs]
@@ -1581,16 +1580,16 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
     if len(topo_chs) >= 3:
         info_topo = mne.create_info(topo_chs, sfreq=sfreq, ch_types='eeg')
         info_topo.set_montage(montage, on_missing='ignore')
- 
+
     all_epochs     = {ch: {} for ch in channels}
     all_trial_nums = {}
- 
+
     for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
         mask       = bursts_df['condition'].isin(condition_set)
         group_df   = bursts_df[mask].reset_index(drop=True)
         trial_nums = np.arange(1, len(group_df) + 1)
         all_trial_nums[group_label] = trial_nums
- 
+
         for ch in channels:
             ch_idx = raw.ch_names.index(ch)
             trials = []
@@ -1600,22 +1599,22 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 if start < 0 or stop > raw.n_times:
                     trials.append(np.full(n_samples, np.nan))
                     continue
-                trial = raw.get_data(picks=[ch_idx],start=start, stop=stop)[0] * 1e6
+                trial = raw.get_data(picks=[ch_idx], start=start, stop=stop)[0] * 1e6
                 trials.append(trial)
             all_epochs[ch][group_label] = np.array(trials)
- 
+
     focus_channel_by_condition = {}
- 
+
     for baseline_name, baseline_mode in ERP_BASELINES.items():
         print(f'\n    ERP baseline: {baseline_name}')
         mean_erps_by_condition = {}
         peak_amp_by_condition  = {}
- 
+
         for group_label in ('sham', 'active'):
-            mean_erps   = []
+            mean_erps            = []
             clean_trials_by_channel = []
 
-            # ── Step 1: identify bad channels (>30% rejection) ────────────────────
+            # ── Step 1: identify bad channels (>30% rejection) ────────────
             BAD_CHANNEL_REJECTION_RATE = 0.30
             n_trials      = all_epochs[channels[0]][group_label].shape[0]
             good_channels = []
@@ -1635,11 +1634,11 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
 
             if bad_channels:
                 print(f'      [{group_label}] Excluded noisy channels '
-                    f'(>{BAD_CHANNEL_REJECTION_RATE*100:.0f}% trials rejected):')
+                      f'(>{BAD_CHANNEL_REJECTION_RATE*100:.0f}% trials rejected):')
                 for ch, pct in bad_channels:
                     print(f'        {ch}: {pct}% rejected')
             print(f'      [{group_label}] Clean channels for ERP: '
-                f'{len(good_channels)} / {len(channels)}')
+                  f'{len(good_channels)} / {len(channels)}')
 
             if not good_channels:
                 print(f'      [{group_label}] No clean channels — skipping')
@@ -1649,7 +1648,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 mean_erps_by_condition[group_label] = mean_erps
                 continue
 
-            # ── Step 2: build global keep-mask from good channels only ────────────
+            # ── Step 2: build global keep-mask from good channels only ────
             global_keep = np.ones(n_trials, dtype=bool)
 
             for ch in good_channels:
@@ -1663,9 +1662,9 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
 
             n_kept = int(global_keep.sum())
             print(f'      [{group_label}] Global trial mask: {n_kept} / {n_trials} trials kept '
-                f'(across {len(good_channels)} clean channels)')
+                  f'(across {len(good_channels)} clean channels)')
 
-            # ── Step 3: apply uniform mask across all channels ────────────────────
+            # ── Step 3: apply uniform mask across all channels ────────────
             for ch in channels:
                 raw_trials = all_epochs[ch][group_label].copy()
                 corrected  = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
@@ -1678,21 +1677,22 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     clean.mean(axis=0) if (len(clean) and not np.all(np.isnan(clean)))
                     else np.full(n_samples, np.nan)
                 )
+
             mean_erps_by_condition[group_label] = mean_erps
             ranked_chs, scores = _rank_channels_by_erp(mean_erps, channels, post_start_idx)
             if group_label == 'active':
                 focus_channel_by_condition['active'] = ranked_chs[0]
             peak_amp_by_condition[group_label] = {ch: scores[ch] for ch in channels}
- 
+
             print(f'      [{group_label}] Channel ranking (peak |ERP|, 0–end):')
             for rank_i, rc in enumerate(ranked_chs[:5], 1):
                 print(f'        {rank_i}. {rc}  {scores[rc]:.2f} µV')
- 
+
             best_ch    = ranked_chs[0]
             color      = '#4B7BE0' if group_label == 'sham' else '#E04B4B'
             ylabel_erp = 'µV' if baseline_name != 'pre_zscore' else 'z-score'
- 
-            # Figure 1: all channels (3-col grid) 
+
+            # Figure 1: all channels (3-col grid)
             fname_all = (f'{participant_id}_{session_name}_{suffix}_'
                          f'ERP_{group_label}_{baseline_name}_all_channels.png')
             if not _already_done(output_dir, fname_all):
@@ -1704,15 +1704,13 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     sharex=True, squeeze=False,
                 )
                 for idx_ch, ch in enumerate(channels):
-                    r_i, c_i     = divmod(idx_ch, ncols_erp)
-                    ax            = axes_all[r_i][c_i]
-                    ch_idx_list   = channels.index(ch)
+                    r_i, c_i    = divmod(idx_ch, ncols_erp)
+                    ax          = axes_all[r_i][c_i]
+                    ch_idx_list = channels.index(ch)
                     clean_trials = clean_trials_by_channel[ch_idx_list]
                     mean_erp = mean_erps[ch_idx_list]
                     sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
                                 if len(clean_trials) > 1 else np.zeros(n_samples))
-                    #for trial in clean_trials:
-                    #   ax.plot(times, trial, color=color, alpha=0.10, lw=0.5)
                     ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,
                                     color=color, alpha=0.3)
                     ax.plot(times, mean_erp, color=color, lw=1.8,
@@ -1738,7 +1736,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                             ax.set_xlabel('Time (s)', fontsize=7)
                 fig_all.suptitle(
                     f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
-                    f'[baseline: {baseline_name}\n'
+                    f'[baseline: {baseline_name}]\n'
                     f'All channels  |  ★ = highest ERP response ({best_ch})',
                     fontsize=11, fontweight='bold'
                 )
@@ -1746,33 +1744,31 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 fig_all.savefig(Path(output_dir) / fname_all, dpi=150, bbox_inches='tight')
                 plt.close(fig_all)
                 print(f'      Saved ERP (all channels): {fname_all}')
- 
-            # Figure 2: top-10 
+
+            # Figure 2: top-10
             top10_chs   = ranked_chs[:10]
             fname_top10 = (f'{participant_id}_{session_name}_{suffix}_'
                            f'ERP_{group_label}_{baseline_name}_top10.png')
             if not _already_done(output_dir, fname_top10):
                 ncols_top = 2
-                nrows_top = 5          # always 5 rows for exactly 10 channels
+                nrows_top = 5
                 fig10, axes10 = plt.subplots(
                     nrows_top, ncols_top,
-                    figsize=(14, 4 * nrows_top),   # same height-per-panel as before
-                    sharex=True, sharey=False,      # independent y per panel
+                    figsize=(14, 4 * nrows_top),
+                    sharex=True, sharey=False,
                     squeeze=False,
                 )
                 axes10_flat = axes10.ravel()
                 for j in range(len(top10_chs), len(axes10_flat)):
-                        axes10_flat[j].set_visible(False)
- 
+                    axes10_flat[j].set_visible(False)
+
                 for panel_idx, ch in enumerate(top10_chs):
-                    ax           = axes10_flat[panel_idx]
-                    ch_idx_list  = channels.index(ch)
+                    ax          = axes10_flat[panel_idx]
+                    ch_idx_list = channels.index(ch)
                     clean_trials = clean_trials_by_channel[ch_idx_list]
                     mean_erp = mean_erps[ch_idx_list]
-                    sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))  
+                    sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
                                 if len(clean_trials) > 1 else np.zeros(n_samples))
-                    #for trial in clean_trials:
-                    #   ax.plot(times, trial, color=color, alpha=0.12, lw=0.6)
                     ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,
                                     color=color, alpha=0.3)
                     ax.plot(times, mean_erp, color=color, lw=2.0,
@@ -1783,7 +1779,6 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                                label='Baseline')
                     ax.axhline(0, color='grey', lw=0.6, ls=':')
                     ax.set_ylabel(ylabel_erp, fontsize=8)
- 
                     rank_pos   = ranked_chs.index(ch) + 1
                     is_best_ch = (ch == best_ch)
                     ch_title   = (
@@ -1796,14 +1791,12 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                                  color='#C0392B' if is_best_ch else 'black')
                     ax.legend(fontsize=7, loc='upper right')
                     ax.tick_params(labelsize=7)
- 
-                    # x-axis label only on the bottom row
                     if panel_idx >= ncols_top * (nrows_top - 1):
                         ax.set_xlabel('Time (s)', fontsize=8)
- 
+
                 fig10.suptitle(
                     f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
-                    f'[baseline: {baseline_name}\n'
+                    f'[baseline: {baseline_name}]\n'
                     f'Top 10 channels by peak |ERP| response  |  ★ = {best_ch} (highest)',
                     fontsize=11, fontweight='bold'
                 )
@@ -1811,18 +1804,13 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 fig10.savefig(Path(output_dir) / fname_top10, dpi=150, bbox_inches='tight')
                 plt.close(fig10)
                 print(f'      Saved ERP top-10 figure: {fname_top10}')
-                # Figure 2b: top-3
-            top3_chs = ranked_chs[:3]
-            fname_top3 = (
-                f'{participant_id}_{session_name}_{suffix}_'
-                f'ERP_{group_label}_{baseline_name}_top3.png'
-            )
+
+            # Figure 2b: top-3
+            top3_chs   = ranked_chs[:3]
+            fname_top3 = (f'{participant_id}_{session_name}_{suffix}_'
+                          f'ERP_{group_label}_{baseline_name}_top3.png')
             if not _already_done(output_dir, fname_top3):
-                fig3, axes3 = plt.subplots(
-                    3, 1,
-                    figsize=(10, 10),
-                    sharex=True
-                )
+                fig3, axes3 = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
 
                 for panel_idx, ch in enumerate(top3_chs):
                     ax          = axes3[panel_idx]
@@ -1830,24 +1818,13 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     clean_trials = clean_trials_by_channel[ch_idx_list]
                     mean_erp    = mean_erps[ch_idx_list]
                     n_tr        = len(clean_trials)
+                    sem_erp     = (clean_trials.std(axis=0) / np.sqrt(n_tr)
+                                   if n_tr > 1 else np.zeros(n_samples))
 
-                    sem_erp = (
-                        clean_trials.std(axis=0) / np.sqrt(n_tr)
-                        if n_tr > 1
-                        else np.zeros(n_samples)
-                    )
-
-                    #for trial in clean_trials:
-                    #    ax.plot(times, trial, color=color, alpha=0.10, lw=0.4)
-
-                    ax.axvspan(-TUS_EPOCH_PRE_SEC, 0,
-                               color='grey', alpha=0.08, label='Baseline' if panel_idx == 0 else '_')
-                    ax.fill_between(
-                        times,
-                        mean_erp - sem_erp,
-                        mean_erp + sem_erp,
-                        color=color, alpha=0.3
-                    )
+                    ax.axvspan(-TUS_EPOCH_PRE_SEC, 0, color='grey', alpha=0.08,
+                               label='Baseline' if panel_idx == 0 else '_')
+                    ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,
+                                    color=color, alpha=0.3)
                     ax.plot(times, mean_erp, color=color, lw=2,
                             label=f'Mean ± SEM  (n={n_tr})' if panel_idx == 0 else f'n={n_tr}')
                     ax.axvline(0, color='black', lw=1.2, ls='--',
@@ -1869,7 +1846,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 axes3[-1].set_xlabel('Time (s)', fontsize=9)
                 fig3.suptitle(
                     f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
-                    f'[baseline: {baseline_name}\n'
+                    f'[baseline: {baseline_name}]\n'
                     f'Top 3 channels by post-stimulus RMS',
                     fontsize=11, fontweight='bold'
                 )
@@ -1878,7 +1855,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 plt.close(fig3)
                 print(f'      Saved ERP top-3 figure: {fname_top3}')
 
-            # Figure 3: habituation for ALL channels 
+            # Figure 3: habituation for ALL channels
             _habituation_plot_all_channels(
                 all_epochs=all_epochs,
                 channels=channels,
@@ -1895,24 +1872,30 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 kind='ERP',
                 best_channel=best_ch,
             )
- 
+
             if info_topo is not None:
-                _erp_topomap(peak_amp_by_condition[group_label],topo_chs, info_topo,session_name, participant_id, output_dir,suffix, group_label, baseline_name)
-            # Difference wave 
-            # Difference wave + topo overlay — both need active and sham
-            if ('active' in mean_erps_by_condition and 'sham' in mean_erps_by_condition):
-                _plot_erp_difference(
-                    mean_erps_by_condition['active'], mean_erps_by_condition['sham'],
-                    channels, times, pre_samples,
-                    session_name, participant_id, output_dir, suffix, baseline_name,
+                _erp_topomap(
+                    peak_amp_by_condition[group_label], topo_chs, info_topo,
+                    session_name, participant_id, output_dir,
+                    suffix, group_label, baseline_name,
                 )
-                _plot_erp_topo_overlay(
-                    mean_erps_by_condition['active'], mean_erps_by_condition['sham'],
-                    channels, times,
-                    session_name, participant_id, output_dir, suffix, baseline_name,
-                    t_min=-0.5, t_max=2.0,
-                )
-                return focus_channel_by_condition.get('active', channels[0] if channels else None)
+
+        # ── outside group_label loop, inside baseline loop ────────────────
+        if 'active' in mean_erps_by_condition and 'sham' in mean_erps_by_condition:
+            _plot_erp_difference(
+                mean_erps_by_condition['active'], mean_erps_by_condition['sham'],
+                channels, times, pre_samples,
+                session_name, participant_id, output_dir, suffix, baseline_name,
+            )
+            _plot_erp_topo_overlay(
+                mean_erps_by_condition['active'], mean_erps_by_condition['sham'],
+                channels, times,
+                session_name, participant_id, output_dir, suffix, baseline_name,
+                t_min=-0.5, t_max=1.5,
+            )
+
+    # ── outside baseline loop ─────────────────────────────────────────────
+    return focus_channel_by_condition.get('active', channels[0] if channels else None)
 
 
 def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
@@ -1980,16 +1963,20 @@ def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
             continue
         for ch in channels:
             ch_idx = raw.ch_names.index(ch)
-            epochs = []
+            # collect all trials first to compute adaptive threshold
+            all_trials_uv = []
             for _, burst in group_df.iterrows():
                 center = int(burst['burst_time_s'] * sfreq)
                 start, stop = center - pre_samples, center + post_samples
                 if start < 0 or stop > raw.n_times:
                     continue
-                trial_uv = raw.get_data(start=start, stop=stop)[ch_idx] * 1e6
-                if np.ptp(trial_uv) > TRIAL_NOISE_THRESHOLD_UV:
-                    continue
-                epochs.append(trial_uv)
+                all_trials_uv.append(raw.get_data(start=start, stop=stop)[ch_idx] * 1e6)
+            if len(all_trials_uv) < 2:
+                continue
+            # adaptive threshold: mean PTP + k*SD
+            ptps      = np.array([np.ptp(t) for t in all_trials_uv])
+            threshold = ptps.mean() + TRIAL_NOISE_SD_MULTIPLIER * ptps.std()
+            epochs    = [t for t, p in zip(all_trials_uv, ptps) if p <= threshold]
             if len(epochs) >= 2:
                 raw_power[(ch, group_label)] = morlet_tfr(np.array(epochs))
     for bl_name, (bl_start, bl_end) in TFR_BASELINES.items():
