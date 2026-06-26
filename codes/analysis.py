@@ -1360,9 +1360,9 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 if start < 0 or stop > raw.n_times:
                     trials.append(np.full(n_samples, np.nan))
                     continue
-                trial = raw.get_data(start=start, stop=stop)[ch_idx] * 1e6
+                trial = raw.get_data(picks=[ch_idx],start=start, stop=stop)[0] * 1e6
                 try:
-                    trial = bandpass(trial, freq_band[0], freq_band[1], sfreq)
+                    trial = bandpass(trial, 0.1, 30.0, sfreq)
                 except Exception:
                     pass
                 trials.append(trial)
