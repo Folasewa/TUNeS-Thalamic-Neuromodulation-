@@ -1112,7 +1112,7 @@ TFR_BASELINES = {
 }
 
 N_BEST_CHANNELS          = 3
-TRIAL_NOISE_THRESHOLD_UV = 500.0
+TRIAL_NOISE_THRESHOLD_UV = 150.0
 HABITUATION_WINDOW_SEC   = (0.0, 1.0)
 TFR_BANDS = {
     'delta': (0.5, 4.0),
@@ -1148,7 +1148,7 @@ def _exclude_noisy_trials(epochs_2d, threshold_uv):
 def _rank_channels_by_erp(mean_erps, ch_names, post_start_idx):
     scores = {}
     for ch, erp in zip(ch_names, mean_erps):
-        scores[ch] = np.max(np.abs(erp[post_start_idx:]))
+        scores[ch] = np.sqrt(np.nanmean(erp[post_start_idx:] ** 2))
     return sorted(scores, key=scores.get, reverse=True), scores
 
 
@@ -1185,14 +1185,8 @@ def _habituation_plot(trial_amplitudes, trial_numbers, ch_name, condition,
     print(f'      Saved habituation plot: {fname}')
 
 
-def _habituation_plot_all_channels(
-        all_epochs, channels, pre_samples, baseline_mode,
-        hab_start, hab_end, clean_masks,
-        condition, session_name, participant_id,
-        output_dir, suffix, kind,
-        best_channel=None):
- 
-
+def _habituation_plot_all_channels(all_epochs, channels, pre_samples, baseline_mode, hab_start, hab_end,
+                                    clean_trials_by_channel, condition, session_name, participant_id,output_dir, suffix, kind,best_channel=None):
  
     fname = (f'{participant_id}_{session_name}_{suffix}_'
              f'habituation_{kind}_{condition}_all_channels.png')
@@ -1215,11 +1209,7 @@ def _habituation_plot_all_channels(
         row_i, col_i = divmod(idx, ncols)
         ax = axes[row_i][col_i]
  
-        raw_trials = all_epochs[ch][condition].copy()
-        corrected  = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode)
-        keep       = clean_masks[idx]
-        clean      = corrected[keep]
- 
+        clean = clean_trials_by_channel[idx]
         hab_amps   = np.array([t[hab_start:hab_end].mean() for t in clean])
         trial_nums = np.arange(1, len(hab_amps) + 1)
  
@@ -1377,7 +1367,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
  
         for group_label in ('sham', 'active'):
             mean_erps   = []
-            clean_masks = []
+            clean_trials_by_channel = []
             for ch in channels:
                 raw_trials  = all_epochs[ch][group_label].copy()
                 corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode)
@@ -1387,7 +1377,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 )
                 keep  = np.where(finite_mask)[0][noise_mask]
                 clean = corrected[keep]
-                clean_masks.append(keep)
+                clean_trials_by_channel.append(clean)
                 mean_erps.append(
                     clean.mean(axis=0) if len(clean) else np.full(n_samples, np.nan)
                 )
@@ -1421,10 +1411,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     r_i, c_i     = divmod(idx_ch, ncols_erp)
                     ax            = axes_all[r_i][c_i]
                     ch_idx_list   = channels.index(ch)
-                    keep          = clean_masks[ch_idx_list]
-                    clean_trials  = _apply_erp_baseline(
-                        all_epochs[ch][group_label], pre_samples, baseline_mode
-                    )[keep]
+                    clean_trials = clean_trials_by_channel[ch_idx_list]
                     mean_erp = mean_erps[ch_idx_list]
                     sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
                                 if len(clean_trials) > 1 else np.zeros(n_samples))
@@ -1478,14 +1465,13 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     squeeze=False,
                 )
                 axes10_flat = axes10.ravel()
+                for j in range(len(top10_chs), len(axes10_flat)):
+                        axes10_flat[j].set_visible(False)
  
                 for panel_idx, ch in enumerate(top10_chs):
                     ax           = axes10_flat[panel_idx]
                     ch_idx_list  = channels.index(ch)
-                    keep         = clean_masks[ch_idx_list]
-                    clean_trials = _apply_erp_baseline(
-                        all_epochs[ch][group_label], pre_samples, baseline_mode
-                    )[keep]
+                    clean_trials = clean_trials_by_channel[ch_idx_list]
                     mean_erp = mean_erps[ch_idx_list]
                     sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
                                 if len(clean_trials) > 1 else np.zeros(n_samples))
@@ -1530,6 +1516,54 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 fig10.savefig(Path(output_dir) / fname_top10, dpi=150, bbox_inches='tight')
                 plt.close(fig10)
                 print(f'      Saved ERP top-10 figure: {fname_top10}')
+                # Figure 2b: top-3
+            top3_chs = ranked_chs[:3]
+            fname_top3 = (
+                f'{participant_id}_{session_name}_{suffix}_'
+                f'ERP_{group_label}_{baseline_name}_top3.png'
+            )
+
+            if not _already_done(output_dir, fname_top3):
+                fig3, axes3 = plt.subplots(
+                    3, 1,
+                    figsize=(10, 10),
+                    sharex=True
+                )
+
+                for panel_idx, ch in enumerate(top3_chs):
+                    ax = axes3[panel_idx]
+                    ch_idx_list = channels.index(ch)
+                    clean_trials = clean_trials_by_channel[ch_idx_list]
+                    mean_erp = mean_erps[ch_idx_list]
+
+                    sem_erp = (
+                        clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
+                        if len(clean_trials) > 1
+                        else np.zeros(n_samples)
+                    )
+
+                    for trial in clean_trials:
+                        ax.plot(times, trial, color=color, alpha=0.12, lw=0.5)
+
+                    ax.fill_between(
+                        times,
+                        mean_erp - sem_erp,
+                        mean_erp + sem_erp,
+                        color=color,
+                        alpha=0.3
+                    )
+
+                    ax.plot(times, mean_erp, color=color, lw=2)
+                    ax.axvline(0, color='black', ls='--')
+                    ax.axhline(0, color='grey', ls=':')
+                    ax.set_title(f'{ch} (rank #{panel_idx+1})')
+
+                axes3[-1].set_xlabel('Time (s)')
+                fig3.tight_layout()
+                fig3.savefig(Path(output_dir) / fname_top3, dpi=150)
+                plt.close(fig3)
+
+                print(f'      Saved ERP top-3 figure: {fname_top3}')
  
             # Figure 3: habituation for ALL channels 
             _habituation_plot_all_channels(
@@ -1539,7 +1573,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 baseline_mode=baseline_mode,
                 hab_start=hab_start,
                 hab_end=hab_end,
-                clean_masks=clean_masks,
+                clean_trials_by_channel=clean_trials_by_channel,
                 condition=group_label,
                 session_name=session_name,
                 participant_id=participant_id,
