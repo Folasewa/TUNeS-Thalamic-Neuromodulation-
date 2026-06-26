@@ -1129,11 +1129,7 @@ TFR_BASELINES = {
     'tight_500_100ms': (-0.50, -0.10),
     'full_pre':        (-TUS_EPOCH_PRE_SEC, -0.5),
 }
-ERP_ZOOM_WINDOWS = [
-    (0.0, 0.1),   # 0–100 ms
-    (0.1, 0.3),   # 100–300 ms
-    (0.3, 0.6),   # 300–600 ms
-]
+
 N_BEST_CHANNELS          = 3
 TRIAL_NOISE_SD_MULTIPLIER = 4.0   # adaptive rejection: mean PTP + k*SD
 HABITUATION_WINDOW_SEC   = (0.0, 1.0)
@@ -1189,6 +1185,121 @@ def _rank_channels_by_erp(mean_erps, ch_names, post_start_idx):
     for ch, erp in zip(ch_names, mean_erps):
         scores[ch] = np.sqrt(np.nanmean(erp[post_start_idx:] ** 2))
     return sorted(scores, key=scores.get, reverse=True), scores
+
+def _plot_erp_topo_overlay(
+    mean_erps_active, mean_erps_sham,
+    channels, times,
+    session_name, participant_id,
+    output_dir, suffix, baseline_name,
+    t_min=-0.5, t_max=2.0,
+):
+    """
+    EEGLAB-style topo layout: one mini ERP trace per channel positioned at
+    its scalp location. Active and sham overlaid in their respective colours.
+    One figure per baseline type.
+    """
+    fname = (f'{participant_id}_{session_name}_{suffix}_'
+             f'ERP_topo_overlay_{baseline_name}.png')
+    if _already_done(output_dir, fname):
+        return
+
+    montage  = mne.channels.make_standard_montage('standard_1020')
+    pos_dict = {ch: montage._get_ch_pos()[ch] for ch in montage.ch_names
+                if ch in montage._get_ch_pos()}
+
+    # filter to channels that have both a known position and ERP data
+    valid_chs = [ch for ch in channels if ch in pos_dict]
+    if len(valid_chs) < 3:
+        print(f'      Topo overlay skipped: too few channels with known positions')
+        return
+
+    # get 2D xy from 3D montage positions (use x and y, ignore z)
+    xy = np.array([pos_dict[ch][:2] for ch in valid_chs])
+    # normalise to [0.05, 0.95] for figure coordinates
+    xy_norm = (xy - xy.min(axis=0)) / (xy.max(axis=0) - xy.min(axis=0) + 1e-12)
+    xy_norm = xy_norm * 0.82 + 0.05   # leave margin for labels
+
+    time_mask = (times >= t_min) & (times <= t_max)
+    times_zoom = times[time_mask]
+
+    color_active = '#E04B4B'
+    color_sham   = '#4B7BE0'
+
+    # compute a shared y-scale across all channels
+    all_vals = []
+    for ch in valid_chs:
+        idx = channels.index(ch)
+        a = mean_erps_active[idx][time_mask]
+        s = mean_erps_sham[idx][time_mask]
+        if not np.all(np.isnan(a)): all_vals.extend(a[np.isfinite(a)])
+        if not np.all(np.isnan(s)): all_vals.extend(s[np.isfinite(s)])
+    if not all_vals:
+        return
+    y_abs = np.percentile(np.abs(all_vals), 95)
+    ylim  = (-y_abs, y_abs)
+
+    fig = plt.figure(figsize=(20, 16))
+
+    # mini-axes width and height in figure fraction
+    ax_w, ax_h = 0.10, 0.07
+
+    for i, ch in enumerate(valid_chs):
+        x_fig = xy_norm[i, 0]
+        y_fig = xy_norm[i, 1]
+        # centre the mini-axis on the channel position
+        ax = fig.add_axes([x_fig - ax_w/2, y_fig - ax_h/2, ax_w, ax_h])
+
+        idx = channels.index(ch)
+        erp_a = mean_erps_active[idx][time_mask]
+        erp_s = mean_erps_sham[idx][time_mask]
+
+        if not np.all(np.isnan(erp_s)):
+            ax.plot(times_zoom, erp_s, color=color_sham,   lw=1.0, alpha=0.85)
+        if not np.all(np.isnan(erp_a)):
+            ax.plot(times_zoom, erp_a, color=color_active, lw=1.0, alpha=0.85)
+
+        ax.axvline(0,  color='black', lw=0.5, ls='--', alpha=0.5)
+        ax.axhline(0,  color='grey',  lw=0.4, ls=':',  alpha=0.5)
+        ax.set_xlim(t_min, t_max)
+        ax.set_ylim(ylim)
+        ax.set_xticks([])
+        ax.set_yticks([])
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.set_title(ch, fontsize=6, pad=1, color='#333333')
+
+    # shared legend
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], color=color_active, lw=1.5, label='Active'),
+        Line2D([0], [0], color=color_sham,   lw=1.5, label='Sham'),
+        Line2D([0], [0], color='black', lw=0.8, ls='--', label='TUS onset'),
+    ]
+    fig.legend(handles=legend_elements, loc='lower right',
+               fontsize=9, framealpha=0.9)
+
+    # shared scale bar (bottom left)
+    scale_ax = fig.add_axes([0.03, 0.03, 0.08, 0.05])
+    scale_ax.set_xlim(t_min, t_max)
+    scale_ax.set_ylim(ylim)
+    scale_ax.axvline(0, color='black', lw=0.6, ls='--', alpha=0.6)
+    scale_ax.set_xlabel(f'{t_min}–{t_max} s', fontsize=7)
+    scale_ax.set_ylabel(f'±{y_abs:.1f} µV', fontsize=7)
+    scale_ax.set_xticks([t_min, 0, t_max])
+    scale_ax.set_xticklabels([str(t_min), '0', str(t_max)], fontsize=6)
+    scale_ax.set_yticks([])
+    for spine in scale_ax.spines.values():
+        spine.set_linewidth(0.5)
+
+    fig.suptitle(
+        f'{participant_id} – {session_name}  |  ERP topo layout  '
+        f'[baseline: {baseline_name}]\n'
+        f'Active (red) vs Sham (blue)  |  window: {t_min} to {t_max} s',
+        fontsize=11, fontweight='bold',
+    )
+    fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f'      Saved ERP topo overlay: {fname}')
 
 
 def _habituation_plot(trial_amplitudes, trial_numbers, ch_name, condition,
@@ -1307,61 +1418,6 @@ def _habituation_plot_all_channels(all_epochs, channels, pre_samples, baseline_m
     fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
     plt.close(fig)
     print(f'      Saved habituation plot (all channels): {fname}')
-
-def _plot_erp_zoom_window(
-    times,
-    clean_trials,
-    mean_erp,
-    sem_erp,
-    ch,
-    group_label,
-    baseline_name,
-    participant_id,
-    session_name,
-    output_dir,
-    suffix,
-    color,
-    ylabel_erp,
-    t_min,
-    t_max
-):
-
-    mask = (times >= t_min) & (times <= t_max)
-
-    if not np.any(mask):
-        return
-
-    fig, ax = plt.subplots(figsize=(6, 4))
-
-    #for trial in clean_trials:
-    #    ax.plot(times[mask], trial[mask], color=color, alpha=0.12, lw=0.6)
-
-    ax.fill_between(
-        times[mask],
-        (mean_erp - sem_erp)[mask],
-        (mean_erp + sem_erp)[mask],
-        color=color,
-        alpha=0.3
-    )
-
-    ax.plot(times[mask], mean_erp[mask], color=color, lw=2)
-
-    ax.axvline(0, color='black', lw=1, ls='--')
-    ax.axhline(0, color='grey', lw=0.6, ls=':')
-
-    ax.set_title(f'{ch} | {int(t_min*1000)}–{int(t_max*1000)} ms')
-    ax.set_xlabel('Time (s)')
-    ax.set_ylabel(ylabel_erp)
-
-    fname = (
-        f'{participant_id}_{session_name}_{suffix}_'
-        f'ERP_ZOOM_{group_label}_{baseline_name}_{ch}_'
-        f'{int(t_min*1000)}_{int(t_max*1000)}ms.png'
-    )
-
-    fig.tight_layout()
-    fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
-    plt.close(fig)
 
 
 def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
@@ -1655,24 +1711,6 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     mean_erp = mean_erps[ch_idx_list]
                     sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
                                 if len(clean_trials) > 1 else np.zeros(n_samples))
-                    for t_min, t_max in ERP_ZOOM_WINDOWS:
-                        _plot_erp_zoom_window(
-                            times=times,
-                            clean_trials=clean_trials,
-                            mean_erp=mean_erp,
-                            sem_erp=sem_erp,
-                            ch=ch,
-                            group_label=group_label,
-                            baseline_name=baseline_name,
-                            participant_id=participant_id,
-                            session_name=session_name,
-                            output_dir=output_dir,
-                            suffix=suffix,
-                            color=color,
-                            ylabel_erp=ylabel_erp,
-                            t_min=t_min,
-                            t_max=t_max
-    )
                     #for trial in clean_trials:
                     #   ax.plot(times, trial, color=color, alpha=0.10, lw=0.5)
                     ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,
@@ -1861,10 +1899,20 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
             if info_topo is not None:
                 _erp_topomap(peak_amp_by_condition[group_label],topo_chs, info_topo,session_name, participant_id, output_dir,suffix, group_label, baseline_name)
             # Difference wave 
+            # Difference wave + topo overlay — both need active and sham
             if ('active' in mean_erps_by_condition and 'sham' in mean_erps_by_condition):
-                _plot_erp_difference(mean_erps_by_condition['active'],mean_erps_by_condition['sham'],channels, times,pre_samples,session_name, participant_id, output_dir, suffix, baseline_name,)
- 
-    return focus_channel_by_condition.get('active', channels[0] if channels else None)
+                _plot_erp_difference(
+                    mean_erps_by_condition['active'], mean_erps_by_condition['sham'],
+                    channels, times, pre_samples,
+                    session_name, participant_id, output_dir, suffix, baseline_name,
+                )
+                _plot_erp_topo_overlay(
+                    mean_erps_by_condition['active'], mean_erps_by_condition['sham'],
+                    channels, times,
+                    session_name, participant_id, output_dir, suffix, baseline_name,
+                    t_min=-0.5, t_max=2.0,
+                )
+                return focus_channel_by_condition.get('active', channels[0] if channels else None)
 
 
 def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
