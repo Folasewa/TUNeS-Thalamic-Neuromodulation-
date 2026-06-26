@@ -442,35 +442,28 @@ def load_and_link_acoustic(profile_df: pd.DataFrame,
     print('\n[Step 3] Loading & linking acoustic dose data …')
 
     targets         = ['thalamus', 'ventricle']
-    acoustic_rows   = []   # per-region rows (one row per region per sonication)
-    summary_rows    = []   # sonication-level rows (one row per sonication)
+    acoustic_rows   = []
+    summary_rows    = []
     root_path       = Path(results_root)
     pids_in_profile = set(profile_df['participant_id'].astype(str).tolist())
 
     # ── 1. Load both CSV types for each participant × target ──────────────────
     for target in targets:
-        for csv_path in sorted(root_path.glob(f'*_{target}_analysis.csv')):
+        for csv_path in sorted(root_path.glob(f'**/*_{target}_analysis.csv')):  # ← recursive
             pid = csv_path.stem.replace(f'_{target}_analysis', '')
             if pid not in pids_in_profile:
                 continue
 
-            # ── Per-region CSV (has OnTarget_6dB_pct, Coverage_*, MI, etc.) ──
+            # ── Per-region CSV ────────────────────────────────────────────────
             df_a = pd.read_csv(csv_path)
 
-            # Keep only Tier2 nucleus rows — that's where on-target dose lives.
-            # Tier1 tissue rows and Tier3 atlas rows would pollute the selection.
             if 'ReportingTier' in df_a.columns:
                 df_a = df_a[df_a['ReportingTier'] == 'Tier2_Nuclei'].copy()
 
-            # Within Tier2, keep only the row whose TargetName matches this target
-            # (e.g. thalamus session → the Left_Thalamus or Right_Thalamus row)
             if 'TargetName' in df_a.columns:
-                exact_name = TARGET_NAME_MAP.get(target)
-                df_a_exact = df_a[df_a['TargetName'] == exact_name].copy()
+                exact_name  = TARGET_NAME_MAP.get(target)
+                df_a_exact  = df_a[df_a['TargetName'] == exact_name].copy()
 
-                # If exact match finds nothing (naming inconsistency across
-                # participants), warn and fall back to substring so you don't
-                # silently drop the participant entirely
                 if df_a_exact.empty:
                     print(f'    [WARN] {pid} / {target}: exact TargetName '
                           f'"{exact_name}" not found — '
@@ -483,40 +476,37 @@ def load_and_link_acoustic(profile_df: pd.DataFrame,
 
                 df_a = df_a_exact
 
-            # If multiple sonications remain, take the best-coverage one —
-            # that's the placement you actually used clinically
             if len(df_a) > 1 and 'OnTarget_6dB_pct' in df_a.columns:
                 df_a = (df_a
                         .sort_values('OnTarget_6dB_pct', ascending=False)
                         .head(1)
                         .reset_index(drop=True))
 
-            df_a['_target'] = target   # tag so we know which session this came from
+            df_a['participant_id'] = pid        # ensure pid column is present
+            df_a['_target']        = target
             acoustic_rows.append(df_a)
 
-            # ── Sonication summary CSV (has skull_mm, FWHM, prefocal_ratio, etc.) ──
-            # Named: {pid}_{target}_sonication_summary.csv
-            # This is the file you add to v4's write_sonication_summary()
-            summary_path = root_path / f'{pid}_{target}_sonication_summary.csv'
+            # ── Sonication summary CSV (same folder as analysis CSV) ──────────
+            summary_path = csv_path.parent / f'{pid}_{target}_sonication_summary.csv'  # ← fixed
             if summary_path.exists():
                 df_s = pd.read_csv(summary_path)
 
-                # Same logic: best sonication = highest coverage
                 if len(df_s) > 1 and 'coverage_6dB_pct' in df_s.columns:
                     df_s = (df_s
                             .sort_values('coverage_6dB_pct', ascending=False)
                             .head(1)
                             .reset_index(drop=True))
 
-                df_s['_target'] = target
+                df_s['participant_id'] = pid    # ensure pid column is present
+                df_s['_target']        = target
                 summary_rows.append(df_s)
             else:
                 print(f'    [WARN] No sonication summary for {pid} / {target} '
-                      f'— beam metrics will be missing for this session')
+                      f'at {summary_path} — beam metrics will be missing')
 
     if not acoustic_rows:
         print('    [WARN] No acoustic CSVs found — dose–response steps will be skipped.')
-        print(f'    Expected pattern: {results_root}/{{pid}}_{{target}}_analysis.csv')
+        print(f'    Expected pattern: {results_root}/<pid>/<target>/<pid>_<target>_analysis.csv')
         return profile_df.copy()
 
     # ── 2. Stack and check coverage ───────────────────────────────────────────
@@ -551,16 +541,12 @@ def load_and_link_acoustic(profile_df: pd.DataFrame,
         print(f'    [WARN] Beam metric columns not found in summary CSV: {missing_beam}')
 
     # ── 4. Pivot both wide — one column per target × metric ──────────────────
-    # Both acoustic_df and summary_df are pivoted with the same pattern:
-    #   thalamus_OnTarget_6dB_pct, ventricle_OnTarget_6dB_pct
-    #   thalamus_skull_thickness_mm, ventricle_skull_thickness_mm  ← beam metrics
-    pivot_rows = []
+    pivot_rows  = []
+    all_pids    = acoustic_df['participant_id'].unique()
 
-    all_pids = acoustic_df['participant_id'].unique()
     for pid in all_pids:
         row = {'participant_id': str(pid)}
 
-        # Per-region dose metrics
         pid_acoustic = acoustic_df[acoustic_df['participant_id'] == pid]
         for _, sess in pid_acoustic.iterrows():
             tgt = str(sess.get('_target', '')).lower()
@@ -569,8 +555,6 @@ def load_and_link_acoustic(profile_df: pd.DataFrame,
             for col in available_dose:
                 row[f'{tgt}_{col}'] = pd.to_numeric(sess.get(col), errors='coerce')
 
-        # Beam metrics from sonication summary
-        # These go in the SAME row dict — just different source dataframe
         if has_summary:
             pid_summary = summary_df[summary_df['participant_id'] == pid]
             for _, sess in pid_summary.iterrows():
@@ -582,9 +566,9 @@ def load_and_link_acoustic(profile_df: pd.DataFrame,
 
         pivot_rows.append(row)
 
-    # ── 5. Merge everything onto the response profile ─────────────────────────
+    # ── 5. Merge onto response profile ───────────────────────────────────────
     acoustic_wide = pd.DataFrame(pivot_rows)
-    linked = profile_df.merge(acoustic_wide, on='participant_id', how='left')
+    linked        = profile_df.merge(acoustic_wide, on='participant_id', how='left')
 
     n_with_dose = linked[
         [f'thalamus_{c}' for c in available_dose if f'thalamus_{c}' in linked.columns]
