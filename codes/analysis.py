@@ -1135,7 +1135,7 @@ ERP_ZOOM_WINDOWS = [
     (0.3, 0.6),   # 300–600 ms
 ]
 N_BEST_CHANNELS          = 3
-TRIAL_NOISE_THRESHOLD_UV = 150.0
+TRIAL_NOISE_SD_MULTIPLIER = 4.0   # adaptive rejection: mean PTP + k*SD
 HABITUATION_WINDOW_SEC   = (0.0, 1.0)
 TFR_BANDS = {
     'delta': (0.5, 4.0),
@@ -1167,15 +1167,22 @@ def _apply_erp_baseline(epochs_2d, pre_samples, mode, sfreq):
     return out
 
 
-def _exclude_noisy_trials(epochs_2d, threshold_uv):
-    ptp  = np.ptp(epochs_2d, axis=1)
-    mask = ptp <= threshold_uv
+def _exclude_noisy_trials(epochs_2d, sd_multiplier=None):
+    """
+    Adaptive rejection: reject trials whose peak-to-peak amplitude exceeds
+    mean + sd_multiplier * SD of the trial PTP distribution.
+    """
+    ptp       = np.ptp(epochs_2d, axis=1)
+    mean_ptp  = np.mean(ptp)
+    sd_ptp    = np.std(ptp)
+    mult      = sd_multiplier if sd_multiplier is not None else TRIAL_NOISE_SD_MULTIPLIER
+    threshold = mean_ptp + mult * sd_ptp
+    mask      = ptp <= threshold
     n_excluded = int((~mask).sum())
     if n_excluded:
         print(f'      Noise exclusion: removed {n_excluded} / {len(mask)} trials '
-              f'(threshold {threshold_uv} µV p-p)')
-    return mask
-
+              f'[adaptive threshold: {threshold:.1f} µV  ({mult} SD above mean PTP)]')
+    return mask, float(threshold)
 
 def _rank_channels_by_erp(mean_erps, ch_names, post_start_idx):
     scores = {}
@@ -1326,8 +1333,8 @@ def _plot_erp_zoom_window(
 
     fig, ax = plt.subplots(figsize=(6, 4))
 
-    for trial in clean_trials:
-        ax.plot(times[mask], trial[mask], color=color, alpha=0.12, lw=0.6)
+    #for trial in clean_trials:
+    #    ax.plot(times[mask], trial[mask], color=color, alpha=0.12, lw=0.6)
 
     ax.fill_between(
         times[mask],
@@ -1551,20 +1558,70 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
         for group_label in ('sham', 'active'):
             mean_erps   = []
             clean_trials_by_channel = []
+
+            # ── Step 1: identify bad channels (>30% rejection) ────────────────────
+            BAD_CHANNEL_REJECTION_RATE = 0.30
+            n_trials      = all_epochs[channels[0]][group_label].shape[0]
+            good_channels = []
+            bad_channels  = []
+
             for ch in channels:
                 raw_trials  = all_epochs[ch][group_label].copy()
                 corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
                 finite_mask = np.all(np.isfinite(corrected), axis=1)
-                noise_mask  = _exclude_noisy_trials(
-                    corrected[finite_mask], TRIAL_NOISE_THRESHOLD_UV
-                )
-                keep  = np.where(finite_mask)[0][noise_mask]
-                clean = corrected[keep]
+                noise_mask, _ = _exclude_noisy_trials(corrected[finite_mask])
+                n_rejected     = int((~noise_mask).sum())
+                rejection_rate = n_rejected / n_trials
+                if rejection_rate > BAD_CHANNEL_REJECTION_RATE:
+                    bad_channels.append((ch, round(rejection_rate * 100, 1)))
+                else:
+                    good_channels.append(ch)
+
+            if bad_channels:
+                print(f'      [{group_label}] Excluded noisy channels '
+                    f'(>{BAD_CHANNEL_REJECTION_RATE*100:.0f}% trials rejected):')
+                for ch, pct in bad_channels:
+                    print(f'        {ch}: {pct}% rejected')
+            print(f'      [{group_label}] Clean channels for ERP: '
+                f'{len(good_channels)} / {len(channels)}')
+
+            if not good_channels:
+                print(f'      [{group_label}] No clean channels — skipping')
+                for ch in channels:
+                    clean_trials_by_channel.append(np.empty((0, n_samples)))
+                    mean_erps.append(np.full(n_samples, np.nan))
+                mean_erps_by_condition[group_label] = mean_erps
+                continue
+
+            # ── Step 2: build global keep-mask from good channels only ────────────
+            global_keep = np.ones(n_trials, dtype=bool)
+
+            for ch in good_channels:
+                raw_trials  = all_epochs[ch][group_label].copy()
+                corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
+                finite_mask = np.all(np.isfinite(corrected), axis=1)
+                noise_mask, _ = _exclude_noisy_trials(corrected[finite_mask])
+                trial_keep    = np.zeros(n_trials, dtype=bool)
+                trial_keep[np.where(finite_mask)[0][noise_mask]] = True
+                global_keep  &= trial_keep
+
+            n_kept = int(global_keep.sum())
+            print(f'      [{group_label}] Global trial mask: {n_kept} / {n_trials} trials kept '
+                f'(across {len(good_channels)} clean channels)')
+
+            # ── Step 3: apply uniform mask across all channels ────────────────────
+            for ch in channels:
+                raw_trials = all_epochs[ch][group_label].copy()
+                corrected  = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
+                if ch in good_channels:
+                    clean = corrected[global_keep]
+                else:
+                    clean = np.full((n_kept, n_samples), np.nan)
                 clean_trials_by_channel.append(clean)
                 mean_erps.append(
-                    clean.mean(axis=0) if len(clean) else np.full(n_samples, np.nan)
+                    clean.mean(axis=0) if (len(clean) and not np.all(np.isnan(clean)))
+                    else np.full(n_samples, np.nan)
                 )
- 
             mean_erps_by_condition[group_label] = mean_erps
             ranked_chs, scores = _rank_channels_by_erp(mean_erps, channels, post_start_idx)
             if group_label == 'active':
@@ -1616,8 +1673,8 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                             t_min=t_min,
                             t_max=t_max
     )
-                    for trial in clean_trials:
-                        ax.plot(times, trial, color=color, alpha=0.10, lw=0.5)
+                    #for trial in clean_trials:
+                    #   ax.plot(times, trial, color=color, alpha=0.10, lw=0.5)
                     ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,
                                     color=color, alpha=0.3)
                     ax.plot(times, mean_erp, color=color, lw=1.8,
@@ -1676,8 +1733,8 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     mean_erp = mean_erps[ch_idx_list]
                     sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))  
                                 if len(clean_trials) > 1 else np.zeros(n_samples))
-                    for trial in clean_trials:
-                        ax.plot(times, trial, color=color, alpha=0.12, lw=0.6)
+                    #for trial in clean_trials:
+                    #   ax.plot(times, trial, color=color, alpha=0.12, lw=0.6)
                     ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,
                                     color=color, alpha=0.3)
                     ax.plot(times, mean_erp, color=color, lw=2.0,
@@ -1742,8 +1799,8 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                         else np.zeros(n_samples)
                     )
 
-                    for trial in clean_trials:
-                        ax.plot(times, trial, color=color, alpha=0.10, lw=0.4)
+                    #for trial in clean_trials:
+                    #    ax.plot(times, trial, color=color, alpha=0.10, lw=0.4)
 
                     ax.axvspan(-TUS_EPOCH_PRE_SEC, 0,
                                color='grey', alpha=0.08, label='Baseline' if panel_idx == 0 else '_')
