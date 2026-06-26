@@ -1123,7 +1123,7 @@ ERP_BASELINES = {
     'pre_mean':   'pre_mean',
     'pre_zscore': 'pre_zscore',
 }
-ERP_BASELINE_SEC = 0.2   # use only the last 200 ms before t=0 for baseline correction
+ERP_BASELINE_SEC = 0.5   # use only the last 200 ms before t=0 for baseline correction
 TFR_BASELINES = {
     'tight_300_50ms':  (-0.30, -0.05),
     'tight_500_100ms': (-0.50, -0.10),
@@ -1241,7 +1241,7 @@ def _plot_erp_topo_overlay(
     fig = plt.figure(figsize=(20, 16))
 
     # mini-axes width and height in figure fraction
-    ax_w, ax_h = 0.05, 0.04
+    ax_w, ax_h = 0.05, 0.035
 
     for i, ch in enumerate(valid_chs):
         x_fig = xy_norm[i, 0]
@@ -1254,9 +1254,9 @@ def _plot_erp_topo_overlay(
         erp_s = mean_erps_sham[idx][time_mask]
 
         if not np.all(np.isnan(erp_s)):
-            ax.plot(times_zoom, erp_s, color=color_sham,   lw=1.0, alpha=0.85)
+            ax.plot(times_zoom, erp_s, color=color_sham,   lw=0.7, alpha=0.85)
         if not np.all(np.isnan(erp_a)):
-            ax.plot(times_zoom, erp_a, color=color_active, lw=1.0, alpha=0.85)
+            ax.plot(times_zoom, erp_a, color=color_active, lw=0.7, alpha=0.85)
 
         ax.axvline(0,  color='black', lw=0.5, ls='--', alpha=0.5)
         ax.axhline(0,  color='grey',  lw=0.4, ls=':',  alpha=0.5)
