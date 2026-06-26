@@ -1811,6 +1811,7 @@ def write_csv(all_rows: List[Dict], cfg: Dict, out_path: str):
         ["Sonication","ReportingTier","Isppa_Target_Wcm2"],
         ascending=[True,True,False]
     ).reset_index(drop=True)
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     df.to_csv(out_path, index=False)
     print(f"  [csv]  {out_path}  ({len(df)} rows)")
 
