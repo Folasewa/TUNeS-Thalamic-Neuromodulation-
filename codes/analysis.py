@@ -1104,15 +1104,11 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
     for idx in range(n_ch, nrows * ncols):
         axes_flat[idx].set_visible(False)
     # One shared colorbar for the whole figure
+    fig.suptitle(f'{participant_id} – {session_name}: spectrogram  [cyan = NREM]',fontsize=12, fontweight='bold',)
+    fig.subplots_adjust(top=0.93, right=0.88)
     if last_pcm is not None:
-        fig.colorbar(last_pcm, ax=axes_flat[:n_ch].tolist(),
-                     label='dB/Hz', shrink=0.6, pad=0.01)
- 
-    fig.suptitle(
-        f'{participant_id} – {session_name}: spectrogram  [cyan = NREM]',
-        fontsize=12, fontweight='bold',
-    )
-    fig.tight_layout()
+        cax = fig.add_axes([0.90, 0.15, 0.015, 0.70])
+        fig.colorbar(last_pcm, cax=cax, label='dB/Hz')
     fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print('    Saved spectrogram')
@@ -1127,6 +1123,7 @@ ERP_BASELINES = {
     'pre_mean':   'pre_mean',
     'pre_zscore': 'pre_zscore',
 }
+ERP_BASELINE_SEC = 0.2   # use only the last 200 ms before t=0 for baseline correction
 TFR_BASELINES = {
     'tight_300_50ms':  (-0.30, -0.05),
     'tight_500_100ms': (-0.50, -0.10),
@@ -1145,9 +1142,18 @@ TFR_BANDS = {
 }
 
 
-def _apply_erp_baseline(epochs_2d, pre_samples, mode):
+def _apply_erp_baseline(epochs_2d, pre_samples, mode, sfreq):
+    """
+    Baseline-correct using only the last ERP_BASELINE_SEC before t=0,
+    regardless of how long the full pre-stimulus window is.
+    The full epoch (including all pre-stimulus context) is returned —
+    only the correction window changes.
+    """
     out = epochs_2d.copy()
-    pre = epochs_2d[:, :pre_samples]
+    bl_samples = int(ERP_BASELINE_SEC * sfreq)
+    # last `bl_samples` of the pre-stimulus window
+    bl_start = pre_samples - bl_samples
+    pre = epochs_2d[:, bl_start:pre_samples]
     if mode == 'pre_mean':
         out = out - pre.mean(axis=1, keepdims=True)
     elif mode == 'pre_zscore':
@@ -1330,6 +1336,82 @@ def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
     plt.close(fig)
     print(f'      Saved ERP topomap: {fname}')
 
+def _plot_erp_difference(mean_erps_active, mean_erps_sham, channels, times,
+                          pre_samples, session_name, participant_id,
+                          output_dir, suffix, baseline_name):
+    """
+    Plot the difference wave (active minus sham) for every channel.
+    One PNG per baseline type, all channels in a 3-column grid.
+    """
+    fname = (f'{participant_id}_{session_name}_{suffix}_'
+             f'ERP_difference_{baseline_name}_all_channels.png')
+    if _already_done(output_dir, fname):
+        return
+
+    ncols = 3
+    nrows = int(np.ceil(len(channels) / ncols))
+    fig, axes = plt.subplots(
+        nrows, ncols,
+        figsize=(7 * ncols, 4 * nrows),
+        sharex=True, squeeze=False,
+    )
+
+    for idx, ch in enumerate(channels):
+        r_i, c_i = divmod(idx, ncols)
+        ax = axes[r_i][c_i]
+
+        active_erp = mean_erps_active[idx]
+        sham_erp   = mean_erps_sham[idx]
+
+        if np.all(np.isnan(active_erp)) or np.all(np.isnan(sham_erp)):
+            ax.text(0.5, 0.5, 'insufficient data',
+                    transform=ax.transAxes, ha='center', va='center',
+                    color='grey', fontsize=8)
+            ax.set_title(ch, fontsize=8)
+            continue
+
+        diff = active_erp - sham_erp
+
+        # shade positive (active > sham) and negative (sham > active) regions
+        ax.fill_between(times, diff, 0,
+                        where=(diff >= 0), color='#E04B4B', alpha=0.35,
+                        label='active > sham')
+        ax.fill_between(times, diff, 0,
+                        where=(diff < 0),  color='#4B7BE0', alpha=0.35,
+                        label='sham > active')
+        ax.plot(times, diff, color='black', lw=1.5)
+        ax.axvline(0,  color='black', lw=0.9, ls='--', alpha=0.7)
+        ax.axhline(0,  color='grey',  lw=0.6, ls=':')
+        ax.axvspan(-TUS_EPOCH_PRE_SEC, 0, color='grey', alpha=0.06)
+
+        ax.set_ylabel('µV (active − sham)', fontsize=7)
+        ax.set_title(ch, fontsize=8)
+        ax.tick_params(labelsize=6)
+        if idx == 0:
+            ax.legend(fontsize=6, loc='upper right')
+
+    # hide unused panels
+    for idx in range(len(channels), nrows * ncols):
+        r_i, c_i = divmod(idx, ncols)
+        axes[r_i][c_i].set_visible(False)
+
+    # x-axis label on every visible bottom-row panel
+    for ax_row in axes:
+        for ax in ax_row:
+            if ax.get_visible():
+                ax.set_xlabel('Time (s)', fontsize=7)
+
+    fig.suptitle(
+        f'{participant_id} – {session_name}  |  ERP difference  (active − sham)\n'
+        f'baseline: {baseline_name}',
+        fontsize=11, fontweight='bold',
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'      Saved ERP difference figure: {fname}')
+
+
 def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_dir, suffix=''):
 
     if 'burst_time_s' not in bursts_df.columns:
@@ -1352,10 +1434,6 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
     post_start_idx = pre_samples
     hab_start      = pre_samples + int(HABITUATION_WINDOW_SEC[0] * sfreq)
     hab_end        = pre_samples + int(HABITUATION_WINDOW_SEC[1] * sfreq)
- 
-    def bandpass(data, low, high, fs):
-        b, a = butter(4, [low / (fs / 2), high / (fs / 2)], btype='band')
-        return filtfilt(b, a, data)
  
     montage   = mne.channels.make_standard_montage('standard_1020')
     known_chs = set(montage.ch_names)
@@ -1384,10 +1462,6 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     trials.append(np.full(n_samples, np.nan))
                     continue
                 trial = raw.get_data(picks=[ch_idx],start=start, stop=stop)[0] * 1e6
-                try:
-                    trial = bandpass(trial, 0.1, 30.0, sfreq)
-                except Exception:
-                    pass
                 trials.append(trial)
             all_epochs[ch][group_label] = np.array(trials)
  
@@ -1403,7 +1477,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
             clean_trials_by_channel = []
             for ch in channels:
                 raw_trials  = all_epochs[ch][group_label].copy()
-                corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode)
+                corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
                 finite_mask = np.all(np.isfinite(corrected), axis=1)
                 noise_mask  = _exclude_noisy_trials(
                     corrected[finite_mask], TRIAL_NOISE_THRESHOLD_UV
@@ -1475,7 +1549,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                             ax.set_xlabel('Time (s)', fontsize=7)
                 fig_all.suptitle(
                     f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
-                    f'[{freq_band[0]}–{freq_band[1]} Hz]  |  baseline: {baseline_name}\n'
+                    f'[baseline: {baseline_name}\n'
                     f'All channels  |  ★ = highest ERP response ({best_ch})',
                     fontsize=11, fontweight='bold'
                 )
@@ -1541,7 +1615,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
  
                 fig10.suptitle(
                     f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
-                    f'[{freq_band[0]}–{freq_band[1]} Hz]  |  baseline: {baseline_name}\n'
+                    f'[baseline: {baseline_name}\n'
                     f'Top 10 channels by peak |ERP| response  |  ★ = {best_ch} (highest)',
                     fontsize=11, fontweight='bold'
                 )
@@ -1607,7 +1681,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 axes3[-1].set_xlabel('Time (s)', fontsize=9)
                 fig3.suptitle(
                     f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
-                    f'[{freq_band[0]}–{freq_band[1]} Hz]  |  baseline: {baseline_name}\n'
+                    f'[baseline: {baseline_name}\n'
                     f'Top 3 channels by post-stimulus RMS',
                     fontsize=11, fontweight='bold'
                 )
@@ -1635,12 +1709,10 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
             )
  
             if info_topo is not None:
-                _erp_topomap(
-                    peak_amp_by_condition[group_label],
-                    topo_chs, info_topo,
-                    session_name, participant_id, output_dir,
-                    suffix, group_label, baseline_name
-                )
+                _erp_topomap(peak_amp_by_condition[group_label],topo_chs, info_topo,session_name, participant_id, output_dir,suffix, group_label, baseline_name)
+            # Difference wave 
+            if ('active' in mean_erps_by_condition and 'sham' in mean_erps_by_condition):
+                _plot_erp_difference(mean_erps_by_condition['active'],mean_erps_by_condition['sham'],channels, times,pre_samples,session_name, participant_id, output_dir, suffix, baseline_name,)
  
     return focus_channel_by_condition.get('active', channels[0] if channels else None)
 
