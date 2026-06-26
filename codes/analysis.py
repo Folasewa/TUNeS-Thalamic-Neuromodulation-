@@ -1430,7 +1430,24 @@ def _plot_erp_difference(mean_erps_active, mean_erps_sham, channels, times,
             continue
 
         diff = active_erp - sham_erp
+        t_min, t_max = 0.0, 0.3  # 0–300 ms
 
+        mask = (times >= t_min) & (times <= t_max)
+
+        ax_in = ax.inset_axes([0.55, 0.55, 0.4, 0.4])
+
+        ax_in.fill_between(times[mask], diff[mask], 0,
+                        where=(diff[mask] >= 0), color='#E04B4B', alpha=0.35)
+        ax_in.fill_between(times[mask], diff[mask], 0,
+                        where=(diff[mask] < 0), color='#4B7BE0', alpha=0.35)
+
+        ax_in.plot(times[mask], diff[mask], color='black', lw=1.2)
+        ax_in.axvline(0, color='black', lw=0.8, ls='--', alpha=0.7)
+        ax_in.axhline(0, color='grey', lw=0.5, ls=':')
+
+        ax_in.set_xlim(t_min, t_max)
+        ax_in.set_xticks([])
+        ax_in.set_yticks([])
         # shade positive (active > sham) and negative (sham > active) regions
         ax.fill_between(times, diff, 0,
                         where=(diff >= 0), color='#E04B4B', alpha=0.35,
