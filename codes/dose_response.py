@@ -441,53 +441,116 @@ def load_and_link_acoustic(profile_df: pd.DataFrame,
 
     print('\n[Step 3] Loading & linking acoustic dose data …')
 
-    targets         = ['thalamus', 'ventricle']
-    acoustic_rows   = []
-    summary_rows    = []
-    root_path       = Path(results_root)
+    targets       = ['thalamus', 'ventricle']
+    acoustic_rows = []
+    summary_rows  = []
+    root_path     = Path(results_root)
     pids_in_profile = set(profile_df['participant_id'].astype(str).tolist())
+
+    TARGET_FILE_MAP = {
+        'thalamus': 'Left_Thalamus',
+        'ventricle': 'Left_Lateral_Ventricle',
+    }
 
     # ── 1. Load both CSV types for each participant × target ──────────────────
     for target in targets:
-        for csv_path in sorted(root_path.glob(f'**/*_{target}_analysis.csv')):  # ← recursive
-            pid = csv_path.stem.replace(f'_{target}_analysis', '')
+        structure_name = TARGET_FILE_MAP[target]
+
+        # Group all CSVs found per participant so we can pick best across files
+        pid_to_files = {}
+        for csv_path in sorted(root_path.glob(f'**/*_{structure_name}*_analysis.csv')):
+            # Skip old all-caps ANALYSIS files if any remain
+            if csv_path.stem.endswith('_ANALYSIS'):
+                continue
+
+            # Extract pid: tunes08_Left_Thalamus_analysis → tunes08
+            pid_raw = csv_path.stem.split(f'_{structure_name}')[0]
+            # Normalise to match participant_id format: tunes08 → tunes-08
+            pid = pid_raw[:5] + '-' + pid_raw[5:] if '-' not in pid_raw else pid_raw
+
             if pid not in pids_in_profile:
                 continue
 
-            # ── Per-region CSV ────────────────────────────────────────────────
-            df_a = pd.read_csv(csv_path)
+            if pid not in pid_to_files:
+                pid_to_files[pid] = []
+            pid_to_files[pid].append((pid_raw, csv_path))
 
-            if 'ReportingTier' in df_a.columns:
-                df_a = df_a[df_a['ReportingTier'] == 'Tier2_Nuclei'].copy()
+        # Process each participant — pick best sonication across all files
+        for pid, file_list in pid_to_files.items():
+            best_row      = None
+            best_coverage = -np.inf
+            best_pid_raw  = None
+            best_path     = None
 
-            if 'TargetName' in df_a.columns:
-                exact_name  = TARGET_NAME_MAP.get(target)
-                df_a_exact  = df_a[df_a['TargetName'] == exact_name].copy()
+            for pid_raw, csv_path in file_list:
+                df_a = pd.read_csv(csv_path)
 
-                if df_a_exact.empty:
-                    print(f'    [WARN] {pid} / {target}: exact TargetName '
-                          f'"{exact_name}" not found — '
-                          f'available: {df_a["TargetName"].unique().tolist()} '
-                          f'— falling back to substring match')
-                    df_a_exact = df_a[
-                        df_a['TargetName'].str.lower().str.contains(
-                            target[:4], na=False)
-                    ].copy()
+                # Keep only Tier2 nucleus rows
+                if 'ReportingTier' in df_a.columns:
+                    df_a = df_a[df_a['ReportingTier'] == 'Tier2_Nuclei'].copy()
 
-                df_a = df_a_exact
+                # Keep only rows matching this target structure
+                if 'TargetName' in df_a.columns:
+                    df_a_exact = df_a[df_a['TargetName'].str.startswith(
+                        structure_name, na=False)].copy()
 
-            if len(df_a) > 1 and 'OnTarget_6dB_pct' in df_a.columns:
-                df_a = (df_a
-                        .sort_values('OnTarget_6dB_pct', ascending=False)
-                        .head(1)
-                        .reset_index(drop=True))
+                    if df_a_exact.empty:
+                        print(f'    [WARN] {pid} / {target} / {csv_path.name}: '
+                              f'no TargetName starting with "{structure_name}" — '
+                              f'available: {df_a["TargetName"].unique().tolist()} '
+                              f'— falling back to substring match')
+                        df_a_exact = df_a[
+                            df_a['TargetName'].str.lower().str.contains(
+                                target[:4], na=False)
+                        ].copy()
 
-            df_a['participant_id'] = pid        # ensure pid column is present
-            df_a['_target']        = target
-            acoustic_rows.append(df_a)
+                    df_a = df_a_exact
 
-            # ── Sonication summary CSV (same folder as analysis CSV) ──────────
-            summary_path = csv_path.parent / f'{pid}_{target}_sonication_summary.csv'  # ← fixed
+                if df_a.empty:
+                    continue
+
+                # Best sonication within this file
+                if 'OnTarget_6dB_pct' in df_a.columns:
+                    df_a = (df_a
+                            .sort_values('OnTarget_6dB_pct', ascending=False)
+                            .head(1)
+                            .reset_index(drop=True))
+                    coverage = pd.to_numeric(
+                        df_a['OnTarget_6dB_pct'].iloc[0], errors='coerce')
+                else:
+                    df_a     = df_a.head(1).reset_index(drop=True)
+                    coverage = -np.inf
+
+                # Keep this file's best row if it beats the current best
+                if coverage > best_coverage:
+                    best_coverage = coverage
+                    best_row      = df_a
+                    best_pid_raw  = pid_raw
+                    best_path     = csv_path
+
+            if best_row is None:
+                print(f'    [WARN] {pid} / {target}: no valid rows found across '
+                      f'{len(file_list)} file(s) — skipping')
+                continue
+
+            if len(file_list) > 1:
+                print(f'    [{pid} / {target}] {len(file_list)} placement files found — '
+                      f'selected {best_path.name} '
+                      f'(OnTarget_6dB_pct = {best_coverage:.1f}%)')
+
+            best_row['participant_id'] = pid
+            best_row['_target']        = target
+            acoustic_rows.append(best_row)
+
+            # Sonication summary — look in same folder as the winning CSV
+            summary_path = best_path.parent / \
+                f'{best_pid_raw}_{structure_name}_sonication_summary.csv'
+
+            # Fallback: try variant name (e.g. Left_Thalamus1_sonication_summary)
+            if not summary_path.exists():
+                alt_stem     = best_path.stem.replace('_analysis', '_sonication_summary')
+                summary_path = best_path.parent / f'{alt_stem}.csv'
+
             if summary_path.exists():
                 df_s = pd.read_csv(summary_path)
 
@@ -497,7 +560,7 @@ def load_and_link_acoustic(profile_df: pd.DataFrame,
                             .head(1)
                             .reset_index(drop=True))
 
-                df_s['participant_id'] = pid    # ensure pid column is present
+                df_s['participant_id'] = pid
                 df_s['_target']        = target
                 summary_rows.append(df_s)
             else:
@@ -523,7 +586,7 @@ def load_and_link_acoustic(profile_df: pd.DataFrame,
         print('    [WARN] No sonication summary CSVs found — '
               'FWHM / skull / prefocal columns will be absent from linked table')
 
-    acoustic_pids = set(acoustic_df['participant_id'].astype(str).tolist())
+    acoustic_pids   = set(acoustic_df['participant_id'].astype(str).tolist())
     missing_acoustic = pids_in_profile - acoustic_pids
     if missing_acoustic:
         print(f'    [WARN] No acoustic data for: {sorted(missing_acoustic)}')
@@ -541,8 +604,8 @@ def load_and_link_acoustic(profile_df: pd.DataFrame,
         print(f'    [WARN] Beam metric columns not found in summary CSV: {missing_beam}')
 
     # ── 4. Pivot both wide — one column per target × metric ──────────────────
-    pivot_rows  = []
-    all_pids    = acoustic_df['participant_id'].unique()
+    pivot_rows = []
+    all_pids   = acoustic_df['participant_id'].unique()
 
     for pid in all_pids:
         row = {'participant_id': str(pid)}
