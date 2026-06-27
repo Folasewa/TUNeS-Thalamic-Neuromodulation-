@@ -100,14 +100,14 @@ from statsmodels.stats.multitest import multipletests
 # =============================================================================
 
 # Path to the all_session_features.csv produced by Level 2 (analyze.py)
-ALL_SESSION_FEATURES_CSV = '/content/drive/MyDrive/TUNES/results/group/all_session_features.csv'
+ALL_SESSION_FEATURES_CSV = '/home/e_fabdulsa/Desktop/TUNeS_sharbie/results/all_session_features.csv'
 
 # Folder that contains per-participant sub-folders, each holding the
 # Level 1 acoustic enriched CSV: {pid}_{target}_acoustic_report_enriched.csv
-RESULTS_ROOT = '/content/drive/MyDrive/TUNES/results'
+RESULTS_ROOT = '/home/e_fabdulsa/Desktop/TUNeS_sharbie/acoustic_report'
 
 # Where to write all Level 3 outputs
-OUTPUT_DIR = '/content/drive/MyDrive/TUNES/results/group/dose_response'
+OUTPUT_DIR = '/home/e_fabdulsa/Desktop/TUNeS_sharbie/results/dose_response_results'
 
 # Minimum participants for a statistical test / correlation to be reported
 MIN_N = 4
