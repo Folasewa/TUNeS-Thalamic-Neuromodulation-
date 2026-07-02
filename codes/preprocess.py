@@ -23,10 +23,10 @@ import numpy as np
  
 mne.set_log_level('WARNING')
 
-DATA_ROOT      = '/Users/folasewaabdulsalam/Downloads/TUNES/subjects'
-PREPROCESSED_DIR = '/Users/folasewaabdulsalam/Downloads/TUNES/preprocessed'
-LOCAL_WORK_DIR = '/Users/folasewaabdulsalam/Downloads/TUNES/tunes_work'
-PARTICIPANTS   = ['03', '06', '08']
+DATA_ROOT      = '/home/e_fabdulsa/Desktop/TUNeS_sharbie/subjects'
+PREPROCESSED_DIR = '/home/e_fabdulsa/Desktop/TUNeS_sharbie/preprocessed'
+LOCAL_WORK_DIR = '/home/e_fabdulsa/Desktop/TUNeS_sharbie/tunes_work'
+PARTICIPANTS   = ['02', '03', '06', '08', '10']
 
 COPY_SESSIONS_TO_LOCAL = False
 REFRESH_LOCAL_COPY     = False
