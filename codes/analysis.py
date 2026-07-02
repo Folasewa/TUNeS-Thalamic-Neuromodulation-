@@ -37,8 +37,10 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.cm import ScalarMappable
 from matplotlib.colors import Normalize
+from matplotlib.lines import Line2D
 
 import mne
+from mne.channels.layout import _find_topomap_coords
 import numpy as np
 import pandas as pd
 import yasa
@@ -1193,41 +1195,40 @@ def _plot_erp_topo_overlay(
     channels, times,
     session_name, participant_id,
     output_dir, suffix, baseline_name,
-    t_min=-0.5, t_max=2.0,
+    t_min=-0.5, t_max=1.0,
 ):
     """
-    EEGLAB-style topo layout: one mini ERP trace per channel positioned at
-    its scalp location. Active and sham overlaid in their respective colours.
-    One figure per baseline type.
+    EEGLAB-style topo layout using MNE's native layout engine.
+    Overlays active and sham ERP traces per channel at their correct scalp locations.
     """
     fname = (f'{participant_id}_{session_name}_{suffix}_'
              f'ERP_topo_overlay_{baseline_name}.png')
     if _already_done(output_dir, fname):
         return
 
-    montage  = mne.channels.make_standard_montage('standard_1020')
-    pos_dict = {ch: montage._get_ch_pos()[ch] for ch in montage.ch_names
-                if ch in montage._get_ch_pos()}
-
-    # filter to channels that have both a known position and ERP data
+    # 1. Create standard montage and filter valid channels
+    montage = mne.channels.make_standard_montage('standard_1020')
+    pos_dict = montage._get_ch_pos()
     valid_chs = [ch for ch in channels if ch in pos_dict]
+    
     if len(valid_chs) < 3:
         print(f'      Topo overlay skipped: too few channels with known positions')
         return
 
-    # get 2D xy from 3D montage positions (use x and y, ignore z)
-    xy = np.array([pos_dict[ch][:2] for ch in valid_chs])
-    # normalise to [0.05, 0.95] for figure coordinates
-    xy_norm = (xy - xy.min(axis=0)) / (xy.max(axis=0) - xy.min(axis=0) + 1e-12)
-    xy_norm = xy_norm * 0.82 + 0.05   # leave margin for labels
+    # 2. Generate MNE native layout
+    # We create a temporary info object to let MNE calculate the ideal 2D layout grid
+    info = mne.create_info(ch_names=valid_chs, sfreq=1000, ch_types='eeg')
+    info.set_montage(montage)
+    layout = mne.channels.find_layout(info, ch_type='eeg')
 
+    # 3. Time masking and color setups
     time_mask = (times >= t_min) & (times <= t_max)
     times_zoom = times[time_mask]
 
     color_active = '#E04B4B'
     color_sham   = '#4B7BE0'
 
-    # compute a shared y-scale across all channels
+    # 4. Compute a shared y-scale across all channels
     all_vals = []
     for ch in valid_chs:
         idx = channels.index(ch)
@@ -1240,65 +1241,80 @@ def _plot_erp_topo_overlay(
     y_abs = np.percentile(np.abs(all_vals), 95)
     ylim  = (-y_abs, y_abs)
 
-    fig = plt.figure(figsize=(20, 16))
+    # 5. Initialize figure
+    fig = plt.figure(figsize=(22, 18))
 
-    # mini-axes width and height in figure fraction
-    ax_w, ax_h = 0.05, 0.035
+    # Scale factor to shrink mini-axes slightly so titles don't collide
+    # MNE maximizes space; scaling by 0.85 leaves breathing room between axes
+    box_scale = 0.85 
 
-    for i, ch in enumerate(valid_chs):
-        x_fig = xy_norm[i, 0]
-        y_fig = xy_norm[i, 1]
-        # centre the mini-axis on the channel position
-        ax = fig.add_axes([x_fig - ax_w/2, y_fig - ax_h/2, ax_w, ax_h])
+    # 6. Plot each channel using layout geometries
+    # layout.names matches the exact order of channels requested
+    for ch, pos in zip(layout.names, layout.pos):
+        x_pos, y_pos, width, height = pos
+        
+        # Center-scale the boxes to introduce padding between them
+        new_w = width * box_scale
+        new_h = height * box_scale
+        new_x = x_pos + (width - new_w) / 2
+        new_y = y_pos + (height - new_h) / 2
+        
+        # Shift everything slightly up/right to avoid overlapping scalebar/legend margins
+        ax = fig.add_axes([new_x * 0.84 + 0.08, new_y * 0.84 + 0.08, new_w * 0.84, new_h * 0.84])
 
         idx = channels.index(ch)
         erp_a = mean_erps_active[idx][time_mask]
         erp_s = mean_erps_sham[idx][time_mask]
 
         if not np.all(np.isnan(erp_s)):
-            ax.plot(times_zoom, erp_s, color=color_sham,   lw=0.7, alpha=0.85)
+            ax.plot(times_zoom, erp_s, color=color_sham,   lw=0.8, alpha=0.9)
         if not np.all(np.isnan(erp_a)):
-            ax.plot(times_zoom, erp_a, color=color_active, lw=0.7, alpha=0.85)
+            ax.plot(times_zoom, erp_a, color=color_active, lw=0.8, alpha=0.9)
 
-        ax.axvline(0,  color='black', lw=0.5, ls='--', alpha=0.5)
-        ax.axhline(0,  color='grey',  lw=0.4, ls=':',  alpha=0.5)
+        # Inner axes markings
+        ax.axvline(0,  color='black', lw=0.5, ls='--', alpha=0.4)
+        ax.axhline(0,  color='grey',  lw=0.4, ls=':',  alpha=0.4)
         ax.set_xlim(t_min, t_max)
         ax.set_ylim(ylim)
         ax.set_xticks([])
         ax.set_yticks([])
+        
         for spine in ax.spines.values():
             spine.set_visible(False)
-        ax.set_title(ch, fontsize=6, pad=1, color='#333333')
+            
+        # Increased font size and added slight vertical padding for scannability
+        ax.set_title(ch, fontsize=9, pad=3, color='#222222', fontweight='bold')
 
-    # shared legend
-    from matplotlib.lines import Line2D
+    # 7. Shared legend
     legend_elements = [
         Line2D([0], [0], color=color_active, lw=1.5, label='Active'),
         Line2D([0], [0], color=color_sham,   lw=1.5, label='Sham'),
         Line2D([0], [0], color='black', lw=0.8, ls='--', label='TUS onset'),
     ]
     fig.legend(handles=legend_elements, loc='lower right',
-               fontsize=9, framealpha=0.9)
+               fontsize=10, framealpha=0.9)
 
-    # shared scale bar (bottom left)
-    scale_ax = fig.add_axes([0.03, 0.03, 0.08, 0.05])
+    # 8. Shared scale bar (bottom left)
+    scale_ax = fig.add_axes([0.05, 0.05, 0.07, 0.05])
     scale_ax.set_xlim(t_min, t_max)
     scale_ax.set_ylim(ylim)
     scale_ax.axvline(0, color='black', lw=0.6, ls='--', alpha=0.6)
-    scale_ax.set_xlabel(f'{t_min}–{t_max} s', fontsize=7)
-    scale_ax.set_ylabel(f'±{y_abs:.1f} µV', fontsize=7)
+    scale_ax.set_xlabel(f'{t_min}–{t_max} s', fontsize=8)
+    scale_ax.set_ylabel(f'±{y_abs:.1f} µV', fontsize=8)
     scale_ax.set_xticks([t_min, 0, t_max])
-    scale_ax.set_xticklabels([str(t_min), '0', str(t_max)], fontsize=6)
+    scale_ax.set_xticklabels([str(t_min), '0', str(t_max)], fontsize=7)
     scale_ax.set_yticks([])
     for spine in scale_ax.spines.values():
         spine.set_linewidth(0.5)
 
+    # Title styling
     fig.suptitle(
         f'{participant_id} – {session_name}  |  ERP topo layout  '
         f'[baseline: {baseline_name}]\n'
         f'Active (red) vs Sham (blue)  |  window: {t_min} to {t_max} s',
-        fontsize=11, fontweight='bold',
+        fontsize=13, fontweight='bold', y=0.96
     )
+    
     fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
     plt.close(fig)
     print(f'      Saved ERP topo overlay: {fname}')
