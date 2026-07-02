@@ -4,9 +4,10 @@ For each participant and session:
   1. Find the raw BrainVision (.vhdr) files
   2. Downsample to RESAMPLE_FREQ (256 Hz) *before* loading into RAM
   3. Bandpass filter (0.1–40 Hz) + notch filter (50 Hz)
-  4. Run ICA to remove ocular and cardiac artefacts
-  5. Save the cleaned raw as  TUNES/preprocessed/<pid>/<session_target>_raw.fif
-  6. Save a pre-ICA snapshot (first 5 min, VIZ_CHANNELS only) for QC plots                 
+  4. Run ICA to remove ocular and cardiac artefacts (optional toggle)
+  5. Reference to Average
+  6. Save the cleaned raw as  TUNES/preprocessed/<pid>/<session_target>_raw.fif
+  7. Save a pre-ICA snapshot (first 5 min, VIZ_CHANNELS only) for QC plots                 
 """
 
 import argparse
