@@ -40,12 +40,12 @@ from matplotlib.colors import Normalize
 from matplotlib.lines import Line2D
 
 import mne
-from mne.channels.layout import _find_topomap_coords
 import numpy as np
 import pandas as pd
 import yasa
 from scipy.signal import welch
 from scipy.signal import spectrogram as scipy_spectrogram
+from scipy.stats import wilcoxon, mannwhitneyu
 from scipy import stats as sp_stats
 from scipy.signal import butter, filtfilt
 from scipy.stats import linregress
@@ -101,6 +101,10 @@ INTENSITY_COMMENTS = {
     'stim':            'ignore',
     'transducer away': 'ignore',
     'reprep':          'ignore',
+}
+CSV_ISPPA_MAP = {
+    60.0: 'active_60w',
+     1.0: 'sham_1isppa',
 }
 ACTIVE_CONDITIONS = {'active_60w'}
 SHAM_CONDITIONS   = {'sham_1isppa'}
@@ -196,7 +200,8 @@ def load_original_sfreq(participant_id, target, fallback=5000.0):
 
 def find_vmrk(participant_id, target):
     """
-    Locate the .vmrk marker file.
+    Locate ALL .vmrk marker files for a session.
+    Returns a list of paths (sorted), or empty list if none found.
     This is the ONLY access to the raw subjects folder in analysis.py.
     """
     subject_folder = Path(MARKERS_ROOT) / participant_id
@@ -209,9 +214,123 @@ def find_vmrk(participant_id, target):
             continue
         vmrk_files = sorted(folder.glob('*.vmrk'))
         if vmrk_files:
-            return str(vmrk_files[0])
-    return None
+            return [str(p) for p in vmrk_files]
+    return []
 
+
+#statistics helpers
+def _bh_fdr_correct(pvals):
+    """
+    Benjamini-Hochberg FDR correction.
+    pvals : array-like of raw p-values (may contain np.nan)
+    Returns corrected p-values in the same order, nan preserved.
+    """
+    pvals = np.asarray(pvals, dtype=float)
+    n = len(pvals)
+    out = np.full(n, np.nan)
+ 
+    valid_mask = ~np.isnan(pvals)
+    valid_p = pvals[valid_mask]
+    n_valid = len(valid_p)
+    if n_valid == 0:
+        return out
+ 
+    order = np.argsort(valid_p)
+    ranked = valid_p[order]
+    corrected = ranked * n_valid / (np.arange(n_valid) + 1)
+    corrected = np.minimum.accumulate(corrected[::-1])[::-1]
+    corrected = np.clip(corrected, 0, 1)
+ 
+    corrected_full = np.empty(n_valid)
+    corrected_full[order] = corrected
+    out[valid_mask] = corrected_full
+    return out
+ 
+ 
+def _p_to_stars(p):
+    if p is None or np.isnan(p):
+        return ''
+    if p < 0.001:
+        return '***'
+    elif p < 0.01:
+        return '**'
+    elif p < 0.05:
+        return '*'
+    else:
+        return 'ns'
+ 
+ 
+def _paired_wilcoxon(pre_vals, post_vals):
+    """
+    Paired Wilcoxon signed-rank test between pre and post values
+    for the same trials/participant. Returns p-value or np.nan if
+    the test cannot be run (too few pairs, all-zero differences, etc).
+    """
+    pre_vals = np.asarray(pre_vals, dtype=float)
+    post_vals = np.asarray(post_vals, dtype=float)
+    n = min(len(pre_vals), len(post_vals))
+    if n < 3:
+        return np.nan
+    pre_vals = pre_vals[:n]
+    post_vals = post_vals[:n]
+    diffs = post_vals - pre_vals
+    if np.all(diffs == 0):
+        return np.nan
+    try:
+        _, p = wilcoxon(pre_vals, post_vals, zero_method='wilcox')
+        return p
+    except ValueError:
+        return np.nan
+ 
+ 
+def _unpaired_mannwhitney(vals_a, vals_b):
+    """
+    Mann-Whitney U test between two independent groups
+    (e.g. sham vs active). Returns p-value or np.nan.
+    """
+    vals_a = np.asarray(vals_a, dtype=float)
+    vals_b = np.asarray(vals_b, dtype=float)
+    if len(vals_a) < 3 or len(vals_b) < 3:
+        return np.nan
+    try:
+        _, p = mannwhitneyu(vals_a, vals_b, alternative='two-sided')
+        return p
+    except ValueError:
+        return np.nan
+ 
+ 
+def _add_sig_bracket(ax, x1, x2, y, p_corrected, color='#222', fontsize=8,
+                      bracket_frac=0.035):
+    """
+    Draw a significance bracket with stars (or 'ns') between x1 and x2
+    at height y. Skips drawing entirely if p_corrected is nan (test
+    could not be run).
+    """
+    if p_corrected is None or np.isnan(p_corrected):
+        return
+    stars = _p_to_stars(p_corrected)
+    ylo, yhi = ax.get_ylim()
+    h = (yhi - ylo) * bracket_frac
+    ax.plot([x1, x1, x2, x2], [y, y + h, y + h, y],
+            lw=1.0, c=color, clip_on=False)
+    ax.text((x1 + x2) / 2, y + h, stars, ha='center', va='bottom',
+            fontsize=fontsize, color=color, clip_on=False)
+ 
+ 
+def _bracket_y(*value_arrays, pad_frac=0.10):
+    """
+    Compute a sensible y position for a significance bracket, sitting
+    just above the highest data point (incl. whiskers) across the
+    given arrays. Falls back to 0 if everything is empty.
+    """
+    all_vals = np.concatenate([np.asarray(v, dtype=float).ravel()
+                                for v in value_arrays if len(v)])
+    if len(all_vals) == 0:
+        return 0.0, 1.0
+    lo, hi = np.nanmin(all_vals), np.nanmax(all_vals)
+    span = hi - lo if hi > lo else max(abs(hi), 1.0)
+    return hi + span * pad_frac, span
+ 
 
 # =============================================================================
 # Sleep staging
@@ -479,42 +598,76 @@ def _plot_spectral_power(power_df, session_name, participant_id, output_dir):
 # =============================================================================
 # Marker / burst parsing
 # =============================================================================
+def load_csv_condition_sequence(session_folder: str) -> list:
+    folder    = Path(session_folder)
+    csv_files = sorted(folder.glob('Condition_matrix_*.csv'))
+    if not csv_files:
+        return []
+    conditions = []
+    for csv_path in csv_files:
+        try:
+            df = pd.read_csv(csv_path, sep=',', encoding='latin-1', engine='python')
+            isppa_cols = [c for c in df.columns if 'ISPPA' in c.upper()]
+            if not isppa_cols:
+                print(f'    [CSV] No ISPPA column in {csv_path.name} — skipping')
+                continue
+            isppa_col = isppa_cols[0]
+            delivered = df[df[isppa_col].notna()]
+            for val in delivered[isppa_col]:
+                cond = CSV_ISPPA_MAP.get(float(val), 'unknown')
+                conditions.append(cond)
+        except Exception as exc:
+            print(f'    [CSV] Could not read {csv_path.name}: {exc}')
+    print(f'    [CSV path] {len(csv_files)} CSV files → {len(conditions)} delivered trials')
+    return conditions
 
-def parse_tus_markers_bursts(vmrk_path, original_sfreq, burst_gap_threshold=0.5):
+
+def _parse_vmrk_pulses(vmrk_path: str, original_sfreq: float):
     pulses            = []
+    b_markers         = []
     current_condition = 'unknown'
-    with open(vmrk_path, 'r', encoding='utf-8', errors='replace') as f:
-        for line in f:
+    has_comments      = False
+    with open(vmrk_path, 'r', encoding='utf-8', errors='replace') as fh:
+        for line in fh:
             if not line.startswith('Mk'):
                 continue
-            _, fields_str = line.strip().split('=', 1)
-            fields = fields_str.split(',')
-            if len(fields) < 3:
+            _, rest = line.strip().split('=', 1)
+            parts = rest.split(',')
+            if len(parts) < 3:
                 continue
-            marker_type = fields[0]
-            label       = fields[1].strip()
-            sample      = int(fields[2])
+            marker_type = parts[0]
+            label       = parts[1].strip()
+            sample      = int(parts[2])
             if marker_type == 'Comment':
                 text = label.lower()
                 for keyword, condition in INTENSITY_COMMENTS.items():
                     if keyword in text:
                         current_condition = condition
+                        has_comments      = True
                         break
+            elif marker_type == 'Stimulus' and label == 'B':
+                b_markers.append({
+                    'sample_original': sample,
+                    'time_sec':        sample / original_sfreq,
+                })
             elif marker_type == 'Stimulus' and label == TUS_MARKER_CODE:
                 pulses.append({
                     'sample_original': sample,
                     'time_sec':        sample / original_sfreq,
                     'condition':       current_condition,
                 })
-    if not pulses:
+    return pulses, b_markers, has_comments
+
+def _group_into_bursts(df: pd.DataFrame, burst_gap_threshold: float) -> pd.DataFrame:
+    if df.empty:
         return pd.DataFrame()
-    df = pd.DataFrame(pulses)
-    df = df[df['condition'] != 'unknown'].reset_index(drop=True)
     df = df.sort_values('sample_original').reset_index(drop=True)
     df['trigger_seq_all']       = np.arange(1, len(df) + 1)
     df['trigger_seq_condition'] = df.groupby('condition').cumcount() + 1
-    df['gap_sec']  = df['time_sec'].diff()
-    df['burst_id'] = (df['gap_sec'].isna() | (df['gap_sec'] > burst_gap_threshold)).cumsum()
+    df['gap_sec']               = df['time_sec'].diff()
+    df['burst_id']              = (
+        df['gap_sec'].isna() | (df['gap_sec'] > burst_gap_threshold)
+    ).cumsum()
     burst_rows = []
     for burst_id, group in df.groupby('burst_id'):
         group = group.sort_values('sample_original')
@@ -524,7 +677,9 @@ def parse_tus_markers_bursts(vmrk_path, original_sfreq, burst_gap_threshold=0.5)
             'time_sec':                    float(group['time_sec'].iloc[0]),
             'condition':                   group['condition'].iloc[0],
             'n_pulses':                    len(group),
-            'duration_sec':                float(group['time_sec'].iloc[-1] - group['time_sec'].iloc[0]),
+            'duration_sec':                float(
+                group['time_sec'].iloc[-1] - group['time_sec'].iloc[0]
+            ),
             'first_trigger_seq_all':       int(group['trigger_seq_all'].iloc[0]),
             'last_trigger_seq_all':        int(group['trigger_seq_all'].iloc[-1]),
             'first_trigger_seq_condition': int(group['trigger_seq_condition'].iloc[0]),
@@ -532,6 +687,84 @@ def parse_tus_markers_bursts(vmrk_path, original_sfreq, burst_gap_threshold=0.5)
         })
     bursts = pd.DataFrame(burst_rows)
     bursts.insert(0, 'burst_seq_all', np.arange(1, len(bursts) + 1))
+    return bursts
+
+def parse_tus_markers_bursts(vmrk_path: str,
+                              original_sfreq: float,
+                              burst_gap_threshold: float = 0.5,
+                              session_folder: str = None) -> pd.DataFrame:
+    if session_folder is None:
+        session_folder = str(Path(vmrk_path).parent)
+
+    pulses, b_markers, has_comments = _parse_vmrk_pulses(vmrk_path, original_sfreq)
+    if not pulses:
+        return pd.DataFrame()
+
+    if has_comments:
+        # ── PATH 1: Comment-marker protocol (old sessions) ────────────────
+        print(f'    [parse_tus_markers_bursts] PATH 1: Comment markers found')
+        df = pd.DataFrame(pulses)
+        df = df[df['condition'] != 'unknown'].reset_index(drop=True)
+        df = df[df['condition'] != 'ignore'].reset_index(drop=True)
+        bursts = _group_into_bursts(df, burst_gap_threshold)
+
+    else:
+        # ── PATH 2: Raspberry Pi CSV fallback (new sessions) ──────────────
+        print(f'    [parse_tus_markers_bursts] PATH 2: No Comment markers — '
+              f'using Raspberry Pi CSV condition sequence')
+        csv_conditions = load_csv_condition_sequence(session_folder)
+        if not csv_conditions:
+            print(f'    [CSV path] WARNING: no Condition_matrix CSV files found '
+                  f'in {session_folder} — cannot assign conditions')
+            return pd.DataFrame()
+
+        b_markers_sorted = sorted(b_markers, key=lambda x: x['sample_original'])
+        n_b   = len(b_markers_sorted)
+        n_csv = len(csv_conditions)
+        n_use = min(n_b, n_csv)
+        if n_b != n_csv:
+            print(f'    [CSV path] WARNING: {n_b} vmrk B-markers vs '
+                  f'{n_csv} CSV delivered trials — using first {n_use} of each')
+
+        df = pd.DataFrame(pulses)
+        df = df.sort_values('sample_original').reset_index(drop=True)
+        df['gap_sec']  = df['time_sec'].diff()
+        df['burst_id'] = (
+            df['gap_sec'].isna() | (df['gap_sec'] > burst_gap_threshold)
+        ).cumsum()
+
+        burst_rows = []
+        cond_seq   = {}
+        for burst_idx, (burst_id, group) in enumerate(df.groupby('burst_id')):
+            if burst_idx >= n_use:
+                break
+            condition = csv_conditions[burst_idx]
+            if condition == 'unknown':
+                continue
+            group = group.sort_values('sample_original')
+            cond_seq[condition] = cond_seq.get(condition, 0) + 1
+            burst_rows.append({
+                'burst_id':                    int(burst_id),
+                'sample_original':             int(group['sample_original'].iloc[0]),
+                'time_sec':                    float(group['time_sec'].iloc[0]),
+                'condition':                   condition,
+                'n_pulses':                    len(group),
+                'duration_sec':                float(
+                    group['time_sec'].iloc[-1] - group['time_sec'].iloc[0]
+                ),
+                'first_trigger_seq_all':       int(group.index[0]  + 1),
+                'last_trigger_seq_all':        int(group.index[-1] + 1),
+                'first_trigger_seq_condition': cond_seq[condition],
+                'last_trigger_seq_condition':  cond_seq[condition],
+            })
+
+        if not burst_rows:
+            print('    [CSV path] No bursts matched — check CSV files and vmrk')
+            return pd.DataFrame()
+
+        bursts = pd.DataFrame(burst_rows)
+        bursts.insert(0, 'burst_seq_all', np.arange(1, len(bursts) + 1))
+
     print(f'    Bursts: {bursts["condition"].value_counts().to_dict()}')
     return bursts
 
@@ -766,15 +999,22 @@ def _save_burst_locked_spindle_summary(burst_locked_df, session_name,
 def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
                               freq_band, session_name, participant_id,
                               target, is_adaptation, output_dir):
-    if is_adaptation or not vmrk_path or not Path(vmrk_path).exists():
+    if is_adaptation or not vmrk_path:
         return {}
     print(f'\n[8] Burst-level analysis: {participant_id} / {session_name}')
     original_sfreq = load_original_sfreq(participant_id, target)
-    bursts = parse_tus_markers_bursts(vmrk_path, original_sfreq)
-    if bursts.empty:
+    # NEW
+    all_bursts = []
+    for vp in vmrk_path:   # vmrk_path is now a list
+        b = parse_tus_markers_bursts(vp, original_sfreq,
+                                    session_folder=str(Path(vp).parent))
+        if not b.empty:
+            all_bursts.append(b)
+    if not all_bursts:
         print('    No bursts found')
         return {}
-
+    bursts = pd.concat(all_bursts, ignore_index=True)
+    bursts['burst_seq_all'] = np.arange(1, len(bursts) + 1)
     analysis_is_nrem = hypno_int is not None
     sfreq        = raw.info['sfreq']
     nrem_mask    = nrem_mask_from_hypno(hypno_int, raw)
@@ -2387,6 +2627,30 @@ def plot_spindle_boxplots(pulse_df, session_info, output_dir, suffix=''):
     if not _already_done(output_dir, fname):
         nrow = len(channels)
         ncol = len(pre_post_pairs)
+ 
+        # --- Pass 1: compute raw p-values for every channel × feature ×
+        #     condition, so FDR correction can run across channels within
+        #     each (feature, condition) combination. ---
+        raw_p = {}  # (feat_idx, condition) -> list of p-values, indexed by channel row
+        for col_idx, (pre_feat, post_feat, feat_label) in enumerate(pre_post_pairs):
+            for condition in ['sham', 'active']:
+                pvals = []
+                for ch in channels:
+                    pre_col  = f'{ch}_{pre_feat}'
+                    post_col = f'{ch}_{post_feat}'
+                    if pre_col in pulse_df.columns and post_col in pulse_df.columns:
+                        mask = pulse_df['group'] == condition
+                        pre_vals  = pulse_df.loc[mask, pre_col].dropna().values
+                        post_vals = pulse_df.loc[mask, post_col].dropna().values
+                        pvals.append(_paired_wilcoxon(pre_vals, post_vals))
+                    else:
+                        pvals.append(np.nan)
+                raw_p[(col_idx, condition)] = pvals
+ 
+        corrected_p = {
+            key: _bh_fdr_correct(vals) for key, vals in raw_p.items()
+        }
+ 
         fig, axes = plt.subplots(
             nrow, ncol,
             figsize=(ncol * 3.6, nrow * 3.2),
@@ -2457,12 +2721,29 @@ def plot_spindle_boxplots(pulse_df, session_info, output_dir, suffix=''):
                                 transform=ax.get_xaxis_transform(),
                                 ha='center', fontsize=8, color='#555')
  
+                # --- Significance brackets: pre vs post within each condition ---
+                sham_p   = corrected_p[(col_idx, 'sham')][row_idx]
+                active_p = corrected_p[(col_idx, 'active')][row_idx]
+ 
+                y_sham, _   = _bracket_y(groups_data[0], groups_data[1])
+                y_active, _ = _bracket_y(groups_data[2], groups_data[3])
+                y_top = max(y_sham, y_active)
+ 
+                _add_sig_bracket(ax, 1, 2, y_top, sham_p)
+                _add_sig_bracket(ax, 3, 4, y_top, active_p)
+ 
+                # give brackets room to breathe
+                ylo, yhi = ax.get_ylim()
+                ax.set_ylim(ylo, yhi + (yhi - ylo) * 0.12)
+ 
         fig.suptitle(
             f'{pid} – {session}: pre vs post power  [Sham | Active]\n'
-            f'Baseline: −3 to 0 s  |  Response: 0 to +5 s  (re: TUS onset)',
-            fontsize=10, fontweight='bold', y=1.01,
+            f'Baseline: −3 to 0 s  |  Response: 0 to +5 s  (re: TUS onset)\n'
+            f'Wilcoxon signed-rank, BH–FDR corrected across channels '
+            f'(* p<0.05, ** p<0.01, *** p<0.001)',
+            fontsize=10, fontweight='bold', y=1.03,
         )
-        fig.tight_layout(rect=[0, 0, 1, 0.99])
+        fig.tight_layout(rect=[0, 0, 1, 0.97])
         fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
         plt.close(fig)
         print(f'    Saved pre/post boxplots: {fname}')
@@ -2476,6 +2757,24 @@ def plot_spindle_boxplots(pulse_df, session_info, output_dir, suffix=''):
     if not _already_done(output_dir, fname2):
         nrow2 = len(channels)
         ncol2 = len(ratio_features)
+ 
+        # --- Pass 1: raw p-values per channel for each feature column,
+        #     corrected across channels within that feature. ---
+        raw_p2 = {}
+        for col_idx, (feat_suffix, feat_label) in enumerate(ratio_features):
+            pvals = []
+            for ch in channels:
+                col_name = f'{ch}_{feat_suffix}'
+                if col_name in pulse_df.columns:
+                    sham_vals   = pulse_df.loc[pulse_df['group'] == 'sham',   col_name].dropna().values
+                    active_vals = pulse_df.loc[pulse_df['group'] == 'active', col_name].dropna().values
+                    pvals.append(_unpaired_mannwhitney(sham_vals, active_vals))
+                else:
+                    pvals.append(np.nan)
+            raw_p2[col_idx] = pvals
+ 
+        corrected_p2 = {key: _bh_fdr_correct(vals) for key, vals in raw_p2.items()}
+ 
         fig2, axes2 = plt.subplots(
             nrow2, ncol2,
             figsize=(ncol2 * 3.6, nrow2 * 3.2),
@@ -2523,16 +2822,26 @@ def plot_spindle_boxplots(pulse_df, session_info, output_dir, suffix=''):
                 if row_idx == 0:
                     ax.set_title(feat_label, fontsize=9, fontweight='bold', pad=5)
  
+                # --- Significance bracket: sham vs active ---
+                p_corr = corrected_p2[col_idx][row_idx]
+                y_top, _ = _bracket_y(sham_vals, active_vals)
+                _add_sig_bracket(ax, 1, 2, y_top, p_corr)
+ 
+                ylo, yhi = ax.get_ylim()
+                ax.set_ylim(ylo, yhi + (yhi - ylo) * 0.12)
+ 
         fig2.suptitle(
             f'{pid} – {session}: sigma change & amplitude  [Sham vs Active]\n'
-            f'Baseline: −3 to 0 s  |  Response: 0 to +5 s  (re: TUS onset)',
-            fontsize=10, fontweight='bold', y=1.01,
+            f'Baseline: −3 to 0 s  |  Response: 0 to +5 s  (re: TUS onset)\n'
+            f'Mann–Whitney U, BH–FDR corrected across channels '
+            f'(* p<0.05, ** p<0.01, *** p<0.001)',
+            fontsize=10, fontweight='bold', y=1.03,
         )
-        fig2.tight_layout(rect=[0, 0, 1, 0.99])
+        fig2.tight_layout(rect=[0, 0, 1, 0.97])
         fig2.savefig(Path(output_dir) / fname2, dpi=200, bbox_inches='tight')
         plt.close(fig2)
         print(f'    Saved change boxplots: {fname2}')
-
+ 
 
 def plot_spindle_violins(pulse_df, session_info, output_dir, suffix=''):
     pid     = session_info['participant_id']
@@ -2560,6 +2869,25 @@ def plot_spindle_violins(pulse_df, session_info, output_dir, suffix=''):
  
     nrow = len(channels)
     ncol = len(ratio_features)
+ 
+    # --- Pass 1: raw p-values per channel for each feature column,
+    #     corrected across channels within that feature (same test
+    #     family as Figure 2 above — Mann-Whitney, sham vs active). ---
+    raw_p = {}
+    for col_idx, (feat_suffix, feat_label) in enumerate(ratio_features):
+        pvals = []
+        for ch in channels:
+            col_name = f'{ch}_{feat_suffix}'
+            if col_name in pulse_df.columns:
+                sham_vals   = pulse_df.loc[pulse_df['group'] == 'sham',   col_name].dropna().values
+                active_vals = pulse_df.loc[pulse_df['group'] == 'active', col_name].dropna().values
+                pvals.append(_unpaired_mannwhitney(sham_vals, active_vals))
+            else:
+                pvals.append(np.nan)
+        raw_p[col_idx] = pvals
+ 
+    corrected_p = {key: _bh_fdr_correct(vals) for key, vals in raw_p.items()}
+ 
     fig, axes = plt.subplots(
         nrow, ncol,
         figsize=(ncol * 3.6, nrow * 3.4),
@@ -2636,17 +2964,25 @@ def plot_spindle_violins(pulse_df, session_info, output_dir, suffix=''):
             if row_idx == 0:
                 ax.set_title(feat_label, fontsize=9, fontweight='bold', pad=5)
  
+            # --- Significance bracket: sham vs active ---
+            p_corr = corrected_p[col_idx][row_idx]
+            y_top, _ = _bracket_y(groups_data[0], groups_data[1])
+            _add_sig_bracket(ax, positions[0], positions[1], y_top, p_corr)
+ 
+            ylo, yhi = ax.get_ylim()
+            ax.set_ylim(ylo, yhi + (yhi - ylo) * 0.12)
+ 
     fig.suptitle(
         f'{pid} – {session}: sigma change & amplitude  [violin + box]\n'
-        f'Baseline: −3 to 0 s  |  Response: 0 to +5 s  (re: TUS onset)',
-        fontsize=10, fontweight='bold', y=1.01,
+        f'Baseline: −3 to 0 s  |  Response: 0 to +5 s  (re: TUS onset)\n'
+        f'Mann–Whitney U, BH–FDR corrected across channels '
+        f'(* p<0.05, ** p<0.01, *** p<0.001)',
+        fontsize=10, fontweight='bold', y=1.03,
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.99])
+    fig.tight_layout(rect=[0, 0, 1, 0.97])
     fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
     plt.close(fig)
     print(f'    Saved violin plots: {fname}')
- 
-
 
 # =============================================================================
 # Feature assembly + session runner
