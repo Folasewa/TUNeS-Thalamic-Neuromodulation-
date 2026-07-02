@@ -1729,10 +1729,8 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     mean_erp = mean_erps[ch_idx_list]
                     sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
                                 if len(clean_trials) > 1 else np.zeros(n_samples))
-                    ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,
-                                    color=color, alpha=0.3)
-                    ax.plot(times, mean_erp, color=color, lw=1.8,
-                            label=f'n={len(clean_trials)}')
+                    ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,color=color, alpha=0.3)
+                    ax.plot(times, mean_erp, color=color, lw=1.8,label=f'n={len(clean_trials)}')
                     ax.axvline(0, color='black', lw=0.9, ls='--', alpha=0.7)
                     ax.axhline(0, color='grey',  lw=0.5, ls=':')
                     ax.axvspan(-ERP_BASELINE_SEC, 0, color='grey', alpha=0.07, label='Baseline' if idx_ch == 0 else '_')
@@ -1916,6 +1914,177 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
 
     # ── outside baseline loop ─────────────────────────────────────────────
     return focus_channel_by_condition.get('active', channels[0] if channels else None)
+
+def plot_erps_500ms(raw, bursts_df, freq_band, session_name, participant_id, output_dir, suffix=''):
+    """
+    Plots ERPs strictly using a 500ms post-stimulus window across all baselines.
+    Outputs figures for: All Channels, Top 10 Channels, and Top 3 Channels.
+    X-axis is scaled to milliseconds (ms) to clearly evaluate early peaks.
+    """
+    if 'burst_time_s' not in bursts_df.columns:
+        print('    plot_erps_500ms: burst_time_s column missing — skipping')
+        return None
+        
+    bursts_df['burst_time_s'] = pd.to_numeric(bursts_df['burst_time_s'], errors='coerce')
+    bursts_df = bursts_df.dropna(subset=['burst_time_s'])
+
+    channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)
+                if raw.ch_names[i] not in EXCLUDE_CHANNELS]
+    if not channels or bursts_df.empty:
+        return None
+
+    # ── FIXED 500MS POST-STIMULUS CONFIGURATION ──────────────────────────────
+    POST_STIMULUS_SEC = 0.5   
+    sfreq             = raw.info['sfreq']
+    pre_samples       = int(TUS_EPOCH_PRE_SEC * sfreq)
+    post_samples      = int(POST_STIMULUS_SEC * sfreq)
+    n_samples         = pre_samples + post_samples
+    
+    # Generate time base and instantly scale to milliseconds
+    times_ms          = np.linspace(-TUS_EPOCH_PRE_SEC, POST_STIMULUS_SEC, n_samples) * 1000
+    post_start_idx    = pre_samples
+    # ─────────────────────────────────────────────────────────────────────────
+
+    # Extract raw data epochs for Sham and Active blocks
+    all_epochs = {ch: {} for ch in channels}
+    for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
+        mask = bursts_df['condition'].isin(condition_set)
+        group_df = bursts_df[mask].reset_index(drop=True)
+
+        for ch in channels:
+            ch_idx = raw.ch_names.index(ch)
+            trials = []
+            for _, burst in group_df.iterrows():
+                center = int(burst['burst_time_s'] * sfreq)
+                start, stop = center - pre_samples, center + post_samples
+                if start < 0 or stop > raw.n_times:
+                    trials.append(np.full(n_samples, np.nan))
+                    continue
+                trial = raw.get_data(picks=[ch_idx], start=start, stop=stop)[0] * 1e6
+                trials.append(trial)
+            all_epochs[ch][group_label] = np.array(trials)
+
+    # Loop through your 3 baseline styles (none, pre_mean, pre_zscore)
+    for baseline_name, baseline_mode in ERP_BASELINES.items():
+        print(f'\n    ERP 500ms baseline: {baseline_name}')
+        
+        # We will collect active vs sham means to help track rankings and plotting limits
+        mean_erps_active = []
+        mean_erps_sham   = []
+        clean_trials_active = {}
+        clean_trials_sham   = {}
+        
+        # ── DATA CLEANING & BASELINING FOR BOTH CONDITIONS ───────────────────
+        for group_label in ('sham', 'active'):
+            BAD_CHANNEL_REJECTION_RATE = 0.30
+            n_trials = all_epochs[channels[0]][group_label].shape[0]
+            good_channels = []
+
+            for ch in channels:
+                raw_trials = all_epochs[ch][group_label].copy()
+                corrected = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
+                finite_mask = np.all(np.isfinite(corrected), axis=1)
+                noise_mask, _ = _exclude_noisy_trials(corrected[finite_mask])
+                if (int((~noise_mask).sum()) / n_trials) <= BAD_CHANNEL_REJECTION_RATE:
+                    good_channels.append(ch)
+
+            global_keep = np.ones(n_trials, dtype=bool)
+            for ch in good_channels:
+                raw_trials = all_epochs[ch][group_label].copy()
+                corrected = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
+                finite_mask = np.all(np.isfinite(corrected), axis=1)
+                noise_mask, _ = _exclude_noisy_trials(corrected[finite_mask])
+                trial_keep = np.zeros(n_trials, dtype=bool)
+                trial_keep[np.where(finite_mask)[0][noise_mask]] = True
+                global_keep &= trial_keep
+
+            for ch in channels:
+                raw_trials = all_epochs[ch][group_label].copy()
+                corrected = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
+                clean = corrected[global_keep] if ch in good_channels else np.full((int(global_keep.sum()), n_samples), np.nan)
+                m_erp = clean.mean(axis=0) if (len(clean) and not np.all(np.isnan(clean))) else np.full(n_samples, np.nan)
+                
+                if group_label == 'active':
+                    mean_erps_active.append(m_erp)
+                    clean_trials_active[ch] = clean
+                else:
+                    mean_erps_sham.append(m_erp)
+                    clean_trials_sham[ch] = clean
+
+        # Calculate Channel Rankings based on peak |ERP| amplitude in the active group
+        ranked_chs, scores = _rank_channels_by_erp(mean_erps_active, channels, post_start_idx)
+        ylabel_erp = 'µV' if baseline_name != 'pre_zscore' else 'z-score'
+
+        # ── DEFINE THE 3 CHANNEL SUBSETS TO PLOT ─────────────────────────────
+        plot_configurations = [
+            ('all', channels),
+            ('top10', ranked_chs[:10]),
+            ('top3', ranked_chs[:3])
+        ]
+
+        # ── PLOTTING LOOP FOR THE 3 CONFIGURATIONS ───────────────────────────
+        for subset_name, ch_list in plot_configurations:
+            if not ch_list:
+                continue
+                
+            fname = f'{participant_id}_{session_name}_{suffix}_ERP_{baseline_name}_{subset_name}_500ms.png'
+            if _already_done(output_dir, fname):
+                continue
+
+            ncols = 3 if subset_name != 'top3' else 3
+            nrows = int(np.ceil(len(ch_list) / ncols))
+            
+            fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4 * nrows), sharex=True, squeeze=False)
+            
+            for idx_ch, ch in enumerate(ch_list):
+                r_i, c_i = divmod(idx_ch, ncols)
+                ax = axes[r_i][c_i]
+                
+                ch_idx = channels.index(ch)
+                
+                # Plot Sham (Blue)
+                sham_clean = clean_trials_sham[ch]
+                sham_mean  = mean_erps_sham[ch_idx]
+                sham_sem   = (sham_clean.std(axis=0) / np.sqrt(len(sham_clean)) if len(sham_clean) > 1 else np.zeros(n_samples))
+                ax.fill_between(times_ms, sham_mean - sham_sem, sham_mean + sham_sem, color='#4B7BE0', alpha=0.2)
+                ax.plot(times_ms, sham_mean, color='#4B7BE0', lw=1.2, label='Sham')
+
+                # Plot Active (Red)
+                act_clean = clean_trials_active[ch]
+                act_mean  = mean_erps_active[ch_idx]
+                act_sem   = (act_clean.std(axis=0) / np.sqrt(len(act_clean)) if len(act_clean) > 1 else np.zeros(n_samples))
+                ax.fill_between(times_ms, act_mean - act_sem, act_mean + act_sem, color='#E04B4B', alpha=0.2)
+                ax.plot(times_ms, act_mean, color='#E04B4B', lw=1.2, label='Active')
+
+                # Visual Anchors for Early Peak Tracking
+                ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7)  # TUS Onset Line
+                ax.axhline(0, color='grey', lw=0.5, ls=':', alpha=0.5)
+                ax.set_xlim(times_ms[0], times_ms[-1])
+                ax.set_title(f'Channel: {ch}', fontsize=12, fontweight='bold')
+                ax.set_ylabel(ylabel_erp, fontsize=10)
+                ax.grid(True, ls='--', alpha=0.4) # Dashed background grid to visually map latency
+
+                # Label the X-axis on the bottom row charts
+                if r_i == nrows - 1:
+                    ax.set_xlabel('Time (ms)', fontsize=11)
+                
+                if idx_ch == 0:
+                    ax.legend(loc='upper right', fontsize=9)
+
+            # Hide empty subplots if the grid has leftover spaces
+            for remaining in range(idx_ch + 1, nrows * ncols):
+                r_i, c_i = divmod(remaining, ncols)
+                fig.delaxes(axes[r_i][c_i])
+
+            fig.suptitle(
+                f'{participant_id} ({session_name}) | 500ms Window ({subset_name.upper()})\n'
+                f'Baseline Treatment: {baseline_name}', 
+                fontsize=14, fontweight='bold', y=0.98
+            )
+            fig.tight_layout()
+            fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
+            plt.close(fig)
+            print(f'      Saved 500ms ERP subset figure: {fname}')
 
 
 def plot_tfrs(raw, bursts_df, freq_band, session_name, participant_id,
@@ -2574,12 +2743,8 @@ def process_one_session(participant_id, target, session_name, is_adaptation,
                 session_name, participant_id,
                 participant_output_dir, suffix,
             )
-            safe_plot(
-                plot_tfrs, raw, bursts_df, freq_band,
-                session_name, participant_id,
-                participant_output_dir, suffix,
-                focus_ch,
-            )
+            safe_plot(plot_erps_500ms, raw, bursts_df, freq_band, session_name, participant_id,participant_output_dir, suffix,)
+            safe_plot(plot_tfrs, raw, bursts_df, freq_band,session_name, participant_id,participant_output_dir, suffix,focus_ch,)
 
         del raw, hypno_up
         gc.collect()
