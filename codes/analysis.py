@@ -61,7 +61,7 @@ PREPROCESSED_DIR = '/home/e_fabdulsa/Desktop/TUNeS_sharbie/preprocessed'
 # timing.  No .vhdr or EEG signal data are ever loaded from here.
 MARKERS_ROOT     = '/home/e_fabdulsa/Desktop/TUNeS_sharbie/subjects'
 OUTPUT_DIR       = '/home/e_fabdulsa/Desktop/TUNeS_sharbie/results'
-PARTICIPANTS     = ['02', '03', '06', '08']
+PARTICIPANTS     = ['02', '03', '06', '08', '10']
 
 RESAMPLE_FREQ  = 500
 STAGING_FREQ   = 100
