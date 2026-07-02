@@ -1038,18 +1038,20 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
     print('    Computing global spectrogram scale ...')
     _all_db = []
     for ch in channels:
-        _d = raw.get_data(picks=[ch])[0]
-        _, _, _S = scipy_spectrogram(_d, fs=sfreq, nperseg=n_fft,
-                                     noverlap=n_fft - hop, scaling='density')
-        _fm = _ <= 30.0   # _ is freqs here; reuse variable to avoid shadowing
-        _, _, _S = scipy_spectrogram(_d, fs=sfreq, nperseg=n_fft,
-                                     noverlap=n_fft - hop, scaling='density')
-        _freqs_tmp, _, _S = scipy_spectrogram(_d, fs=sfreq, nperseg=n_fft,
-                                              noverlap=n_fft - hop, scaling='density')
-        _fm = _freqs_tmp <= 30.0
-        _db = 10 * np.log10(_S[_fm] + 1e-30)
-        _all_db.append(_db.ravel())
-        del _d, _S, _db
+        data = raw.get_data(picks=[ch])[0]
+
+        freqs_tmp, _, Sxx_tmp = scipy_spectrogram(
+            data,
+            fs=sfreq,
+            nperseg=n_fft,
+            noverlap=n_fft - hop,
+            scaling='density'
+        )
+
+        fmask = freqs_tmp <= 30.0
+        Sxx_db = 10 * np.log10(Sxx_tmp[fmask] + 1e-30)
+        _all_db.append(Sxx_db.ravel())
+        del data, Sxx_tmp, Sxx_db
     _all_db_flat = np.concatenate(_all_db)
     global_vmin  = float(np.percentile(_all_db_flat, 5))
     global_vmax  = float(np.percentile(_all_db_flat, 98))
@@ -1076,7 +1078,7 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
         pcm = ax.pcolormesh(
             times / 60, freqs[fmask], Sxx_db,
             cmap='inferno', shading='gouraud',
-            vmin=global_vmin, vmax=global_vmax,
+            vmin=np.percentile(Sxx_db, 5), vmax=np.percentile(Sxx_db, 98),
         )
         last_pcm = pcm
         del data, Sxx, Sxx_db
