@@ -37,6 +37,7 @@ BANDPASS_HIGH  = 40.0
 NOTCH_FREQ     = 50.0
  
 ICA_N_COMPONENTS = 20
+USE_ICA = False
 VIZ_CHANNELS = ['Fp1', 'Fp2', 'F3', 'F4', 'Fz',
                  'C3',  'C4',  'Cz',
                  'P3',  'P4',  'Pz',
@@ -117,52 +118,72 @@ def load_and_resample(vhdr_path):
 
 
 def preprocess(raw):
-    """Filter + ICA. Modifies raw in place, returns it."""
+    """Filter + optional ICA + average reference. Modifies raw in place."""
+
     raw.set_montage(
-        mne.channels.make_standard_montage('standard_1020'), on_missing='ignore'
+        mne.channels.make_standard_montage('standard_1020'),
+        on_missing='ignore'
     )
+
+    # mark physical reference channels as non-EEG
+    raw.set_channel_types({'TP9': 'misc', 'TP10': 'misc'})
+
+    # filtering first
     raw.filter(BANDPASS_LOW, BANDPASS_HIGH, verbose=False)
     raw.notch_filter(NOTCH_FREQ, verbose=False)
-    #mark tp9 and tp10 as non-eeg since we used them as physical reference
-    raw.set_channel_types({'TP9': 'misc', 'TP10': 'misc'})
-    # Re-reference to average
-    raw.set_eeg_reference('average', projection=False, verbose=False)
-    print('Re-referenced to Average')
- 
+
+    # artefact diagnostics
     ART_THRESHOLD_UV = 150.0
-    eeg_chs = [ch for idx, ch in enumerate(raw.ch_names)
-               if mne.channel_type(raw.info, idx) == 'eeg']
+    eeg_chs = [
+        ch for idx, ch in enumerate(raw.ch_names)
+        if mne.channel_type(raw.info, idx) == 'eeg'
+    ]
+
     if eeg_chs:
         data_uv = raw.get_data(picks=eeg_chs) * 1e6
-        flags   = np.abs(data_uv) > ART_THRESHOLD_UV
-        total   = flags.any(axis=0).mean() * 100
+        flags = np.abs(data_uv) > ART_THRESHOLD_UV
+        total = flags.any(axis=0).mean() * 100
         print(f'    Artefact rate (±{ART_THRESHOLD_UV} µV): {total:.1f}% of samples')
+
         del data_uv, flags
         gc.collect()
- 
-    if ICA_N_COMPONENTS is not None:
+
+    # optional ICA BEFORE re-referencing
+    if USE_ICA and ICA_N_COMPONENTS is not None:
         try:
             eeg_picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
-            n_comps   = min(ICA_N_COMPONENTS, len(eeg_picks) - 1)
+            n_comps = min(ICA_N_COMPONENTS, len(eeg_picks) - 1)
+
             print(f'    ICA: fitting {n_comps} components …')
+
             ica = mne.preprocessing.ICA(
-                n_components=n_comps, method='fastica',
-                random_state=42, max_iter='auto',
+                n_components=n_comps,
+                method='fastica',
+                random_state=42,
+                max_iter='auto'
             )
+
             raw_fit = raw.copy().filter(1.0, None, verbose=False)
             ica.fit(raw_fit, picks=eeg_picks, verbose=False)
+
             del raw_fit
             gc.collect()
- 
+
             exclude = []
-            eog_chs = [ch for ch in raw.ch_names
-                       if mne.channel_type(raw.info, raw.ch_names.index(ch)) == 'eog']
+
+            # EOG detection
+            eog_chs = [
+                ch for ch in raw.ch_names
+                if mne.channel_type(raw.info, raw.ch_names.index(ch)) == 'eog'
+            ]
+
             if eog_chs:
                 try:
                     idx, _ = ica.find_bads_eog(raw, ch_name=eog_chs, verbose=False)
                     exclude.extend(idx)
                 except Exception as e:
                     print(f'      EOG detection skipped: {e}')
+
             else:
                 frontal = [ch for ch in ['Fp1', 'Fp2'] if ch in raw.ch_names]
                 if frontal:
@@ -171,20 +192,30 @@ def preprocess(raw):
                         exclude.extend(idx)
                     except Exception:
                         pass
+
+            # ECG detection
             try:
                 idx, _ = ica.find_bads_ecg(raw, method='correlation', verbose=False)
                 exclude.extend(idx)
             except Exception as e:
                 print(f'      ECG detection skipped: {e}')
- 
+
             ica.exclude = list(set(exclude))
+
             print(f'    ICA: removing {len(ica.exclude)} components {ica.exclude}')
+
             ica.apply(raw)
+
             del ica
             gc.collect()
+
         except Exception as exc:
             print(f'    ICA failed ({exc}) — skipping')
- 
+
+    # average reference AFTER ICA
+    raw.set_eeg_reference('average', projection=False, verbose=False)
+    print('    Re-referenced to Average')
+
     return raw
 
 
