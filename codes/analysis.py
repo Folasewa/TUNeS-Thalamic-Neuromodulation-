@@ -600,10 +600,23 @@ def _plot_spectral_power(power_df, session_name, participant_id, output_dir):
 # Marker / burst parsing
 # =============================================================================
 def load_csv_condition_sequence(session_folder: str) -> list:
-    folder    = Path(session_folder)
-    csv_files = sorted(folder.glob('Condition_matrix_*.csv'))
+    folder = Path(session_folder)
+    # Condition_matrix_*.csv files may live directly inside the session
+    # folder, or nested inside a subfolder (e.g. "condition matrix",
+    # "Condition_Matrix", etc). Search recursively and match by filename,
+    # not by folder name, so we don't need to guess the subfolder's exact
+    # name or casing.
+    csv_files = sorted(
+        p for p in folder.rglob('*.csv')
+        if p.name.lower().startswith('condition_matrix')
+    )
     if not csv_files:
+        print(f'    [CSV] No Condition_matrix_*.csv found under {folder} (searched recursively)')
         return []
+    print(f'    [CSV] Found {len(csv_files)} condition matrix file(s) under {folder}:')
+    for p in csv_files:
+        print(f'      {p.relative_to(folder)}')
+
     conditions = []
     for csv_path in csv_files:
         try:
@@ -1196,8 +1209,9 @@ def save_burst_locked_slowwave_csv(burst_times_by_group, sw_summary,
 def plot_slowwave_region_comparison(participant_id, output_dir):
     """
     Participant-level comparison of slow-wave properties: Thalamus vs
-    Ventricle, Sham vs Active. Reads the per-burst slow-wave CSVs written
-    by save_burst_locked_slowwave_csv for both targets.
+    Ventricle, Sham vs Active — with significance brackets for both
+    Sham-vs-Active (within region) and Thalamus-vs-Ventricle (within
+    condition), Mann-Whitney U, BH-FDR corrected across metrics.
     """
     fname = f'{participant_id}_slowwave_region_comparison.png'
     if _already_done(output_dir, fname):
@@ -1239,11 +1253,27 @@ def plot_slowwave_region_comparison(participant_id, output_dir):
         print('    Slow-wave region comparison skipped: no metric columns found')
         return
 
-    fig, axes = plt.subplots(1, len(available_metrics), figsize=(5 * len(available_metrics), 5))
+    # --- Pass 1: raw p-values for all comparisons, all metrics, so FDR
+    #     correction can run across metrics within each comparison family ---
+    comparisons = [
+        ('thal_sham_vs_active', ('thalamus', 'sham'),  ('thalamus', 'active')),
+        ('vent_sham_vs_active', ('ventricle', 'sham'), ('ventricle', 'active')),
+        ('sham_thal_vs_vent',   ('thalamus', 'sham'),  ('ventricle', 'sham')),
+        ('active_thal_vs_vent', ('thalamus', 'active'),('ventricle', 'active')),
+    ]
+    raw_p = {name: [] for name, _, _ in comparisons}
+    for col, _ in available_metrics:
+        for name, (t1, c1), (t2, c2) in comparisons:
+            v1 = df.loc[(df['target'] == t1) & (df['condition'] == c1), col].dropna().values
+            v2 = df.loc[(df['target'] == t2) & (df['condition'] == c2), col].dropna().values
+            raw_p[name].append(_unpaired_mannwhitney(v1, v2))
+    corrected_p = {name: _bh_fdr_correct(vals) for name, vals in raw_p.items()}
+
+    fig, axes = plt.subplots(1, len(available_metrics), figsize=(5.5 * len(available_metrics), 5.5))
     if len(available_metrics) == 1:
         axes = [axes]
 
-    for ax, (col, label) in zip(axes, available_metrics):
+    for m_idx, (ax, (col, label)) in enumerate(zip(axes, available_metrics)):
         data = [
             df.loc[(df['target'] == t) & (df['condition'] == c), col].dropna().values
             for t, c in groups
@@ -1258,15 +1288,32 @@ def plot_slowwave_region_comparison(participant_id, output_dir):
         ax.set_title(label, fontsize=10, fontweight='bold')
         ax.spines[['top', 'right']].set_visible(False)
 
+        # --- significance brackets ---
+        y_base, _ = _bracket_y(*data)
+        ylo, yhi = ax.get_ylim()
+        step = (yhi - ylo) * 0.14
+
+        # tier 1: sham vs active within each region
+        _add_sig_bracket(ax, 1, 2, y_base, corrected_p['thal_sham_vs_active'][m_idx])
+        _add_sig_bracket(ax, 3, 4, y_base, corrected_p['vent_sham_vs_active'][m_idx])
+
+        # tier 2: thalamus vs ventricle within each condition (raised above tier 1)
+        _add_sig_bracket(ax, 1, 3, y_base + step,       corrected_p['sham_thal_vs_vent'][m_idx])
+        _add_sig_bracket(ax, 2, 4, y_base + step * 1.8, corrected_p['active_thal_vs_vent'][m_idx])
+
+        ylo, yhi = ax.get_ylim()
+        ax.set_ylim(ylo, yhi + (yhi - ylo) * 0.15)
+
     fig.suptitle(
-        f'{participant_id}: slow-wave properties — Thalamus vs Ventricle, Sham vs Active',
+        f'{participant_id}: slow-wave properties — Thalamus vs Ventricle, Sham vs Active\n'
+        f'Mann–Whitney U, BH–FDR corrected across metrics '
+        f'(* p<0.05, ** p<0.01, *** p<0.001)',
         fontsize=12, fontweight='bold'
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.tight_layout(rect=[0, 0, 1, 0.90])
     fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
     plt.close(fig)
     print(f'  Saved slow-wave region comparison: {fname}')
-
 
 # =============================================================================
 # Region comparison boxplots (Thalamus vs Ventricle, pre/post, sham/active)
@@ -1276,9 +1323,10 @@ def plot_region_comparison_boxplots(participant_id, output_dir):
     """
     Participant-level comparison across BOTH targets in one figure per band:
     for each channel, shows pre/post pairs for Thalamus-Sham, Thalamus-Active,
-    Ventricle-Sham, Ventricle-Active side by side.
-    Reads the per-pulse feature CSVs written during run_pulse_level_analysis
-    for both targets.
+    Ventricle-Sham, Ventricle-Active side by side, with significance testing
+    for: (1) pre vs post within each group [paired Wilcoxon], (2) sham vs
+    active within each region [Mann-Whitney, post values], (3) thalamus vs
+    ventricle within each condition [Mann-Whitney, post values].
     """
     dfs = []
     for target in ('thalamus', 'ventricle'):
@@ -1321,23 +1369,58 @@ def plot_region_comparison_boxplots(participant_id, output_dir):
         if _already_done(output_dir, band_fname):
             continue
 
-        fig, axes = plt.subplots(len(channels), 1,
-                                 figsize=(12, 3.4 * len(channels)), squeeze=False)
-        any_plotted = False
+        valid_channels = [
+            ch for ch in channels
+            if f'{ch}_pre_{band_key}' in df.columns and f'{ch}_post_{band_key}' in df.columns
+        ]
+        if not valid_channels:
+            continue
 
-        for row_idx, ch in enumerate(channels):
+        # --- Pass 1: raw p-values for all comparison families, across all
+        #     channels, for FDR correction within each family ---
+        prepost_raw      = {g: [] for g in groups}
+        sham_v_act_raw   = {'thalamus': [], 'ventricle': []}
+        thal_v_vent_raw  = {'sham': [], 'active': []}
+
+        for ch in valid_channels:
+            pre_col, post_col = f'{ch}_pre_{band_key}', f'{ch}_post_{band_key}'
+            post_by_group = {}
+            for target, condition in groups:
+                mask = (df['target'] == target) & (df['group'] == condition)
+                pair_df = df.loc[mask, [pre_col, post_col]].dropna()
+                prepost_raw[(target, condition)].append(
+                    _paired_wilcoxon(pair_df[pre_col].values, pair_df[post_col].values)
+                )
+                post_by_group[(target, condition)] = df.loc[mask, post_col].dropna().values
+
+            for target in ('thalamus', 'ventricle'):
+                sham_v_act_raw[target].append(_unpaired_mannwhitney(
+                    post_by_group[(target, 'sham')], post_by_group[(target, 'active')]
+                ))
+            for condition in ('sham', 'active'):
+                thal_v_vent_raw[condition].append(_unpaired_mannwhitney(
+                    post_by_group[('thalamus', condition)], post_by_group[('ventricle', condition)]
+                ))
+
+        prepost_corr     = {g: _bh_fdr_correct(v) for g, v in prepost_raw.items()}
+        sham_v_act_corr  = {t: _bh_fdr_correct(v) for t, v in sham_v_act_raw.items()}
+        thal_v_vent_corr = {c: _bh_fdr_correct(v) for c, v in thal_v_vent_raw.items()}
+
+        fig, axes = plt.subplots(len(valid_channels), 1,
+                                 figsize=(13, 3.8 * len(valid_channels)), squeeze=False)
+
+        for row_idx, ch in enumerate(valid_channels):
             ax = axes[row_idx][0]
             pre_col, post_col = f'{ch}_pre_{band_key}', f'{ch}_post_{band_key}'
-            if pre_col not in df.columns or post_col not in df.columns:
-                ax.set_visible(False)
-                continue
 
             positions, data, colors, labels, pos = [], [], [], [], 1
+            group_positions = {}
             for target, condition in groups:
                 mask = (df['target'] == target) & (df['group'] == condition)
                 data += [df.loc[mask, pre_col].dropna().values,
                          df.loc[mask, post_col].dropna().values]
                 positions += [pos, pos + 1]
+                group_positions[(target, condition)] = (pos, pos + 1)
                 colors += (['#AAB7C4', '#2C3E50'] if condition == 'sham'
                            else ['#F1948A', '#922B21'])
                 labels += [f'{target[:4].title()}\n{condition.title()}\nPre',
@@ -1354,17 +1437,45 @@ def plot_region_comparison_boxplots(participant_id, output_dir):
             ax.axhline(0, color='grey', lw=0.6, ls='--', alpha=0.5)
             ax.set_ylabel(ch, fontsize=9, fontweight='bold')
             ax.spines[['top', 'right']].set_visible(False)
-            any_plotted = True
 
-        if not any_plotted:
-            plt.close(fig)
-            continue
+            # --- significance brackets ---
+            y_base, _ = _bracket_y(*data)
+            ylo, yhi = ax.get_ylim()
+            step = (yhi - ylo) * 0.16
+
+            # tier 0: pre vs post within each group
+            for target, condition in groups:
+                x1, x2 = group_positions[(target, condition)]
+                _add_sig_bracket(ax, x1, x2, y_base, prepost_corr[(target, condition)][row_idx])
+
+            thal_sham_post_x = group_positions[('thalamus', 'sham')][1]
+            thal_act_post_x  = group_positions[('thalamus', 'active')][1]
+            vent_sham_post_x = group_positions[('ventricle', 'sham')][1]
+            vent_act_post_x  = group_positions[('ventricle', 'active')][1]
+
+            # tier 1: sham vs active within region (post vs post)
+            _add_sig_bracket(ax, thal_sham_post_x, thal_act_post_x, y_base + step,
+                             sham_v_act_corr['thalamus'][row_idx])
+            _add_sig_bracket(ax, vent_sham_post_x, vent_act_post_x, y_base + step,
+                             sham_v_act_corr['ventricle'][row_idx])
+
+            # tier 2: thalamus vs ventricle within condition (post vs post)
+            _add_sig_bracket(ax, thal_sham_post_x, vent_sham_post_x, y_base + step * 2.2,
+                             thal_v_vent_corr['sham'][row_idx])
+            _add_sig_bracket(ax, thal_act_post_x, vent_act_post_x, y_base + step * 3.0,
+                             thal_v_vent_corr['active'][row_idx])
+
+            ylo, yhi = ax.get_ylim()
+            ax.set_ylim(ylo, yhi + (yhi - ylo) * 0.20)
 
         fig.suptitle(
-            f'{participant_id}: {band_label} pre/post — Thalamus vs Ventricle, Sham vs Active',
-            fontsize=12, fontweight='bold'
+            f'{participant_id}: {band_label} pre/post — Thalamus vs Ventricle, Sham vs Active\n'
+            f'Wilcoxon (pre/post) & Mann–Whitney U (sham/active, thal/vent), '
+            f'BH–FDR corrected across channels\n'
+            f'(* p<0.05, ** p<0.01, *** p<0.001)',
+            fontsize=11, fontweight='bold'
         )
-        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        fig.tight_layout(rect=[0, 0, 1, 0.93])
         fig.savefig(Path(output_dir) / band_fname, dpi=200, bbox_inches='tight')
         plt.close(fig)
         print(f'  Saved region comparison ({band_label}): {band_fname}')
@@ -1764,6 +1875,10 @@ TFR_BASELINES = {
     'tight_500_100ms': (-0.50, -0.10),
     'full_pre':        (-TUS_EPOCH_PRE_SEC, -0.5),
 }
+ERP_TOPO_TIMECOURSE_PRE_MS     = 300   # start of window (ms before TUS onset)
+ERP_TOPO_TIMECOURSE_POST_MS    = 500   # end of window (ms after TUS onset)
+ERP_TOPO_TIMECOURSE_STEP_MS    = 100   # spacing between topomap frames
+ERP_TOPO_TIMECOURSE_HALFWIN_MS = 25    # ± window averaged into each frame's value
 
 N_BEST_CHANNELS          = 3
 TRIAL_NOISE_SD_MULTIPLIER = 4.0   # adaptive rejection: mean PTP + k*SD
@@ -2114,6 +2229,176 @@ def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
     fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'      Saved ERP topomap: {fname}')
+
+def plot_erp_topomap_evolution(raw, bursts_df, freq_band, session_name, participant_id,
+                                output_dir, suffix=''):
+    """
+    Shows how the ERP scalp topography evolves over time, from
+    -ERP_TOPO_TIMECOURSE_PRE_MS to +ERP_TOPO_TIMECOURSE_POST_MS relative to
+    TUS onset, for Active and Sham separately, across all baseline
+    corrections. One figure per (condition, baseline) — a grid of topomap
+    snapshots at ERP_TOPO_TIMECOURSE_STEP_MS intervals.
+    """
+    if 'burst_time_s' not in bursts_df.columns:
+        print('    plot_erp_topomap_evolution: burst_time_s column missing — skipping')
+        return
+    bursts_df = bursts_df.copy()
+    bursts_df['burst_time_s'] = pd.to_numeric(bursts_df['burst_time_s'], errors='coerce')
+    bursts_df = bursts_df.dropna(subset=['burst_time_s'])
+
+    channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)
+                if raw.ch_names[i] not in EXCLUDE_CHANNELS]
+    if not channels or bursts_df.empty:
+        return
+
+    montage   = mne.channels.make_standard_montage('standard_1020')
+    known_chs = set(montage.ch_names)
+    topo_chs  = [ch for ch in channels if ch in known_chs]
+    if len(topo_chs) < 3:
+        print('    plot_erp_topomap_evolution: too few channels with known positions — skipping')
+        return
+
+    sfreq        = raw.info['sfreq']
+    pre_samples  = int(TUS_EPOCH_PRE_SEC * sfreq)
+    post_samples = int(TUS_EPOCH_POST_SEC * sfreq)
+    n_samples    = pre_samples + post_samples
+    times_ms     = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples) * 1000
+
+    time_points = np.arange(-ERP_TOPO_TIMECOURSE_PRE_MS,
+                            ERP_TOPO_TIMECOURSE_POST_MS + 1,
+                            ERP_TOPO_TIMECOURSE_STEP_MS)
+
+    # Extract epochs once (reused across all baselines/conditions below)
+    all_epochs = {ch: {} for ch in topo_chs}
+    for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
+        mask = bursts_df['condition'].isin(condition_set)
+        group_df = bursts_df[mask].reset_index(drop=True)
+        for ch in topo_chs:
+            ch_idx = raw.ch_names.index(ch)
+            trials = []
+            for _, burst in group_df.iterrows():
+                center = int(burst['burst_time_s'] * sfreq)
+                start, stop = center - pre_samples, center + post_samples
+                if start < 0 or stop > raw.n_times:
+                    trials.append(np.full(n_samples, np.nan))
+                    continue
+                trial = raw.get_data(picks=[ch_idx], start=start, stop=stop)[0] * 1e6
+                trials.append(trial)
+            all_epochs[ch][group_label] = np.array(trials)
+
+    halfwin_samples = int(ERP_TOPO_TIMECOURSE_HALFWIN_MS / 1000 * sfreq)
+
+    for baseline_name, baseline_mode in ERP_BASELINES.items():
+        for group_label in ('sham', 'active'):
+            fname = (f'{participant_id}_{session_name}_{suffix}_'
+                     f'ERP_topomap_evolution_{group_label}_{baseline_name}.png')
+            if _already_done(output_dir, fname):
+                continue
+
+            n_trials = all_epochs[topo_chs[0]][group_label].shape[0]
+            if n_trials == 0:
+                continue
+
+            # Same noisy-channel / noisy-trial exclusion logic as plot_erps,
+            # so this figure stays consistent with the main ERP figures.
+            BAD_CHANNEL_REJECTION_RATE = 0.30
+            good_channels = []
+            for ch in topo_chs:
+                raw_trials  = all_epochs[ch][group_label].copy()
+                corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
+                finite_mask = np.all(np.isfinite(corrected), axis=1)
+                if finite_mask.sum() == 0:
+                    continue
+                noise_mask, _ = _exclude_noisy_trials(corrected[finite_mask])
+                n_rejected = int((~noise_mask).sum())
+                if (n_rejected / n_trials) <= BAD_CHANNEL_REJECTION_RATE:
+                    good_channels.append(ch)
+            if not good_channels:
+                continue
+
+            global_keep = np.ones(n_trials, dtype=bool)
+            for ch in good_channels:
+                raw_trials  = all_epochs[ch][group_label].copy()
+                corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
+                finite_mask = np.all(np.isfinite(corrected), axis=1)
+                noise_mask, _ = _exclude_noisy_trials(corrected[finite_mask])
+                trial_keep    = np.zeros(n_trials, dtype=bool)
+                trial_keep[np.where(finite_mask)[0][noise_mask]] = True
+                global_keep  &= trial_keep
+
+            mean_erp_by_ch = {}
+            for ch in good_channels:
+                raw_trials = all_epochs[ch][group_label].copy()
+                corrected  = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
+                clean      = corrected[global_keep]
+                mean_erp_by_ch[ch] = (clean.mean(axis=0)
+                                      if len(clean) and not np.all(np.isnan(clean))
+                                      else np.full(n_samples, np.nan))
+            if not mean_erp_by_ch:
+                continue
+
+            # --- shared color scale across all frames ---
+            frame_vals = []
+            for t_ms in time_points:
+                t_idx = int(np.argmin(np.abs(times_ms - t_ms)))
+                s0, s1 = max(t_idx - halfwin_samples, 0), min(t_idx + halfwin_samples, n_samples)
+                vals = np.array([
+                    np.nanmean(mean_erp_by_ch[ch][s0:s1]) if ch in mean_erp_by_ch else np.nan
+                    for ch in topo_chs
+                ])
+                frame_vals.append(vals)
+            all_frame_vals = np.array(frame_vals)
+            finite_vals = all_frame_vals[np.isfinite(all_frame_vals)]
+            if len(finite_vals) == 0:
+                continue
+            vlim = np.nanpercentile(np.abs(finite_vals), 95)
+            vlim = vlim if vlim > 0 else 1.0
+
+            ncols = 5
+            nrows = int(np.ceil(len(time_points) / ncols))
+            fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.2 * nrows))
+            axes_flat = np.array(axes).ravel()
+
+            last_im = None
+            for i, t_ms in enumerate(time_points):
+                ax = axes_flat[i]
+                vals = all_frame_vals[i]
+                valid_mask = np.isfinite(vals)
+                if valid_mask.sum() < 3:
+                    ax.text(0.5, 0.5, 'n/a', transform=ax.transAxes,
+                            ha='center', va='center', fontsize=8, color='grey')
+                    ax.set_axis_off()
+                    ax.set_title(f'{int(t_ms)} ms', fontsize=9)
+                    continue
+                vals_valid = vals[valid_mask]
+                chs_valid  = [ch for ch, ok in zip(topo_chs, valid_mask) if ok]
+                info_valid = mne.create_info(chs_valid, sfreq=sfreq, ch_types='eeg')
+                info_valid.set_montage(montage, on_missing='ignore')
+                im, _ = mne.viz.plot_topomap(
+                    vals_valid, info_valid, axes=ax, show=False,
+                    cmap='RdBu_r', vlim=(-vlim, vlim), contours=4,
+                )
+                last_im = im
+                title_color = 'black' if t_ms < 0 else '#922B21'
+                ax.set_title(f'{int(t_ms)} ms', fontsize=9, fontweight='bold', color=title_color)
+
+            for j in range(len(time_points), nrows * ncols):
+                axes_flat[j].set_visible(False)
+
+            if last_im is not None:
+                fig.subplots_adjust(right=0.90, top=0.88)
+                cax = fig.add_axes([0.92, 0.15, 0.015, 0.65])
+                fig.colorbar(last_im, cax=cax, label='µV (re: baseline)')
+
+            fig.suptitle(
+                f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP topomap evolution\n'
+                f'baseline: {baseline_name}  |  −{ERP_TOPO_TIMECOURSE_PRE_MS} to '
+                f'+{ERP_TOPO_TIMECOURSE_POST_MS} ms  (step: {ERP_TOPO_TIMECOURSE_STEP_MS} ms)',
+                fontsize=12, fontweight='bold'
+            )
+            fig.savefig(Path(output_dir) / fname, dpi=180, bbox_inches='tight')
+            plt.close(fig)
+            print(f'      Saved ERP topomap evolution: {fname}')
 
 def _plot_erp_difference(mean_erps_active, mean_erps_sham, channels, times,
                           pre_samples, session_name, participant_id,
@@ -3491,6 +3776,7 @@ def process_one_session(participant_id, target, session_name, is_adaptation,
                 participant_output_dir, suffix,
             )
             safe_plot(plot_erps_500ms, raw, bursts_df, freq_band, session_name, participant_id,participant_output_dir, suffix,)
+            safe_plot(plot_erp_topomap_evolution, raw, bursts_df, freq_band, session_name, participant_id, participant_output_dir, suffix)
             safe_plot(plot_tfrs, raw, bursts_df, freq_band,session_name, participant_id,participant_output_dir, suffix,focus_ch,)
 
         del raw, hypno_up
