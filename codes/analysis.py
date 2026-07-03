@@ -1117,6 +1117,46 @@ def save_sw_locked_sigma_timecourse(raw, sw_summary, active_burst_times, freq_ba
     np.savez(out_path, times_sec=times_sec, mean_z=mean_z, sem_z=sem_z, n_trials=n_trials)
     print(f'    Saved SW-locked sigma timecourse: {fname}  (n={n_trials} SWs)')
 
+def plot_sw_locked_sigma_single_region(participant_id, target, output_dir):
+    """
+    Plots the SW-locked sigma-power timecourse for a SINGLE region
+    (thalamus OR ventricle), independent of whether the other region's
+    session exists. Useful when only one target has been recorded/processed
+    for a given participant.
+    """
+    fname = f'{participant_id}_{target}_sw_locked_sigma_single.png'
+    if _already_done(output_dir, fname):
+        return
+
+    npz_path = Path(output_dir) / f'{participant_id}_{target}_active_sw_locked_sigma.npz'
+    if not npz_path.exists():
+        print(f'    SW-locked sigma single-region plot skipped: no data for {target}')
+        return
+
+    d = np.load(npz_path)
+    t, m, sem, n_trials = d['times_sec'], d['mean_z'], d['sem_z'], int(d['n_trials'])
+
+    color = '#8E44AD' if target == 'thalamus' else '#16A085'
+    label = f'{target.title()} (active)'
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    ax.fill_between(t, m - sem, m + sem, color=color, alpha=0.25)
+    ax.plot(t, m, color=color, lw=2.2, label=f'{label} (n={n_trials})')
+    ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7, label='Slow wave trough')
+    ax.axhline(0, color='grey', lw=0.6, ls=':')
+    ax.set_xlabel('Time relative to slow wave (s)')
+    ax.set_ylabel('Sigma power (z-score)')
+    ax.set_title(
+        f'{participant_id}: sigma power time course locked to slow waves\n'
+        f'{target.title()} (active TUS)',
+        fontsize=11, fontweight='bold'
+    )
+    ax.legend(fontsize=9)
+    ax.spines[['top', 'right']].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Saved SW-locked sigma single-region plot ({target}): {fname}')
 
 def plot_sw_locked_sigma_thalamus_vs_ventricle(participant_id, output_dir):
     """
@@ -3856,6 +3896,8 @@ def process_participant(participant_id):
         safe_plot(plot_spindle_boxplots, pulse_df, session_info, str(out_dir), suffix)
         safe_plot(plot_spindle_violins,  pulse_df, session_info, str(out_dir), suffix)
     safe_plot(plot_sw_locked_sigma_thalamus_vs_ventricle, participant_id, str(out_dir))
+    safe_plot(plot_sw_locked_sigma_single_region, participant_id, 'thalamus', str(out_dir))
+    safe_plot(plot_sw_locked_sigma_single_region, participant_id, 'ventricle', str(out_dir))
     safe_plot(plot_slowwave_region_comparison, participant_id, str(out_dir))
     safe_plot(plot_region_comparison_boxplots, participant_id, str(out_dir))
 
