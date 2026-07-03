@@ -1077,30 +1077,25 @@ def compute_sw_locked_sigma_timecourse(raw, sw_starts_sec, burst_times_sec,
     return times_sec, trials.mean(axis=0), trials.std(axis=0) / np.sqrt(len(trials)), len(trials)
 
 
-def save_sw_locked_sigma_timecourse(raw, sw_summary, bursts_df, freq_band,
+def save_sw_locked_sigma_timecourse(raw, sw_summary, active_burst_times, freq_band,
                                      session_name, participant_id, target, output_dir):
     """
     Compute and cache the SW-locked sigma-power timecourse for the ACTIVE
     condition only, for a single target (thalamus/ventricle). Saved as .npz
     so the participant-level comparison plot can load both targets later.
     """
+       
     fname = f'{participant_id}_{target}_active_sw_locked_sigma.npz'
     out_path = Path(output_dir) / fname
     if out_path.exists():
         print(f'    [skip] already exists: {fname}')
         return
-    if sw_summary is None or sw_summary.empty or bursts_df is None or bursts_df.empty:
+    if sw_summary is None or sw_summary.empty or not active_burst_times:
         print('    SW-locked sigma timecourse skipped: missing SW or burst data')
         return
-    if 'condition' not in bursts_df.columns or 'burst_time_s' not in bursts_df.columns:
-        print('    SW-locked sigma timecourse skipped: bursts_df missing required columns')
-        return
 
-    active_bursts = bursts_df.loc[
-        bursts_df['condition'].isin(ACTIVE_CONDITIONS), 'burst_time_s'
-    ].values
     result = compute_sw_locked_sigma_timecourse(
-        raw, sw_summary['Start'].values, active_bursts, freq_band, SPINDLE_CHANNELS
+        raw, sw_summary['Start'].values, active_burst_times, freq_band, SPINDLE_CHANNELS
     )
     if result is None:
         print('    SW-locked sigma timecourse skipped: too few trials')
@@ -1528,7 +1523,7 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
 
     # NEW: write per-burst spindle characterisation CSV
     save_burst_locked_spindle_csv(burst_times_by_group, sp_summary,session_name, participant_id, output_dir, suffix,post_window_sec=TUS_EPOCH_POST_SEC,)
-    save_sw_locked_sigma_timecourse(raw, sw_summary_full, bursts, freq_band,session_name, participant_id, target, output_dir)
+    save_sw_locked_sigma_timecourse(raw, sw_summary_full, burst_times_by_group.get('active', []), freq_band,session_name, participant_id, target, output_dir)
     save_burst_locked_slowwave_csv(burst_times_by_group, sw_summary_full,session_name, participant_id, output_dir, suffix, post_window_sec=TUS_EPOCH_POST_SEC)
     # Save MNE Epochs
     try:
@@ -3566,9 +3561,9 @@ def process_participant(participant_id):
         session_info = {'participant_id': participant_id, 'session_name': session_name}
         safe_plot(plot_spindle_boxplots, pulse_df, session_info, str(out_dir), suffix)
         safe_plot(plot_spindle_violins,  pulse_df, session_info, str(out_dir), suffix)
-        safe_plot(plot_sw_locked_sigma_thalamus_vs_ventricle, participant_id, str(out_dir))
-        safe_plot(plot_slowwave_region_comparison, participant_id, str(out_dir))
-        safe_plot(plot_region_comparison_boxplots, participant_id, str(out_dir))
+    safe_plot(plot_sw_locked_sigma_thalamus_vs_ventricle, participant_id, str(out_dir))
+    safe_plot(plot_slowwave_region_comparison, participant_id, str(out_dir))
+    safe_plot(plot_region_comparison_boxplots, participant_id, str(out_dir))
 
     return df
 
