@@ -49,6 +49,7 @@ from scipy.stats import wilcoxon, mannwhitneyu
 from scipy import stats as sp_stats
 from scipy.signal import butter, filtfilt
 from scipy.stats import linregress
+from scipy.signal import hilbert
 mne.set_log_level('WARNING')
 
 
@@ -643,7 +644,12 @@ def _parse_vmrk_pulses(vmrk_path: str, original_sfreq: float):
                 for keyword, condition in INTENSITY_COMMENTS.items():
                     if keyword in text:
                         current_condition = condition
-                        has_comments      = True
+                        # Only real intensity markers (60w/1w) indicate the
+                        # old Comment-driven protocol. Generic setup comments
+                        # ('stim', 'no stim', 'reprep', etc.) can appear in
+                        # BOTH protocols and must not force PATH 1.
+                        if condition not in ('ignore',):
+                            has_comments = True
                         break
             elif marker_type == 'Stimulus' and label == 'B':
                 b_markers.append({
@@ -697,6 +703,8 @@ def parse_tus_markers_bursts(vmrk_path: str,
         session_folder = str(Path(vmrk_path).parent)
 
     pulses, b_markers, has_comments = _parse_vmrk_pulses(vmrk_path, original_sfreq)
+    print(f'    [routing] has_comments={has_comments} | '
+          f'{len(pulses)} A-pulses, {len(b_markers)} B-markers found')
     if not pulses:
         return pd.DataFrame()
 
@@ -765,6 +773,10 @@ def parse_tus_markers_bursts(vmrk_path: str,
         bursts = pd.DataFrame(burst_rows)
         bursts.insert(0, 'burst_seq_all', np.arange(1, len(bursts) + 1))
 
+    if bursts.empty or 'condition' not in bursts.columns:
+        print('    No valid bursts after condition filtering — check .vmrk comments/CSV mapping')
+        return pd.DataFrame()
+
     print(f'    Bursts: {bursts["condition"].value_counts().to_dict()}')
     return bursts
 
@@ -796,6 +808,10 @@ def compute_window_features(window_data, ch_names, sfreq, freq_band):
             if pre_sigma and pre_sigma > 0 else np.nan
         )
         features[f'{ch}_post_ptp_uv'] = round(float(np.ptp(post)), 3) if len(post) else np.nan
+        features[f'{ch}_pre_theta_power']    = round(band_power(pre,  sfreq, *FREQ_BANDS['theta']), 6)
+        features[f'{ch}_post_theta_power']   = round(band_power(post, sfreq, *FREQ_BANDS['theta']), 6)
+        features[f'{ch}_pre_alpha_power']    = round(band_power(pre,  sfreq, 8.0, 12.0), 6)
+        features[f'{ch}_post_alpha_power']   = round(band_power(post, sfreq, 8.0, 12.0), 6)
     return features
 
 
@@ -993,6 +1009,373 @@ def _save_burst_locked_spindle_summary(burst_locked_df, session_name,
 
 
 # =============================================================================
+# Slow-wave-locked sigma power time course (Thalamus vs Ventricle, active)
+# =============================================================================
+
+SW_LOCK_PRE_SEC, SW_LOCK_POST_SEC = 2.0, 2.0
+SW_LOCK_BASELINE_SEC = (-2.0, -1.0)   # relative to SW trough, used for z-scoring
+
+
+def compute_sw_locked_sigma_timecourse(raw, sw_starts_sec, burst_times_sec,
+                                        freq_band, channels,
+                                        pre_sec=SW_LOCK_PRE_SEC, post_sec=SW_LOCK_POST_SEC,
+                                        near_burst_window=5.0):
+    """
+    Build a sigma-power (z-scored) time course locked to slow-wave troughs,
+    restricted to slow waves occurring near a TUS burst (within
+    `near_burst_window` seconds), so the timecourse reflects stimulation-
+    proximal slow-wave activity rather than the whole recording.
+    """
+    if len(sw_starts_sec) == 0 or len(burst_times_sec) == 0:
+        return None
+    sfreq = raw.info['sfreq']
+    pre_samples, post_samples = int(pre_sec * sfreq), int(post_sec * sfreq)
+    n_samples = pre_samples + post_samples
+    times_sec = np.linspace(-pre_sec, post_sec, n_samples)
+
+    burst_times_sec = np.asarray(burst_times_sec)
+    near_mask = np.array([
+        np.any(np.abs(burst_times_sec - t) <= near_burst_window)
+        for t in sw_starts_sec
+    ])
+    sw_times = np.asarray(sw_starts_sec)[near_mask]
+    if len(sw_times) < 3:
+        return None
+
+    picks = [ch for ch in channels if ch in raw.ch_names]
+    if not picks:
+        return None
+
+    data = raw.get_data(picks=picks) * 1e6
+    nyq  = sfreq / 2.0
+    b, a = butter(4, [freq_band[0] / nyq, freq_band[1] / nyq], btype='band')
+    envelope = np.abs(hilbert(filtfilt(b, a, data, axis=1), axis=1))
+    del data
+    gc.collect()
+
+    bl_s = pre_samples + int(SW_LOCK_BASELINE_SEC[0] * sfreq)
+    bl_e = pre_samples + int(SW_LOCK_BASELINE_SEC[1] * sfreq)
+
+    trials = []
+    for t in sw_times:
+        center = int(t * sfreq)
+        start, stop = center - pre_samples, center + post_samples
+        if start < 0 or stop > raw.n_times:
+            continue
+        trial_mean = envelope[:, start:stop].mean(axis=0)
+        bl = trial_mean[max(bl_s, 0):max(bl_e, 0)]
+        if len(bl) < 3 or bl.std() == 0:
+            continue
+        trials.append((trial_mean - bl.mean()) / bl.std())
+
+    del envelope
+    gc.collect()
+
+    if len(trials) < 3:
+        return None
+    trials = np.array(trials)
+    return times_sec, trials.mean(axis=0), trials.std(axis=0) / np.sqrt(len(trials)), len(trials)
+
+
+def save_sw_locked_sigma_timecourse(raw, sw_summary, bursts_df, freq_band,
+                                     session_name, participant_id, target, output_dir):
+    """
+    Compute and cache the SW-locked sigma-power timecourse for the ACTIVE
+    condition only, for a single target (thalamus/ventricle). Saved as .npz
+    so the participant-level comparison plot can load both targets later.
+    """
+    fname = f'{participant_id}_{target}_active_sw_locked_sigma.npz'
+    out_path = Path(output_dir) / fname
+    if out_path.exists():
+        print(f'    [skip] already exists: {fname}')
+        return
+    if sw_summary is None or sw_summary.empty or bursts_df is None or bursts_df.empty:
+        print('    SW-locked sigma timecourse skipped: missing SW or burst data')
+        return
+    if 'condition' not in bursts_df.columns or 'burst_time_s' not in bursts_df.columns:
+        print('    SW-locked sigma timecourse skipped: bursts_df missing required columns')
+        return
+
+    active_bursts = bursts_df.loc[
+        bursts_df['condition'].isin(ACTIVE_CONDITIONS), 'burst_time_s'
+    ].values
+    result = compute_sw_locked_sigma_timecourse(
+        raw, sw_summary['Start'].values, active_bursts, freq_band, SPINDLE_CHANNELS
+    )
+    if result is None:
+        print('    SW-locked sigma timecourse skipped: too few trials')
+        return
+    times_sec, mean_z, sem_z, n_trials = result
+    np.savez(out_path, times_sec=times_sec, mean_z=mean_z, sem_z=sem_z, n_trials=n_trials)
+    print(f'    Saved SW-locked sigma timecourse: {fname}  (n={n_trials} SWs)')
+
+
+def plot_sw_locked_sigma_thalamus_vs_ventricle(participant_id, output_dir):
+    """
+    Participant-level comparison: overlays the SW-locked sigma-power
+    timecourse for Thalamus (active) vs Ventricle (active), loaded from the
+    cached .npz files written by save_sw_locked_sigma_timecourse.
+    """
+    fname = f'{participant_id}_sw_locked_sigma_thalamus_vs_ventricle.png'
+    if _already_done(output_dir, fname):
+        return
+    thal_path = Path(output_dir) / f'{participant_id}_thalamus_active_sw_locked_sigma.npz'
+    vent_path = Path(output_dir) / f'{participant_id}_ventricle_active_sw_locked_sigma.npz'
+    if not (thal_path.exists() and vent_path.exists()):
+        print('    SW-locked sigma comparison skipped: need both targets computed first')
+        return
+
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for path, color, label in [
+        (thal_path, '#8E44AD', 'Thalamus (active)'),
+        (vent_path, '#16A085', 'Ventricle (active)'),
+    ]:
+        d = np.load(path)
+        t, m, sem = d['times_sec'], d['mean_z'], d['sem_z']
+        ax.fill_between(t, m - sem, m + sem, color=color, alpha=0.25)
+        ax.plot(t, m, color=color, lw=2.0, label=f'{label} (n={int(d["n_trials"])})')
+    ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7, label='Slow wave trough')
+    ax.axhline(0, color='grey', lw=0.6, ls=':')
+    ax.set_xlabel('Time relative to slow wave (s)')
+    ax.set_ylabel('Sigma power (z-score)')
+    ax.set_title(
+        f'{participant_id}: sigma power time course locked to slow waves\n'
+        f'Thalamus vs Ventricle (active TUS)',
+        fontsize=11, fontweight='bold'
+    )
+    ax.legend(fontsize=9)
+    ax.spines[['top', 'right']].set_visible(False)
+    fig.tight_layout()
+    fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Saved SW-locked sigma comparison: {fname}')
+
+
+# =============================================================================
+# Burst-locked slow-wave characterisation CSV + region comparison
+# =============================================================================
+
+def save_burst_locked_slowwave_csv(burst_times_by_group, sw_summary,
+                                    session_name, participant_id, output_dir,
+                                    suffix, post_window_sec=5.0):
+    """
+    Mirrors save_burst_locked_spindle_csv, but for slow waves: one row per
+    burst, describing slow waves occurring in the post-stimulus window.
+    """
+    fname = f'{participant_id}_{session_name}_{suffix}_burst_locked_slowwaves.csv'
+    if _already_done(output_dir, fname):
+        return
+    if sw_summary is None or sw_summary.empty:
+        print('    Burst-locked slow-wave CSV skipped: no SW data')
+        return
+
+    sw = sw_summary.sort_values('Start').copy()
+    rows = []
+    for condition_label, burst_times in burst_times_by_group.items():
+        for burst_idx, bt in enumerate(burst_times):
+            window_mask = (sw['Start'] > bt) & (sw['Start'] <= bt + post_window_sec)
+            matched = sw[window_mask]
+            n_sw = len(matched)
+            rows.append({
+                'participant_id':        participant_id,
+                'session':               session_name,
+                'condition':             condition_label,
+                'burst_index':           burst_idx + 1,
+                'burst_time_s':          round(bt, 4),
+                'post_window_sec':       post_window_sec,
+                'n_slowwaves_in_window': n_sw,
+                'mean_sw_amplitude_uv':  round(matched['PTP'].mean(), 4) if n_sw else np.nan,
+                'mean_sw_duration_sec':  round(matched['Duration'].mean(), 4)
+                                          if n_sw and 'Duration' in matched else np.nan,
+                'mean_sw_slope_uvs':     round(matched['Slope'].mean(), 4)
+                                          if n_sw and 'Slope' in matched else np.nan,
+                'sw_density_per_s':      round(n_sw / post_window_sec, 4),
+            })
+
+    if rows:
+        df = pd.DataFrame(rows)
+        df.to_csv(Path(output_dir) / fname, index=False)
+        print(f'    Saved burst-locked slow-wave CSV: {fname}')
+
+
+def plot_slowwave_region_comparison(participant_id, output_dir):
+    """
+    Participant-level comparison of slow-wave properties: Thalamus vs
+    Ventricle, Sham vs Active. Reads the per-burst slow-wave CSVs written
+    by save_burst_locked_slowwave_csv for both targets.
+    """
+    fname = f'{participant_id}_slowwave_region_comparison.png'
+    if _already_done(output_dir, fname):
+        return
+
+    dfs = []
+    for target in ('thalamus', 'ventricle'):
+        found = False
+        for suffix in ('nrem', 'full_recording'):
+            csv_path = (Path(output_dir) /
+                        f'{participant_id}_{participant_id}_{target}_{suffix}_burst_locked_slowwaves.csv')
+            if csv_path.exists():
+                d = pd.read_csv(csv_path)
+                d['target'] = target
+                dfs.append(d)
+                found = True
+                break
+        if not found:
+            print(f'    Slow-wave region comparison: no burst-locked SW CSV for {target}')
+
+    if len(dfs) < 2:
+        print('    Slow-wave region comparison skipped: need both targets')
+        return
+    df = pd.concat(dfs, ignore_index=True)
+
+    metrics = [
+        ('n_slowwaves_in_window', 'N slow waves / window'),
+        ('sw_density_per_s',      'SW density (per s)'),
+        ('mean_sw_amplitude_uv',  'Mean amplitude (µV)'),
+        ('mean_sw_duration_sec',  'Mean duration (s)'),
+    ]
+    groups        = [('thalamus', 'sham'), ('thalamus', 'active'),
+                      ('ventricle', 'sham'), ('ventricle', 'active')]
+    group_labels  = ['Thal\nSham', 'Thal\nActive', 'Vent\nSham', 'Vent\nActive']
+    colors        = ['#A8C8E8', '#922B21', '#A9DFBF', '#7D3C98']
+
+    available_metrics = [(c, l) for c, l in metrics if c in df.columns]
+    if not available_metrics:
+        print('    Slow-wave region comparison skipped: no metric columns found')
+        return
+
+    fig, axes = plt.subplots(1, len(available_metrics), figsize=(5 * len(available_metrics), 5))
+    if len(available_metrics) == 1:
+        axes = [axes]
+
+    for ax, (col, label) in zip(axes, available_metrics):
+        data = [
+            df.loc[(df['target'] == t) & (df['condition'] == c), col].dropna().values
+            for t, c in groups
+        ]
+        bp = ax.boxplot(data, patch_artist=True, widths=0.55,
+                        medianprops=dict(color='white', linewidth=2))
+        for patch, color in zip(bp['boxes'], colors):
+            patch.set_facecolor(color)
+            patch.set_alpha(0.85)
+        ax.set_xticks(range(1, len(groups) + 1))
+        ax.set_xticklabels(group_labels, fontsize=8)
+        ax.set_title(label, fontsize=10, fontweight='bold')
+        ax.spines[['top', 'right']].set_visible(False)
+
+    fig.suptitle(
+        f'{participant_id}: slow-wave properties — Thalamus vs Ventricle, Sham vs Active',
+        fontsize=12, fontweight='bold'
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.94])
+    fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Saved slow-wave region comparison: {fname}')
+
+
+# =============================================================================
+# Region comparison boxplots (Thalamus vs Ventricle, pre/post, sham/active)
+# =============================================================================
+
+def plot_region_comparison_boxplots(participant_id, output_dir):
+    """
+    Participant-level comparison across BOTH targets in one figure per band:
+    for each channel, shows pre/post pairs for Thalamus-Sham, Thalamus-Active,
+    Ventricle-Sham, Ventricle-Active side by side.
+    Reads the per-pulse feature CSVs written during run_pulse_level_analysis
+    for both targets.
+    """
+    dfs = []
+    for target in ('thalamus', 'ventricle'):
+        found = False
+        for suffix in ('nrem', 'full_recording'):
+            csv_path = (Path(output_dir) /
+                        f'{participant_id}_{participant_id}_{target}_{suffix}_per_pulse_features.csv')
+            if csv_path.exists():
+                d = pd.read_csv(csv_path)
+                d['target'] = target
+                dfs.append(d)
+                found = True
+                break
+        if not found:
+            print(f'    Region comparison boxplots: no per-pulse CSV for {target}')
+
+    if len(dfs) < 2:
+        print('    Region comparison boxplots skipped: need both targets')
+        return
+    df = pd.concat(dfs, ignore_index=True)
+
+    channels = sorted({
+        c.split('_')[0] for c in df.columns if c.endswith('_pre_sigma_power')
+    })
+    if not channels:
+        print('    Region comparison boxplots skipped: no channel columns found')
+        return
+
+    bands = [
+        ('sigma_power', 'Sigma power'),
+        ('delta_power', 'Delta power'),
+        ('theta_power', 'Theta power'),
+        ('alpha_power', 'Alpha power'),
+    ]
+    groups = [('thalamus', 'sham'), ('thalamus', 'active'),
+              ('ventricle', 'sham'), ('ventricle', 'active')]
+
+    for band_key, band_label in bands:
+        band_fname = f'{participant_id}_region_comparison_{band_key}_prepost.png'
+        if _already_done(output_dir, band_fname):
+            continue
+
+        fig, axes = plt.subplots(len(channels), 1,
+                                 figsize=(12, 3.4 * len(channels)), squeeze=False)
+        any_plotted = False
+
+        for row_idx, ch in enumerate(channels):
+            ax = axes[row_idx][0]
+            pre_col, post_col = f'{ch}_pre_{band_key}', f'{ch}_post_{band_key}'
+            if pre_col not in df.columns or post_col not in df.columns:
+                ax.set_visible(False)
+                continue
+
+            positions, data, colors, labels, pos = [], [], [], [], 1
+            for target, condition in groups:
+                mask = (df['target'] == target) & (df['group'] == condition)
+                data += [df.loc[mask, pre_col].dropna().values,
+                         df.loc[mask, post_col].dropna().values]
+                positions += [pos, pos + 1]
+                colors += (['#AAB7C4', '#2C3E50'] if condition == 'sham'
+                           else ['#F1948A', '#922B21'])
+                labels += [f'{target[:4].title()}\n{condition.title()}\nPre',
+                           f'{target[:4].title()}\n{condition.title()}\nPost']
+                pos += 3
+
+            bp = ax.boxplot(data, positions=positions, widths=0.8, patch_artist=True,
+                            medianprops=dict(color='white', linewidth=1.8))
+            for patch, color in zip(bp['boxes'], colors):
+                patch.set_facecolor(color)
+                patch.set_alpha(0.88)
+            ax.set_xticks(positions)
+            ax.set_xticklabels(labels, fontsize=6)
+            ax.axhline(0, color='grey', lw=0.6, ls='--', alpha=0.5)
+            ax.set_ylabel(ch, fontsize=9, fontweight='bold')
+            ax.spines[['top', 'right']].set_visible(False)
+            any_plotted = True
+
+        if not any_plotted:
+            plt.close(fig)
+            continue
+
+        fig.suptitle(
+            f'{participant_id}: {band_label} pre/post — Thalamus vs Ventricle, Sham vs Active',
+            fontsize=12, fontweight='bold'
+        )
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        fig.savefig(Path(output_dir) / band_fname, dpi=200, bbox_inches='tight')
+        plt.close(fig)
+        print(f'  Saved region comparison ({band_label}): {band_fname}')
+
+
+# =============================================================================
 # Burst-level analysis
 # =============================================================================
 
@@ -1031,11 +1414,13 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
         if sp_obj is not None:
             sp_summary = sp_obj.summary()
             spindle_starts_sec = sp_summary['Start'].values
+    sw_summary_full = None
     if sw_channels:
         sw_obj = yasa.sw_detect(raw, ch_names=sw_channels, freq_sw=SW_FREQ,
                                 hypno=hypno_up, include=NREM_STAGES)
         if sw_obj is not None:
-            slowwave_starts_sec = sw_obj.summary()['Start'].values
+            sw_summary_full = sw_obj.summary()
+            slowwave_starts_sec = sw_summary_full['Start'].values
 
     counts = {'total': len(bursts), 'skipped_condition': 0, 'skipped_bounds': 0,
               'skipped_nrem': 0, 'skipped_spindle': 0, 'kept_active': 0, 'kept_sham': 0}
@@ -1142,12 +1527,9 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
         gc.collect()
 
     # NEW: write per-burst spindle characterisation CSV
-    save_burst_locked_spindle_csv(
-        burst_times_by_group, sp_summary,
-        session_name, participant_id, output_dir, suffix,
-        post_window_sec=TUS_EPOCH_POST_SEC,
-    )
-
+    save_burst_locked_spindle_csv(burst_times_by_group, sp_summary,session_name, participant_id, output_dir, suffix,post_window_sec=TUS_EPOCH_POST_SEC,)
+    save_sw_locked_sigma_timecourse(raw, sw_summary_full, bursts, freq_band,session_name, participant_id, target, output_dir)
+    save_burst_locked_slowwave_csv(burst_times_by_group, sw_summary_full,session_name, participant_id, output_dir, suffix, post_window_sec=TUS_EPOCH_POST_SEC)
     # Save MNE Epochs
     try:
         eeg_all     = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True)]
@@ -1258,7 +1640,8 @@ def plot_raw_vs_preprocessed(raw_snapshot_uv, raw_post, channels,
     print(f'    Saved raw vs preprocessed')
 
 
-def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
+def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir,
+                     burst_times_sec=None):
     fname = f'{participant_id}_{session_name}_spectrogram.png'
     if _already_done(output_dir, fname):
         return
@@ -1320,7 +1703,7 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
         pcm = ax.pcolormesh(
             times / 60, freqs[fmask], Sxx_db,
             cmap='inferno', shading='gouraud',
-            vmin=np.percentile(Sxx_db, 5), vmax=np.percentile(Sxx_db, 98),
+            vmin=global_vmin, vmax=global_vmax,
         )
         last_pcm = pcm
         del data, Sxx, Sxx_db
@@ -1331,6 +1714,11 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
                 if stage in NREM_STAGES:
                     ax.axvspan(ei * 30 / 60, (ei + 1) * 30 / 60,
                                color='cyan', alpha=0.10)
+
+        # NEW: mark TUS burst onsets to check whether warm stripes are burst-locked
+        if burst_times_sec is not None and len(burst_times_sec):
+            for bt in burst_times_sec:
+                ax.axvline(bt / 60, color='lime', lw=0.4, alpha=0.5, zorder=10)
  
         ax.axhline(SPINDLE_FREQ_DEFAULT[0], color='white', lw=0.7, ls='--', alpha=0.55)
         ax.axhline(SPINDLE_FREQ_DEFAULT[1], color='white', lw=0.7, ls='--', alpha=0.55)
@@ -1347,8 +1735,16 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir):
     # Hide unused axes
     for idx in range(n_ch, nrows * ncols):
         axes_flat[idx].set_visible(False)
+
+    # Legend note for the burst overlay
+    title_suffix = '  [cyan = NREM'
+    if burst_times_sec is not None and len(burst_times_sec):
+        title_suffix += ' | lime = TUS burst onset'
+    title_suffix += ']'
+
     # One shared colorbar for the whole figure
-    fig.suptitle(f'{participant_id} – {session_name}: spectrogram  [cyan = NREM]',fontsize=12, fontweight='bold',)
+    fig.suptitle(f'{participant_id} – {session_name}: spectrogram{title_suffix}',
+                 fontsize=12, fontweight='bold',)
     fig.subplots_adjust(top=0.93, right=0.88)
     if last_pcm is not None:
         cax = fig.add_axes([0.90, 0.15, 0.015, 0.70])
@@ -2299,7 +2695,8 @@ def plot_erps_500ms(raw, bursts_df, freq_band, session_name, participant_id, out
                 # Visual Anchors for Early Peak Tracking
                 ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7)  # TUS Onset Line
                 ax.axhline(0, color='grey', lw=0.5, ls=':', alpha=0.5)
-                ax.set_xlim(times_ms[0], times_ms[-1])
+                ax.set_xlim(-300, 500)
+                ax.set_xticks(np.arange(-300, 501, 100))
                 ax.set_title(f'Channel: {ch}', fontsize=12, fontweight='bold')
                 ax.set_ylabel(ylabel_erp, fontsize=10)
                 ax.grid(True, ls='--', alpha=0.4) # Dashed background grid to visually map latency
@@ -2609,9 +3006,11 @@ def plot_spindle_boxplots(pulse_df, session_info, output_dir, suffix=''):
         return
  
     pre_post_pairs = [
-        ('pre_sigma_power',  'post_sigma_power',  'Sigma power'),
-        ('pre_delta_power',  'post_delta_power',  'Delta power'),
-    ]
+    ('pre_sigma_power', 'post_sigma_power', 'Sigma power'),
+    ('pre_delta_power', 'post_delta_power', 'Delta power'),
+    ('pre_theta_power', 'post_theta_power', 'Theta power'),
+    ('pre_alpha_power', 'post_alpha_power', 'Alpha power'),
+]
  
     # Palette — sham: blue family, active: red family
     colors = {
@@ -3059,14 +3458,23 @@ def process_one_session(participant_id, target, session_name, is_adaptation,
         )
 
         vmrk = find_vmrk(participant_id, target)
-        pulse_results = run_pulse_level_analysis(
-            raw, vmrk, hypno_int, hypno_up, freq_band,
-            session_name, participant_id, target, is_adaptation, participant_output_dir
-        )
+        pulse_results = run_pulse_level_analysis(raw, vmrk, hypno_int, hypno_up, freq_band,session_name, participant_id, target, is_adaptation, participant_output_dir)
 
-        safe_plot(plot_spectrogram, raw, hypno_int,
-                  session_name, participant_id, participant_output_dir)
+        # Load burst times (if any) so we can overlay them on the spectrogram
+        suffix_tmp = 'nrem' if hypno_int is not None else 'full_recording'
+        burst_csv_tmp = (Path(participant_output_dir) /
+                         f'{participant_id}_{session_name}_{suffix_tmp}_per_pulse_features.csv')
+        burst_times_for_overlay = None
+        if burst_csv_tmp.exists():
+            try:
+                _bdf = pd.read_csv(burst_csv_tmp)
+                if 'burst_time_s' in _bdf.columns:
+                    burst_times_for_overlay = _bdf['burst_time_s'].values
+                del _bdf
+            except Exception as exc:
+                print(f'    Could not load burst times for spectrogram overlay: {exc}')
 
+        safe_plot(plot_spectrogram, raw, hypno_int,session_name, participant_id, participant_output_dir,burst_times_for_overlay)
         suffix   = 'nrem' if hypno_int is not None else 'full_recording'
         burst_csv = (Path(participant_output_dir) /
                      f'{participant_id}_{session_name}_{suffix}_per_pulse_features.csv')
@@ -3158,6 +3566,9 @@ def process_participant(participant_id):
         session_info = {'participant_id': participant_id, 'session_name': session_name}
         safe_plot(plot_spindle_boxplots, pulse_df, session_info, str(out_dir), suffix)
         safe_plot(plot_spindle_violins,  pulse_df, session_info, str(out_dir), suffix)
+        safe_plot(plot_sw_locked_sigma_thalamus_vs_ventricle, participant_id, str(out_dir))
+        safe_plot(plot_slowwave_region_comparison, participant_id, str(out_dir))
+        safe_plot(plot_region_comparison_boxplots, participant_id, str(out_dir))
 
     return df
 
