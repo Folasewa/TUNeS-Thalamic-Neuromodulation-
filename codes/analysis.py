@@ -1847,7 +1847,6 @@ def _plot_erp_topo_overlay(
         return
 
     # 2. Generate MNE native layout
-    # We create a temporary info object to let MNE calculate the ideal 2D layout grid
     info = mne.create_info(ch_names=valid_chs, sfreq=1000, ch_types='eeg')
     info.set_montage(montage)
     layout = mne.channels.find_layout(info, ch_type='eeg')
@@ -1873,24 +1872,24 @@ def _plot_erp_topo_overlay(
     ylim  = (-y_abs, y_abs)
 
     # 5. Initialize figure
-    fig = plt.figure(figsize=(22, 18))
+    fig = plt.figure(figsize=(26, 20))
 
-    # Scale factor to shrink mini-axes slightly so titles don't collide
-    # MNE maximizes space; scaling by 0.85 leaves breathing room between axes
-    box_scale = 0.85 
+    # Separate x/y scale factors: shrink height MORE than width so each box
+    # has internal headroom for the channel label without needing space
+    # above the axis (which is what caused labels to be overwritten by
+    # neighboring subplots).
+    box_scale_x = 0.86
+    box_scale_y = 0.78
 
     # 6. Plot each channel using layout geometries
-    # layout.names matches the exact order of channels requested
     for ch, pos in zip(layout.names, layout.pos):
         x_pos, y_pos, width, height = pos
-        
-        # Center-scale the boxes to introduce padding between them
-        new_w = width * box_scale
-        new_h = height * box_scale
+
+        new_w = width * box_scale_x
+        new_h = height * box_scale_y
         new_x = x_pos + (width - new_w) / 2
         new_y = y_pos + (height - new_h) / 2
-        
-        # Shift everything slightly up/right to avoid overlapping scalebar/legend margins
+
         ax = fig.add_axes([new_x * 0.84 + 0.08, new_y * 0.84 + 0.08, new_w * 0.84, new_h * 0.84])
 
         idx = channels.index(ch)
@@ -1909,12 +1908,21 @@ def _plot_erp_topo_overlay(
         ax.set_ylim(ylim)
         ax.set_xticks([])
         ax.set_yticks([])
-        
+
         for spine in ax.spines.values():
             spine.set_visible(False)
-            
-        # Increased font size and added slight vertical padding for scannability
-        ax.set_title(ch, fontsize=9, pad=3, color='#222222', fontweight='bold')
+
+        # ── FIX: channel label placed INSIDE the axis (not as a title
+        # above it), with clip_on=True so it can never overlap or be
+        # overwritten by a neighboring subplot, and a light background
+        # box so it stays legible over the traces.
+        ax.text(
+            0.5, 0.98, ch,
+            transform=ax.transAxes, ha='center', va='top',
+            fontsize=7.5, fontweight='bold', color='#222222',
+            clip_on=True,
+            bbox=dict(facecolor='white', edgecolor='none', alpha=0.72, pad=1.0),
+        )
 
     # 7. Shared legend
     legend_elements = [
@@ -1943,7 +1951,7 @@ def _plot_erp_topo_overlay(
         f'{participant_id} – {session_name}  |  ERP topo layout  '
         f'[baseline: {baseline_name}]\n'
         f'Active (red) vs Sham (blue)  |  window: {t_min} to {t_max} s',
-        fontsize=13, fontweight='bold', y=0.96
+        fontsize=6.5, fontweight='bold', y=0.96
     )
     
     fig.savefig(Path(output_dir) / fname, dpi=200, bbox_inches='tight')
