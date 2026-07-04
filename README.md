@@ -1,6 +1,6 @@
 # TUNES — Thalamic Ultrasound Neuromodulation 
 
-A two-stage EEG analysis pipeline for characterizing neural responses to transcranial ultrasound stimulation (TUS). The pipeline preprocesses multi-session BrainVision recordings, runs automated sleep staging, and extracts oscillatory features (spindles, slow waves, spectral power) to build a per-participant neural response profile.
+A three-stage EEG analysis pipeline for characterizing neural responses to transcranial ultrasound stimulation (TUS). The pipeline preprocesses multi-session BrainVision recordings, runs automated sleep staging, extracts oscillatory features (spindles, slow waves, spectral power) to build a per-participant neural response profile, runs statistics, and then builds a coherence profile between what was delivered and what was seen on the EEG.
 
 ---
 
@@ -12,6 +12,7 @@ TUNES implements a two-level characterization framework:
 
 - **Level 1 — Acoustic dose**: quantifies what the ultrasound actually delivered to thalamic nuclei per participant
 - **Level 2 — Neural response profile**: extracts sleep oscillatory features from pre- and post-stimulation EEG to characterize how the brain responded
+- **Level 3 — Dose response profile**: links the acoustic dose with the neural response
 
 Together, these levels allow us to ask whether the observed EEG response is coherent with the delivered ultrasound dose — at the single-subject level.
 
