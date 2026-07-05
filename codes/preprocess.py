@@ -132,10 +132,9 @@ def detect_bad_channels(raw, z_thresh=3.5):
 
 def flag_bad_segments(raw, amp_thresh_uv=250.0, diff_thresh_uv=150.0, win_sec=1.0):
     """
-    Continuous-recording artifact detection: scan in fixed
-    windows and mark segments with (a) absolute amplitude above
-    amp_thresh_uv, or (b) a sudden sample-to-sample jump above
-    diff_thresh_uv (typically movement), as 'BAD_artifact' annotations.
+    Detect bad continuous segments (excessive amplitude or sudden jumps,
+    typically movement). Returns a boolean sample-level mask where
+    True = usable, plus an annotation object for record-keeping/QC.
     """
     eeg_picks = mne.pick_types(raw.info, eeg=True)
     data = raw.get_data(picks=eeg_picks) * 1e6
@@ -238,8 +237,6 @@ def preprocess(raw, out_dir=None, target=None):
             }, f, indent=2)
 
     return raw
-
-
 
 def preprocess_session(participant_id, session_folder, target, out_dir):
     """
