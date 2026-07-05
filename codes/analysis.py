@@ -3055,6 +3055,7 @@ def plot_erps_500ms(raw, bursts_df, freq_band, session_name, participant_id, out
     # Loop through your 3 baseline styles (none, pre_mean, pre_zscore)
     for baseline_name, baseline_mode in ERP_BASELINES.items():
         print(f'\n    ERP 500ms baseline: {baseline_name}')
+        ylabel_erp = 'µV' if baseline_name != 'pre_zscore' else 'z-score'
 
         # We will collect active vs sham means to help track rankings and plotting limits
         mean_erps_active = []
@@ -3160,10 +3161,9 @@ def plot_erps_500ms(raw, bursts_df, freq_band, session_name, participant_id, out
                     ax.legend(loc='upper right', fontsize=9)
 
             # Hide empty subplots if the grid has leftover spaces
-            for remaining in range(idx_ch + 1, nrows * ncols):
-                r_i, c_i = divmod(remaining, ncols)
+            for idx_remaining in range(idx_ch + 1, nrows * ncols):
+                r_i, c_i = divmod(idx_remaining, ncols)
                 fig.delaxes(axes[r_i][c_i])
-
             fig.suptitle(
                 f'{participant_id} ({session_name}) | 500ms Window ({subset_name.upper()})\n'
                 f'Baseline Treatment: {baseline_name}', 
