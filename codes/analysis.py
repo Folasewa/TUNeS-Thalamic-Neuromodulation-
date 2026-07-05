@@ -414,13 +414,21 @@ def run_sleep_staging_from_fif(raw, session_name, participant_id, output_dir):
 
 def nrem_mask_from_hypno(hypno_int, raw):
     if hypno_int is None:
-        return np.ones(raw.n_times, dtype=bool)
-    mask = np.zeros(raw.n_times, dtype=bool)
-    spe  = int(raw.info['sfreq'] * 30)
-    for epoch, stage in enumerate(hypno_int):
-        if stage in NREM_STAGES:
-            s = epoch * spe
-            mask[s:min(s + spe, raw.n_times)] = True
+        mask = np.ones(raw.n_times, dtype=bool)
+    else:
+        mask = np.zeros(raw.n_times, dtype=bool)
+        spe  = int(raw.info['sfreq'] * 30)
+        for epoch, stage in enumerate(hypno_int):
+            if stage in NREM_STAGES:
+                s = epoch * spe
+                mask[s:min(s + spe, raw.n_times)] = True
+
+    for ann in raw.annotations:
+        if ann['description'].startswith('BAD'):
+            s = int(ann['onset'] * raw.info['sfreq'])
+            e = int((ann['onset'] + ann['duration']) * raw.info['sfreq'])
+            mask[s:e] = False
+
     return mask
 
 
@@ -1090,12 +1098,12 @@ def compute_evoked_band_responses(raw, bursts_df, session_name, participant_id,
                 start, stop = center - pre_samples, center + post_samples
                 if start < 0 or stop > raw.n_times:
                     continue
+                if window_overlaps_bad_annotation(raw, start / sfreq, stop / sfreq):
+                    continue
                 sw_trials.append(sw_filtered[ch_idx, start:stop])
                 sp_trials.append(spindle_envelope[ch_idx, start:stop])
-
             if len(sw_trials) < 3:
                 continue
-
             sw_trials = np.array(sw_trials)
             sp_trials = np.array(sp_trials)
 

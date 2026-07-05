@@ -2,7 +2,7 @@
 This script does:
 For each participant and session:
   1. Find the raw BrainVision (.vhdr) files
-  2. Downsample to RESAMPLE_FREQ (256 Hz) *before* loading into RAM
+  2. Downsample to 500Hz *before* loading into RAM
   3. Bandpass filter (0.1–40 Hz) + notch filter (50 Hz)
   4. Run ICA to remove ocular and cardiac artefacts (optional toggle)
   5. Reference to Average
@@ -184,7 +184,7 @@ def preprocess(raw, out_dir=None, target=None):
     print(f'    Excluding {n_bad} bad sample(s) '
           f'({n_bad / raw.n_times * 100:.1f}% of recording) from average reference')
 
-    bad_chs, z_scores = detect_bad_channels(raw)
+    bad_chs, z_scores = detect_bad_channels(raw, good_mask=good_mask)
     if bad_chs:
         print(f'    Excluding noisy channels from average reference: {bad_chs}')
         raw.info['bads'] = list(set(raw.info['bads'] + bad_chs))
