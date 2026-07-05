@@ -123,127 +123,123 @@ def detect_bad_channels(raw, z_thresh=3.5):
     eeg_picks = mne.pick_types(raw.info, eeg=True)
     data = raw.get_data(picks=eeg_picks) * 1e6
     ch_names = [raw.ch_names[i] for i in eeg_picks]
-
     variances = np.var(data, axis=1)
     median = np.median(variances)
     mad = np.median(np.abs(variances - median)) * 1.4826
     z = (variances - median) / (mad + 1e-12)
-
     bad = [ch for ch, zi in zip(ch_names, z) if abs(zi) > z_thresh]
     return bad, dict(zip(ch_names, z.tolist()))
 
+def flag_bad_segments(raw, amp_thresh_uv=250.0, diff_thresh_uv=150.0, win_sec=1.0):
+    """
+    Continuous-recording artifact detection: scan in fixed
+    windows and mark segments with (a) absolute amplitude above
+    amp_thresh_uv, or (b) a sudden sample-to-sample jump above
+    diff_thresh_uv (typically movement), as 'BAD_artifact' annotations.
+    """
+    eeg_picks = mne.pick_types(raw.info, eeg=True)
+    data = raw.get_data(picks=eeg_picks) * 1e6
+    sfreq = raw.info['sfreq']
+    win_samples = int(win_sec * sfreq)
+    n_windows = data.shape[1] // win_samples
+
+    good_mask = np.ones(data.shape[1], dtype=bool)
+    bad_onsets = []
+    for w in range(n_windows):
+        s, e = w * win_samples, (w + 1) * win_samples
+        seg = data[:, s:e]
+        abs_bad  = np.any(np.abs(seg) > amp_thresh_uv)
+        diff_bad = np.any(np.abs(np.diff(seg, axis=1)) > diff_thresh_uv)
+        if abs_bad or diff_bad:
+            good_mask[s:e] = False
+            bad_onsets.append(s / sfreq)
+
+    if bad_onsets:
+        onset, duration, desc = [], [], []
+        start = prev = bad_onsets[0]
+        for t in bad_onsets[1:]:
+            if t - prev > win_sec * 1.5:
+                onset.append(start)
+                duration.append(prev - start + win_sec)
+                desc.append('BAD_artifact')
+                start = t
+            prev = t
+        onset.append(start)
+        duration.append(prev - start + win_sec)
+        desc.append('BAD_artifact')
+        raw.set_annotations(raw.annotations + mne.Annotations(onset, duration, desc))
+
+    return raw, good_mask
+
 
 def preprocess(raw, out_dir=None, target=None):
-    """Filter + optional ICA + average reference. Modifies raw in place."""
-
-    raw.set_montage(
-        mne.channels.make_standard_montage('standard_1020'),
-        on_missing='ignore'
-    )
-
-    # mark physical reference channels as non-EEG
-    raw.set_channel_types({'TP9': 'misc', 'TP10': 'misc', 'FT9': 'misc', 'FT10': 'misc'})
-
-    # filtering first
+    raw.set_montage(mne.channels.make_standard_montage('standard_1020'), on_missing='ignore')
+    raw.set_channel_types({'TP9': 'misc', 'TP10': 'misc',
+                            'FT9': 'misc', 'FT10': 'misc'})
+# filtering first (before any epoching happens downstream — avoids border/edge effects, per standard practice)
     raw.filter(BANDPASS_LOW, BANDPASS_HIGH, verbose=False)
     raw.notch_filter(NOTCH_FREQ, verbose=False)
 
-    # artefact diagnostics
-    ART_THRESHOLD_UV = 150.0
-    eeg_chs = [
-        ch for idx, ch in enumerate(raw.ch_names)
-        if mne.channel_type(raw.info, idx) == 'eeg'
-    ]
+    raw, good_mask = flag_bad_segments(raw)
+    n_bad = int((~good_mask).sum())
+    print(f'    Excluding {n_bad} bad sample(s) '
+          f'({n_bad / raw.n_times * 100:.1f}% of recording) from average reference')
 
-    if eeg_chs:
-        data_uv = raw.get_data(picks=eeg_chs) * 1e6
-        flags = np.abs(data_uv) > ART_THRESHOLD_UV
-        total = flags.any(axis=0).mean() * 100
-        print(f'    Artefact rate (±{ART_THRESHOLD_UV} µV): {total:.1f}% of samples')
+    bad_chs, z_scores = detect_bad_channels(raw)
+    if bad_chs:
+        print(f'    Excluding noisy channels from average reference: {bad_chs}')
+        raw.info['bads'] = list(set(raw.info['bads'] + bad_chs))
 
-        del data_uv, flags
-        gc.collect()
-
-    # optional ICA BEFORE re-referencing
     if USE_ICA and ICA_N_COMPONENTS is not None:
         try:
             eeg_picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
             n_comps = min(ICA_N_COMPONENTS, len(eeg_picks) - 1)
-
-            print(f'    ICA: fitting {n_comps} components …')
-
-            ica = mne.preprocessing.ICA(
-                n_components=n_comps,
-                method='fastica',
-                random_state=42,
-                max_iter='auto'
-            )
-
+            ica = mne.preprocessing.ICA(n_components=n_comps, method='fastica',
+                                         random_state=42, max_iter='auto')
             raw_fit = raw.copy().filter(1.0, None, verbose=False)
             ica.fit(raw_fit, picks=eeg_picks, verbose=False)
-
             del raw_fit
             gc.collect()
-
             exclude = []
-
-            # EOG detection
-            eog_chs = [
-                ch for ch in raw.ch_names
-                if mne.channel_type(raw.info, raw.ch_names.index(ch)) == 'eog'
-            ]
-
+            eog_chs = [ch for ch in raw.ch_names
+                       if mne.channel_type(raw.info, raw.ch_names.index(ch)) == 'eog']
             if eog_chs:
-                try:
-                    idx, _ = ica.find_bads_eog(raw, ch_name=eog_chs, verbose=False)
-                    exclude.extend(idx)
-                except Exception as e:
-                    print(f'      EOG detection skipped: {e}')
-
+                idx, _ = ica.find_bads_eog(raw, ch_name=eog_chs, verbose=False)
+                exclude.extend(idx)
             else:
                 frontal = [ch for ch in ['Fp1', 'Fp2'] if ch in raw.ch_names]
                 if frontal:
-                    try:
-                        idx, _ = ica.find_bads_eog(raw, ch_name=frontal, verbose=False)
-                        exclude.extend(idx)
-                    except Exception:
-                        pass
-
-            # ECG detection
-            try:
-                idx, _ = ica.find_bads_ecg(raw, method='correlation', verbose=False)
-                exclude.extend(idx)
-            except Exception as e:
-                print(f'      ECG detection skipped: {e}')
-
+                    idx, _ = ica.find_bads_eog(raw, ch_name=frontal, verbose=False)
+                    exclude.extend(idx)
+            idx, _ = ica.find_bads_ecg(raw, method='correlation', verbose=False)
+            exclude.extend(idx)
             ica.exclude = list(set(exclude))
-
-            print(f'    ICA: removing {len(ica.exclude)} components {ica.exclude}')
-
             ica.apply(raw)
-
             del ica
             gc.collect()
-
         except Exception as exc:
             print(f'    ICA failed ({exc}) — skipping')
 
-   # automated bad-channel detection BEFORE average reference
-    bad_chs, z_scores = detect_bad_channels(raw)
-    if bad_chs:
-        print(f'    Flagged noisy channels (excluded from avg ref): {bad_chs}')
-        raw.info['bads'] = list(set(raw.info['bads'] + bad_chs))
+    good_picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
+    all_data   = raw.get_data()
+    avg_ref    = all_data[good_picks][:, good_mask].mean(axis=0)
+    all_data[good_picks] -= avg_ref[np.newaxis, :]
+    raw._data  = all_data
+    print('    Re-referenced to Average (excluding bad channels/segments)')
 
     if out_dir is not None and target is not None:
-        bad_ch_path = Path(out_dir) / f'{target}_flagged_bad_channels.json'
-        with open(str(bad_ch_path), 'w') as f:
-            json.dump({'flagged': bad_chs, 'z_scores': z_scores}, f, indent=2)
-
-    # average reference AFTER ICA
-    raw.set_eeg_reference('average', projection=False, verbose=False)
-    print('    Re-referenced to Average')
+        log_path = Path(out_dir) / f'{target}_preprocessing_log.json'
+        with open(str(log_path), 'w') as f:
+            json.dump({
+                'flagged_bad_channels': bad_chs,
+                'channel_z_scores': z_scores,
+                'n_bad_samples_excluded': n_bad,
+                'pct_recording_excluded': round(n_bad / raw.n_times * 100, 2),
+            }, f, indent=2)
 
     return raw
+
+
 
 def preprocess_session(participant_id, session_folder, target, out_dir):
     """
