@@ -1180,6 +1180,8 @@ def compute_sw_locked_sigma_timecourse(raw, sw_starts_sec, burst_times_sec,
         start, stop = center - pre_samples, center + post_samples
         if start < 0 or stop > raw.n_times:
             continue
+        if window_overlaps_bad_annotation(raw, start / sfreq, stop / sfreq):
+            continue
         trial_mean = envelope[:, start:stop].mean(axis=0)
         bl = trial_mean[max(bl_s, 0):max(bl_e, 0)]
         if len(bl) < 3 or bl.std() == 0:
@@ -2441,6 +2443,9 @@ def plot_erp_topomap_evolution(raw, bursts_df, freq_band, session_name, particip
                 if start < 0 or stop > raw.n_times:
                     trials.append(np.full(n_samples, np.nan))
                     continue
+                if window_overlaps_bad_annotation(raw, start / sfreq, stop / sfreq):
+                    trials.append(np.full(n_samples, np.nan))
+                    continue
                 trial = raw.get_data(picks=[ch_idx], start=start, stop=stop)[0] * 1e6
                 trials.append(trial)
             all_epochs[ch][group_label] = np.array(trials)
@@ -3040,6 +3045,9 @@ def plot_erps_500ms(raw, bursts_df, freq_band, session_name, participant_id, out
                 if start < 0 or stop > raw.n_times:
                     trials.append(np.full(n_samples, np.nan))
                     continue
+                if window_overlaps_bad_annotation(raw, start / sfreq, stop / sfreq):
+                    trials.append(np.full(n_samples, np.nan))
+                    continue
                 trial = raw.get_data(picks=[ch_idx], start=start, stop=stop)[0] * 1e6
                 trials.append(trial)
             all_epochs[ch][group_label] = np.array(trials)
@@ -3093,13 +3101,12 @@ def plot_erps_500ms(raw, bursts_df, freq_band, session_name, participant_id, out
 
         # Calculate Channel Rankings based on peak |ERP| amplitude in the active group
         ranked_chs, scores = _rank_channels_by_erp(mean_erps_active, channels, post_start_idx)
-        ylabel_erp = 'µV' if baseline_name != 'pre_zscore' else 'z-score'
-
-        # ── DEFINE THE 3 CHANNEL SUBSETS TO PLOT ─────────────────────────────
+        top_chs = [ch for ch in FOCUS_CHANNEL_PRIORITY if ch in channels]
+        remaining = [ch for ch in ranked_chs if ch not in top_chs]
         plot_configurations = [
             ('all', channels),
-            ('top10', ranked_chs[:10]),
-            ('top3', ranked_chs[:3])
+            ('top10', (top_chs + remaining)[:10]),
+            ('top3', (top_chs + remaining)[:3])
         ]
 
         # ── PLOTTING LOOP FOR THE 3 CONFIGURATIONS ───────────────────────────
