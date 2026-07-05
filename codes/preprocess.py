@@ -117,11 +117,11 @@ def load_and_resample(vhdr_path):
     set_channel_types(raw)
     return raw, original_sfreq
 
-def detect_bad_channels(raw, z_thresh=3.5):
-    """Flag EEG channels whose variance is a statistical outlier relative
-    to the rest of the montage, on THIS specific recording."""
+def detect_bad_channels(raw, good_mask=None, z_thresh=3.5):
     eeg_picks = mne.pick_types(raw.info, eeg=True)
     data = raw.get_data(picks=eeg_picks) * 1e6
+    if good_mask is not None:
+        data = data[:, good_mask]
     ch_names = [raw.ch_names[i] for i in eeg_picks]
     variances = np.var(data, axis=1)
     median = np.median(variances)
