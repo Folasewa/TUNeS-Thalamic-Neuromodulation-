@@ -117,8 +117,23 @@ def load_and_resample(vhdr_path):
     set_channel_types(raw)
     return raw, original_sfreq
 
+def detect_bad_channels(raw, z_thresh=3.5):
+    """Flag EEG channels whose variance is a statistical outlier relative
+    to the rest of the montage, on THIS specific recording."""
+    eeg_picks = mne.pick_types(raw.info, eeg=True)
+    data = raw.get_data(picks=eeg_picks) * 1e6
+    ch_names = [raw.ch_names[i] for i in eeg_picks]
 
-def preprocess(raw):
+    variances = np.var(data, axis=1)
+    median = np.median(variances)
+    mad = np.median(np.abs(variances - median)) * 1.4826
+    z = (variances - median) / (mad + 1e-12)
+
+    bad = [ch for ch, zi in zip(ch_names, z) if abs(zi) > z_thresh]
+    return bad, dict(zip(ch_names, z.tolist()))
+
+
+def preprocess(raw, out_dir=None, target=None):
     """Filter + optional ICA + average reference. Modifies raw in place."""
 
     raw.set_montage(
@@ -127,7 +142,7 @@ def preprocess(raw):
     )
 
     # mark physical reference channels as non-EEG
-    raw.set_channel_types({'TP9': 'misc', 'TP10': 'misc'})
+    raw.set_channel_types({'TP9': 'misc', 'TP10': 'misc', 'FT9': 'misc', 'FT10': 'misc'})
 
     # filtering first
     raw.filter(BANDPASS_LOW, BANDPASS_HIGH, verbose=False)
@@ -213,12 +228,22 @@ def preprocess(raw):
         except Exception as exc:
             print(f'    ICA failed ({exc}) — skipping')
 
+   # automated bad-channel detection BEFORE average reference
+    bad_chs, z_scores = detect_bad_channels(raw)
+    if bad_chs:
+        print(f'    Flagged noisy channels (excluded from avg ref): {bad_chs}')
+        raw.info['bads'] = list(set(raw.info['bads'] + bad_chs))
+
+    if out_dir is not None and target is not None:
+        bad_ch_path = Path(out_dir) / f'{target}_flagged_bad_channels.json'
+        with open(str(bad_ch_path), 'w') as f:
+            json.dump({'flagged': bad_chs, 'z_scores': z_scores}, f, indent=2)
+
     # average reference AFTER ICA
     raw.set_eeg_reference('average', projection=False, verbose=False)
     print('    Re-referenced to Average')
 
     return raw
-
 
 def preprocess_session(participant_id, session_folder, target, out_dir):
     """
@@ -260,7 +285,7 @@ def preprocess_session(participant_id, session_folder, target, out_dir):
             gc.collect()
             print(f'    Saved pre-ICA snapshot ({snap_secs:.0f} s, {len(viz_present)} ch)')
  
-        raw = preprocess(raw)
+        raw = preprocess(raw, out_dir=out_dir, target=target)
  
         out_dir_path = Path(out_dir)
         out_dir_path.mkdir(parents=True, exist_ok=True)
