@@ -1953,8 +1953,8 @@ def plot_raw_vs_preprocessed(raw_snapshot_uv, raw_post, channels,
         post_trace = raw_post.get_data(picks=[ch], start=0, stop=post_samp)[0] * 1e6
         ylim = max(np.percentile(np.abs(raw_trace), 99) * 1.15, 10.0)
         for ax, trace, color, label in [
-            (ax_raw,  raw_trace,  '#d62728', 'Before ICA'),
-            (ax_post, post_trace, '#1f77b4', 'After ICA'),
+            (ax_raw,  raw_trace,  '#d62728', 'Raw'),
+            (ax_post, post_trace, '#1f77b4', 'Preprocessed'),
         ]:
             ax.plot(times_min[:len(trace)], trace, lw=0.5, color=color, alpha=0.85, rasterized=True)
             ax.set_ylim(-ylim, ylim)
