@@ -109,6 +109,10 @@ SHOW_BURST_OVERLAY = False
 TUS_EPOCH_PRE_SEC  = 3.0
 TUS_EPOCH_POST_SEC = 5.0
 EPOCH_REJECT_UV = 250.0  # fixed absolute-amplitude rejection threshold (paper-style)
+# Latency windows for component-specific channel ranking (relative to TUS onset, seconds)
+N1_WINDOW_SEC = (0.050, 0.150)
+P2_WINDOW_SEC = (0.150, 0.300)
+ERP_DISPLAY_XLIM_SEC = (-0.3, 0.4)
 
 KNOWN_TARGETS = {'adapt', 'thalamus', 'ventricle', 'ventricles'}
 EXCLUDE_CHANNELS = {'TP9', 'TP10', 'FT9', 'FT10'}
@@ -2095,12 +2099,34 @@ def _rank_channels_by_erp(mean_erps, ch_names, post_start_idx):
         scores[ch] = np.sqrt(np.nanmean(erp[post_start_idx:] ** 2))
     return sorted(scores, key=scores.get, reverse=True), scores
 
+def _rank_channels_by_window(mean_erps, channels, times, window_sec):
+    """
+    Rank channels by peak |amplitude| within a fixed latency window
+    (e.g. N1 or P2), instead of across the entire post-stimulus epoch.
+
+    mean_erps : list of 1D arrays, same order as `channels`
+    times     : the time vector (seconds) matching mean_erps' sample axis
+    window_sec: (start_sec, end_sec) window to search within
+    """
+    win_start_idx = np.searchsorted(times, window_sec[0])
+    win_end_idx   = np.searchsorted(times, window_sec[1])
+
+    scores = {}
+    for ch, erp in zip(channels, mean_erps):
+        segment = erp[win_start_idx:win_end_idx]
+        scores[ch] = np.nan if np.all(np.isnan(segment)) else float(np.nanmax(np.abs(segment)))
+
+    valid   = [ch for ch in channels if not np.isnan(scores[ch])]
+    invalid = [ch for ch in channels if np.isnan(scores[ch])]
+    ranked  = sorted(valid, key=lambda c: -scores[c]) + invalid
+    return ranked, scores
+
 def _plot_erp_topo_overlay(
     mean_erps_active, mean_erps_sham,
     channels, times,
     session_name, participant_id,
     output_dir, suffix, baseline_name,
-    t_min=-0.5, t_max=1.0,
+    t_min=ERP_DISPLAY_XLIM_SEC[0], t_max=ERP_DISPLAY_XLIM_SEC[1],
 ):
     """
     EEGLAB-style topo layout using MNE's native layout engine.
@@ -2180,6 +2206,8 @@ def _plot_erp_topo_overlay(
         # Inner axes markings
         ax.axvline(0,  color='black', lw=0.5, ls='--', alpha=0.4)
         ax.axhline(0,  color='grey',  lw=0.4, ls=':',  alpha=0.4)
+        ax.axvspan(*N1_WINDOW_SEC, color='#2E7D32', alpha=0.10)
+        ax.axvspan(*P2_WINDOW_SEC, color='#E68A00', alpha=0.10)
         ax.set_xlim(t_min, t_max)
         ax.set_ylim(ylim)
         ax.set_xticks([])
@@ -2599,24 +2627,7 @@ def _plot_erp_difference(mean_erps_active, mean_erps_sham, channels, times,
             continue
 
         diff = active_erp - sham_erp
-        t_min, t_max = 0.0, 0.3  # 0–300 ms
 
-        mask = (times >= t_min) & (times <= t_max)
-
-        ax_in = ax.inset_axes([0.55, 0.55, 0.4, 0.4])
-
-        ax_in.fill_between(times[mask], diff[mask], 0,
-                        where=(diff[mask] >= 0), color='#E04B4B', alpha=0.35)
-        ax_in.fill_between(times[mask], diff[mask], 0,
-                        where=(diff[mask] < 0), color='#4B7BE0', alpha=0.35)
-
-        ax_in.plot(times[mask], diff[mask], color='black', lw=1.2)
-        ax_in.axvline(0, color='black', lw=0.8, ls='--', alpha=0.7)
-        ax_in.axhline(0, color='grey', lw=0.5, ls=':')
-
-        ax_in.set_xlim(t_min, t_max)
-        ax_in.set_xticks([])
-        ax_in.set_yticks([])
         # shade positive (active > sham) and negative (sham > active) regions
         ax.fill_between(times, diff, 0,
                         where=(diff >= 0), color='#E04B4B', alpha=0.35,
@@ -2627,8 +2638,16 @@ def _plot_erp_difference(mean_erps_active, mean_erps_sham, channels, times,
         ax.plot(times, diff, color='black', lw=1.5)
         ax.axvline(0,  color='black', lw=0.9, ls='--', alpha=0.7)
         ax.axhline(0,  color='grey',  lw=0.6, ls=':')
-        ax.axvspan(-TUS_EPOCH_PRE_SEC, 0, color='grey', alpha=0.06)
-        ax.set_xlim(-1.0, TUS_EPOCH_POST_SEC)
+
+        ax.axvspan(*N1_WINDOW_SEC, color='#2E7D32', alpha=0.10)
+        ax.axvspan(*P2_WINDOW_SEC, color='#E68A00', alpha=0.10)
+        ylim = ax.get_ylim()
+        ax.text(np.mean(N1_WINDOW_SEC), ylim[1]*0.88, 'N1', ha='center',
+                fontsize=6.5, color='#2E7D32', fontweight='bold')
+        ax.text(np.mean(P2_WINDOW_SEC), ylim[1]*0.88, 'P2', ha='center',
+                fontsize=6.5, color='#E68A00', fontweight='bold')
+
+        ax.set_xlim(*ERP_DISPLAY_XLIM_SEC)
         ax.set_ylabel('µV (active − sham)', fontsize=7)
         ax.set_title(ch, fontsize=8)
         ax.tick_params(labelsize=6)
@@ -2640,7 +2659,6 @@ def _plot_erp_difference(mean_erps_active, mean_erps_sham, channels, times,
         r_i, c_i = divmod(idx, ncols)
         axes[r_i][c_i].set_visible(False)
 
-    # x-axis label on every visible bottom-row panel
     for ax_row in axes:
         for ax in ax_row:
             if ax.get_visible():
@@ -2716,8 +2734,9 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
 
     for baseline_name, baseline_mode in ERP_BASELINES.items():
         print(f'\n    ERP baseline: {baseline_name}')
-        mean_erps_by_condition = {}
-        peak_amp_by_condition  = {}
+        mean_erps_by_condition   = {}
+        peak_amp_by_condition_n1 = {}
+        peak_amp_by_condition_p2 = {}
 
         for group_label in ('sham', 'active'):
             mean_erps            = []
@@ -2788,18 +2807,37 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 )
 
             mean_erps_by_condition[group_label] = mean_erps
-            ranked_chs, scores = _rank_channels_by_erp(mean_erps, channels, post_start_idx)
+
+            # ── N1 / P2 component-specific rankings (replaces whole-epoch ranking) ──
+            ranked_n1, scores_n1 = _rank_channels_by_window(mean_erps, channels, times, N1_WINDOW_SEC)
+            ranked_p2, scores_p2 = _rank_channels_by_window(mean_erps, channels, times, P2_WINDOW_SEC)
+
             if group_label == 'active':
-                focus_channel_by_condition['active'] = ranked_chs[0]
-            peak_amp_by_condition[group_label] = {ch: scores[ch] for ch in channels}
+                focus_channel_by_condition['active_n1'] = ranked_n1[0]
+                focus_channel_by_condition['active_p2'] = ranked_p2[0]
 
-            print(f'      [{group_label}] Channel ranking (peak |ERP|, 0–end):')
-            for rank_i, rc in enumerate(ranked_chs[:5], 1):
-                print(f'        {rank_i}. {rc}  {scores[rc]:.2f} µV')
+            peak_amp_by_condition_n1[group_label] = scores_n1
+            peak_amp_by_condition_p2[group_label] = scores_p2
 
-            best_ch    = ranked_chs[0]
+            print(f'      [{group_label}] N1 (50–150ms) channel ranking:')
+            for i, rc in enumerate(ranked_n1[:5], 1):
+                print(f'        {i}. {rc}  {scores_n1[rc]:.2f} µV')
+            print(f'      [{group_label}] P2 (150–300ms) channel ranking:')
+            for i, rc in enumerate(ranked_p2[:5], 1):
+                print(f'        {i}. {rc}  {scores_p2[rc]:.2f} µV')
+
             color      = '#4B7BE0' if group_label == 'sham' else '#E04B4B'
             ylabel_erp = 'µV' if baseline_name != 'pre_zscore' else 'z-score'
+            best_ch    = ranked_n1[0]  # figure titles anchor on N1 winner; P2 winner called out separately
+
+            def _add_component_labels(ax):
+                ax.axvspan(*N1_WINDOW_SEC, color='#2E7D32', alpha=0.12)
+                ax.axvspan(*P2_WINDOW_SEC, color='#E68A00', alpha=0.12)
+                ylim = ax.get_ylim()
+                ax.text(np.mean(N1_WINDOW_SEC), ylim[1]*0.88, 'N1', ha='center',
+                        fontsize=7, color='#2E7D32', fontweight='bold')
+                ax.text(np.mean(P2_WINDOW_SEC), ylim[1]*0.88, 'P2', ha='center',
+                        fontsize=7, color='#E68A00', fontweight='bold')
 
             # Figure 1: all channels (3-col grid)
             fname_all = (f'{participant_id}_{session_name}_{suffix}_'
@@ -2820,18 +2858,16 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     mean_erp = mean_erps[ch_idx_list]
                     sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
                                 if len(clean_trials) > 1 else np.zeros(n_samples))
-                    ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,color=color, alpha=0.3)
-                    ax.plot(times, mean_erp, color=color, lw=1.8,label=f'n={len(clean_trials)}')
+                    ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp, color=color, alpha=0.3)
+                    ax.plot(times, mean_erp, color=color, lw=1.8, label=f'n={len(clean_trials)}')
                     ax.axvline(0, color='black', lw=0.9, ls='--', alpha=0.7)
                     ax.axhline(0, color='grey',  lw=0.5, ls=':')
-                    ax.axvspan(PAPER_BASELINE_SEC[0], PAPER_BASELINE_SEC[1], color='grey', alpha=0.07, label='Baseline' if idx_ch == 0 else '_')
-                    ax.set_xlim(-1.0, TUS_EPOCH_POST_SEC)
+                    _add_component_labels(ax)
+                    ax.set_xlim(*ERP_DISPLAY_XLIM_SEC)
                     ax.set_ylabel(ylabel_erp, fontsize=7)
                     ax.tick_params(labelsize=6)
-                    rank_pos   = ranked_chs.index(ch) + 1
                     is_best_ch = (ch == best_ch)
-                    ch_title   = (f'★ {ch}  [#1 highest ERP]' if is_best_ch
-                                  else f'{ch}  [rank #{rank_pos}]')
+                    ch_title   = f'★ {ch}  [#1 N1]' if is_best_ch else ch
                     ax.set_title(ch_title, fontsize=8,
                                  fontweight='bold' if is_best_ch else 'normal',
                                  color='#C0392B' if is_best_ch else 'black')
@@ -2845,8 +2881,8 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                             ax.set_xlabel('Time (s)', fontsize=7)
                 fig_all.suptitle(
                     f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
-                    f'[baseline: {baseline_name}]\n'
-                    f'All channels  |  ★ = highest ERP response ({best_ch})',
+                    f'[baseline: {baseline_name}, window: {PAPER_BASELINE_SEC[0]} to {PAPER_BASELINE_SEC[1]}s]\n'
+                    f'All channels  |  ★ = highest N1 response ({best_ch})',
                     fontsize=11, fontweight='bold'
                 )
                 fig_all.tight_layout(rect=[0, 0, 1, 0.96])
@@ -2854,108 +2890,53 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 plt.close(fig_all)
                 print(f'      Saved ERP (all channels): {fname_all}')
 
-            # Figure 2: top-10
-            top10_chs   = ranked_chs[:10]
-            fname_top10 = (f'{participant_id}_{session_name}_{suffix}_'
-                           f'ERP_{group_label}_{baseline_name}_top10.png')
-            if not _already_done(output_dir, fname_top10):
-                ncols_top = 2
-                nrows_top = 5
-                fig10, axes10 = plt.subplots(
-                    nrows_top, ncols_top,
-                    figsize=(14, 4 * nrows_top),
-                    sharex=True, sharey=False,
-                    squeeze=False,
-                )
-                axes10_flat = axes10.ravel()
-                for j in range(len(top10_chs), len(axes10_flat)):
-                    axes10_flat[j].set_visible(False)
-
-                for panel_idx, ch in enumerate(top10_chs):
-                    ax          = axes10_flat[panel_idx]
-                    ch_idx_list = channels.index(ch)
-                    clean_trials = clean_trials_by_channel[ch_idx_list]
-                    mean_erp = mean_erps[ch_idx_list]
-                    sem_erp  = (clean_trials.std(axis=0) / np.sqrt(len(clean_trials))
-                                if len(clean_trials) > 1 else np.zeros(n_samples))
-                    ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,
-                                    color=color, alpha=0.3)
-                    ax.plot(times, mean_erp, color=color, lw=2.0,
-                            label=f'Mean (n={len(clean_trials)})')
-                    ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7,
-                               label='TUS onset')
-                    ax.axvspan(PAPER_BASELINE_SEC[0], PAPER_BASELINE_SEC[1], color='grey', alpha=0.07, label='Baseline')
-                    ax.axhline(0, color='grey', lw=0.6, ls=':')
-                    ax.set_xlim(-1.0, TUS_EPOCH_POST_SEC)
-                    ax.set_ylabel(ylabel_erp, fontsize=8)
-                    rank_pos   = ranked_chs.index(ch) + 1
-                    is_best_ch = (ch == best_ch)
-                    ch_title   = (
-                        f'★ {ch}  [rank #1 – highest ERP  |  n={len(clean_trials)} trials]'
-                        if is_best_ch else
-                        f'{ch}  [rank #{rank_pos}  |  n={len(clean_trials)} trials]'
+            # Figure 2: top-5 N1
+            for comp_name, ranked_list, comp_scores in (
+                ('N1', ranked_n1, scores_n1),
+                ('P2', ranked_p2, scores_p2),
+            ):
+                top5_chs   = ranked_list[:5]
+                fname_top5 = (f'{participant_id}_{session_name}_{suffix}_'
+                              f'ERP_{group_label}_{baseline_name}_top5_{comp_name}.png')
+                if not _already_done(output_dir, fname_top5):
+                    fig5, axes5 = plt.subplots(5, 1, figsize=(9, 14), sharex=True)
+                    for panel_idx, ch in enumerate(top5_chs):
+                        ax          = axes5[panel_idx]
+                        ch_idx_list = channels.index(ch)
+                        clean_trials = clean_trials_by_channel[ch_idx_list]
+                        mean_erp = mean_erps[ch_idx_list]
+                        n_tr     = len(clean_trials)
+                        sem_erp  = (clean_trials.std(axis=0) / np.sqrt(n_tr)
+                                    if n_tr > 1 else np.zeros(n_samples))
+                        ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp, color=color, alpha=0.3)
+                        ax.plot(times, mean_erp, color=color, lw=2, label=f'n={n_tr}')
+                        ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7)
+                        ax.axhline(0, color='grey', lw=0.6, ls=':')
+                        _add_component_labels(ax)
+                        ax.set_xlim(*ERP_DISPLAY_XLIM_SEC)
+                        ax.set_ylabel(ylabel_erp, fontsize=8)
+                        is_best_ch = (panel_idx == 0)
+                        ax.set_title(
+                            f'{"★ " if is_best_ch else ""}{ch}  [{comp_name} rank #{panel_idx+1}, '
+                            f'{comp_scores[ch]:.2f} µV  |  n={n_tr}]',
+                            fontsize=9, fontweight='bold' if is_best_ch else 'normal',
+                            color='#C0392B' if is_best_ch else 'black',
+                        )
+                        ax.tick_params(labelsize=7)
+                        ax.legend(fontsize=7, loc='upper right')
+                    axes5[-1].set_xlabel('Time (s)', fontsize=9)
+                    fig5.suptitle(
+                        f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
+                        f'[baseline: {baseline_name}]\n'
+                        f'Top 5 channels ranked by {comp_name} peak amplitude ({(N1_WINDOW_SEC if comp_name=="N1" else P2_WINDOW_SEC)})',
+                        fontsize=11, fontweight='bold'
                     )
-                    ax.set_title(ch_title, fontsize=9,
-                                 fontweight='bold' if is_best_ch else 'normal',
-                                 color='#C0392B' if is_best_ch else 'black')
-                    ax.legend(fontsize=7, loc='upper right')
-                    ax.tick_params(labelsize=7)
-                    if panel_idx >= ncols_top * (nrows_top - 1):
-                        ax.set_xlabel('Time (s)', fontsize=8)
+                    fig5.tight_layout(rect=[0, 0, 1, 0.96])
+                    fig5.savefig(Path(output_dir) / fname_top5, dpi=150, bbox_inches='tight')
+                    plt.close(fig5)
+                    print(f'      Saved ERP top-5 {comp_name} figure: {fname_top5}')
 
-                fig10.suptitle(
-                    f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
-                    f'[baseline: {baseline_name}]\n'
-                    f'Top 10 channels by peak |ERP| response  |  ★ = {best_ch} (highest)',
-                    fontsize=11, fontweight='bold'
-                )
-                fig10.tight_layout(rect=[0, 0, 1, 0.96])
-                fig10.savefig(Path(output_dir) / fname_top10, dpi=150, bbox_inches='tight')
-                plt.close(fig10)
-                print(f'      Saved ERP top-10 figure: {fname_top10}')
-
-            # Figure 2b: top-3
-            top3_chs   = ranked_chs[:3]
-            fname_top3 = (f'{participant_id}_{session_name}_{suffix}_'
-                          f'ERP_{group_label}_{baseline_name}_top3.png')
-            if not _already_done(output_dir, fname_top3):
-                fig3, axes3 = plt.subplots(3, 1, figsize=(10, 10), sharex=True)
-
-                for panel_idx, ch in enumerate(top3_chs):
-                    ax          = axes3[panel_idx]
-                    ch_idx_list = channels.index(ch)
-                    clean_trials = clean_trials_by_channel[ch_idx_list]
-                    mean_erp    = mean_erps[ch_idx_list]
-                    n_tr        = len(clean_trials)
-                    sem_erp     = (clean_trials.std(axis=0) / np.sqrt(n_tr)
-                                   if n_tr > 1 else np.zeros(n_samples))
-
-                    ax.axvspan(PAPER_BASELINE_SEC[0], PAPER_BASELINE_SEC[1], color='grey', alpha=0.08,label='Baseline' if panel_idx == 0 else '_')
-                    ax.fill_between(times, mean_erp - sem_erp, mean_erp + sem_erp,color=color, alpha=0.3)
-                    ax.plot(times, mean_erp, color=color, lw=2,label=f'Mean ± SEM  (n={n_tr})' if panel_idx == 0 else f'n={n_tr}')
-                    ax.axhline(0, color='grey', lw=0.6, ls=':')
-                    ax.set_xlim(-1.0, TUS_EPOCH_POST_SEC)
-                    ax.set_ylabel(ylabel_erp, fontsize=9)
-                    ax.set_title(f'{ch}  [rank #{panel_idx + 1}  |  n={n_tr} trials]',fontsize=10,fontweight='bold' if panel_idx == 0 else 'normal',color='#C0392B' if panel_idx == 0 else 'black',)
-                    ax.tick_params(labelsize=8)
-                    ax.spines['top'].set_visible(False)
-                    ax.spines['right'].set_visible(False)
-                    if panel_idx == 0:
-                        ax.legend(fontsize=8, loc='upper right')
-
-                axes3[-1].set_xlabel('Time (s)', fontsize=9)
-                fig3.suptitle(
-                    f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP  '
-                    f'[baseline: {baseline_name}]\n'
-                    f'Top 3 channels by post-stimulus RMS',
-                    fontsize=11, fontweight='bold'
-                )
-                fig3.tight_layout(rect=[0, 0, 1, 0.95])
-                fig3.savefig(Path(output_dir) / fname_top3, dpi=150, bbox_inches='tight')
-                plt.close(fig3)
-                print(f'      Saved ERP top-3 figure: {fname_top3}')
-
-            # Figure 3: habituation for ALL channels
+            # Figure 3: habituation for ALL channels (unchanged — still uses HABITUATION_WINDOW_SEC, 0-1s post-onset)
             _habituation_plot_all_channels(
                 all_epochs=all_epochs,
                 channels=channels,
@@ -2975,9 +2956,14 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
 
             if info_topo is not None:
                 _erp_topomap(
-                    peak_amp_by_condition[group_label], topo_chs, info_topo,
+                    peak_amp_by_condition_n1[group_label], topo_chs, info_topo,
                     session_name, participant_id, output_dir,
-                    suffix, group_label, baseline_name,
+                    f'{suffix}_N1', group_label, baseline_name,
+                )
+                _erp_topomap(
+                    peak_amp_by_condition_p2[group_label], topo_chs, info_topo,
+                    session_name, participant_id, output_dir,
+                    f'{suffix}_P2', group_label, baseline_name,
                 )
 
         # ── outside group_label loop, inside baseline loop ────────────────
@@ -2991,7 +2977,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 mean_erps_by_condition['active'], mean_erps_by_condition['sham'],
                 channels, times,
                 session_name, participant_id, output_dir, suffix, baseline_name,
-                t_min=-0.5, t_max=1.5,
+                t_min=ERP_DISPLAY_XLIM_SEC[0], t_max=ERP_DISPLAY_XLIM_SEC[1],
             )
 
     # ── outside baseline loop ─────────────────────────────────────────────
