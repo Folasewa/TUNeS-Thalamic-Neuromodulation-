@@ -221,7 +221,7 @@ def preprocess(raw, out_dir=None, target=None):
 
     good_picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
     all_data   = raw.get_data()
-    avg_ref    = all_data[good_picks][:, good_mask].mean(axis=0)
+    avg_ref    = all_data[good_picks].mean(axis=0)
     all_data[good_picks] -= avg_ref[np.newaxis, :]
     raw._data  = all_data
     print('    Re-referenced to Average (excluding bad channels/segments)')
