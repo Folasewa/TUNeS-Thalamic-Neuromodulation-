@@ -353,4 +353,4 @@ if __name__ == '__main__':
         preprocess_participant(pid)
  
     print('\nDone. Preprocessed files written to:', PREPROCESSED_DIR)
-    print('Run analyze.py next.')
+    print('Run analysis.py next.')
