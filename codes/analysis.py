@@ -2773,6 +2773,64 @@ def _plot_erp_difference(mean_erps_active, mean_erps_sham, channels, times,
     plt.close(fig)
     print(f'      Saved ERP difference figure: {fname}')
 
+def _plot_erp_butterfly(mean_erps_by_condition, channels, times_ms, xlim_ms,
+                         session_name, participant_id, output_dir, suffix, baseline_name):
+    """
+    Butterfly plot: every channel's mean ERP overlaid on one axis, per condition,
+    with global field power (GFP = RMS across channels) drawn on top in bold.
+    One PNG per baseline type, sham and active side by side.
+    """
+    fname = f'{participant_id}_{session_name}_{suffix}_ERP_butterfly_{baseline_name}.png'
+    if _already_done(output_dir, fname):
+        return
+ 
+    conditions = [c for c in ('sham', 'active') if c in mean_erps_by_condition]
+    if not conditions:
+        return
+ 
+    cond_colors = {'sham': '#4B7BE0', 'active': '#E04B4B'}
+    fig, axes = plt.subplots(1, len(conditions), figsize=(7 * len(conditions), 5),
+                              sharex=True, sharey=True, squeeze=False)
+    axes = axes[0]
+ 
+    for ax, cond in zip(axes, conditions):
+        erps = np.array(mean_erps_by_condition[cond])  # shape: (n_channels, n_samples)
+        valid = ~np.all(np.isnan(erps), axis=1)
+ 
+        if not np.any(valid):
+            ax.text(0.5, 0.5, 'insufficient data', transform=ax.transAxes,
+                    ha='center', va='center', color='grey', fontsize=9)
+            ax.set_title(cond.capitalize(), fontsize=11, fontweight='bold')
+            continue
+ 
+        # individual channel traces, thin and translucent
+        for ch_erp in erps[valid]:
+            ax.plot(times_ms, ch_erp, color=cond_colors[cond], lw=0.7, alpha=0.35)
+ 
+        # global field power = RMS across channels at each timepoint
+        gfp = np.sqrt(np.nanmean(erps[valid] ** 2, axis=0))
+        ax.plot(times_ms, gfp, color='black', lw=1.8, label='GFP (RMS)')
+ 
+        ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7)
+        ax.axhline(0, color='grey', lw=0.5, ls=':')
+        ax.set_xlim(*xlim_ms)
+        ax.set_xlabel('Time (ms)', fontsize=9)
+        ax.set_title(f'{cond.capitalize()}  (n_channels={valid.sum()})',
+                     fontsize=11, fontweight='bold')
+        ax.tick_params(labelsize=8)
+        ax.legend(fontsize=8, loc='upper right')
+ 
+    axes[0].set_ylabel('µV' if baseline_name != 'pre_zscore' else 'z-score', fontsize=9)
+ 
+    fig.suptitle(
+        f'{participant_id} – {session_name}  |  ERP butterfly plot  [baseline: {baseline_name}]',
+        fontsize=12, fontweight='bold'
+    )
+    fig.tight_layout(rect=[0, 0, 1, 0.93])
+    fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
+    plt.close(fig)
+    print(f'      Saved ERP butterfly figure: {fname}')
+
 def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_dir, suffix=''):
 
     if 'burst_time_s' not in bursts_df.columns:
@@ -3017,6 +3075,11 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
                 plt.close(fig)
                 print(f'      Saved ERP figure: {fname}')
+                
+            _plot_erp_butterfly(
+                mean_erps_by_condition, channels, times_ms, xlim_ms,
+                session_name, participant_id, output_dir, suffix, baseline_name,
+            )
 
             _plot_erp_difference(
                 mean_erps_by_condition['active'], mean_erps_by_condition['sham'],

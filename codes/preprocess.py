@@ -173,25 +173,26 @@ def flag_bad_segments(raw, amp_thresh_uv=250.0, diff_thresh_uv=150.0, win_sec=1.
 
 def preprocess(raw, out_dir=None, target=None):
     raw.set_montage(mne.channels.make_standard_montage('standard_1020'), on_missing='ignore')
-    ref_channels = {'TP9': 'misc', 'TP10': 'misc', 'FT9': 'misc', 'FT10': 'misc'}
-    present = {ch: typ for ch, typ in ref_channels.items() if ch in raw.ch_names}
-    missing = [ch for ch in ref_channels if ch not in raw.ch_names]
-    if missing:
-        print(f'    Note: {missing} not present in this montage — skipping')
-    if present:
-        raw.set_channel_types(present)
-# filtering first (before any epoching happens downstream — avoids border/edge effects, per standard practice)
+
+    if 'FCz' not in raw.ch_names:
+        raw = mne.add_reference_channels(raw, ref_channels=['FCz'], copy=False)
+        raw.set_channel_types({'FCz': 'eeg'})
+        raw.set_montage(mne.channels.make_standard_montage('standard_1020'), on_missing='ignore')
+
+    # filtering first (before any epoching happens downstream — avoids border/edge effects,
+    # per standard practice)
     raw.filter(BANDPASS_LOW, BANDPASS_HIGH, verbose=False)
     raw.notch_filter(NOTCH_FREQ, verbose=False)
 
     raw, good_mask = flag_bad_segments(raw)
     n_bad = int((~good_mask).sum())
-    print(f'    Excluding {n_bad} bad sample(s) '
-          f'({n_bad / raw.n_times * 100:.1f}% of recording) from average reference')
+    print(f'    Flagged {n_bad} bad sample(s) '
+          f'({n_bad / raw.n_times * 100:.1f}% of recording) as BAD_artifact')
 
+    # Data-driven bad-channel detection 
     bad_chs, z_scores = detect_bad_channels(raw, good_mask=good_mask)
     if bad_chs:
-        print(f'    Excluding noisy channels from average reference: {bad_chs}')
+        print(f'    Excluding noisy channels: {bad_chs}')
         raw.info['bads'] = list(set(raw.info['bads'] + bad_chs))
 
     if USE_ICA and ICA_N_COMPONENTS is not None:
@@ -224,19 +225,28 @@ def preprocess(raw, out_dir=None, target=None):
         except Exception as exc:
             print(f'    ICA failed ({exc}) — skipping')
 
-    good_picks = mne.pick_types(raw.info, eeg=True, exclude='bads')
-    all_data   = raw.get_data()
-    avg_ref    = all_data[good_picks].mean(axis=0)
-    all_data[good_picks] -= avg_ref[np.newaxis, :]
-    raw._data  = all_data
-    print('    Re-referenced to Average (excluding bad channels/segments)')
+    # --- Re-reference: average first (recovers true FCz signal), then
+    # switch to linked mastoids, per lab protocol ---
+    raw.set_eeg_reference(ref_channels='average', verbose=False)
+
+    mastoid_chs = [ch for ch in ('TP9', 'TP10') if ch in raw.ch_names]
+    reference_scheme = 'INCOMPLETE'
+    if len(mastoid_chs) == 2:
+        raw.set_eeg_reference(ref_channels=mastoid_chs, verbose=False)
+        print(f'    Re-referenced to linked mastoids: {mastoid_chs}')
+        reference_scheme = 'linked_mastoid_TP9_TP10'
+        # Post-reference, TP9/TP10's own signal is near-degenerate by
+        # construction (each is now ~(TP9-TP10)/2) — exclude from downstream
+        # channel-level analysis, same as any standard linked-mastoid pipeline.
+        raw.set_channel_types({ch: 'misc' for ch in mastoid_chs})
+    else:
+        print(f'    WARNING: expected TP9 + TP10 for linked-mastoid reference, '
+              f'found {mastoid_chs} — check channel list. Reference left as average.')
 
     if out_dir is not None and target is not None:
         log_path = Path(out_dir) / f'{target}_preprocessing_log.json'
         with open(str(log_path), 'w') as f:
-            json.dump({
-                'flagged_bad_channels': bad_chs,
-                'channel_z_scores': z_scores,
+            json.dump({'reference_scheme': reference_scheme, 'flagged_bad_channels': bad_chs,'channel_z_scores': z_scores,
                 'n_bad_samples_excluded': n_bad,
                 'pct_recording_excluded': round(n_bad / raw.n_times * 100, 2),
             }, f, indent=2)
