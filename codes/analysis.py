@@ -1761,6 +1761,8 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
               'skipped_nrem': 0, 'skipped_spindle': 0, 'kept_active': 0, 'kept_sham': 0, 'skipped_bad_segment': 0}
     suffix      = 'nrem' if analysis_is_nrem else 'full_recording'
     out_csv     = Path(output_dir) / f'{participant_id}_{session_name}_{suffix}_per_pulse_features.csv'
+    if out_csv.exists():
+        out_csv.unlink()
     BATCH_SIZE  = 100
     rows, first_write = [], True
     burst_times_by_group = {'active': [], 'sham': []}
