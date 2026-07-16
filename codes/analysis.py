@@ -2361,7 +2361,7 @@ TFR_BASELINES = {
     'full_pre':        (-TUS_EPOCH_PRE_SEC, -0.5),
 }
 ERP_TOPO_TIMECOURSE_PRE_MS     = 300   # start of window (ms before TUS onset)
-ERP_TOPO_TIMECOURSE_POST_MS    = 500   # end of window (ms after TUS onset)
+ERP_TOPO_TIMECOURSE_POST_MS    = 3000   # end of window (ms after TUS onset)
 ERP_TOPO_TIMECOURSE_STEP_MS    = 100   # spacing between topomap frames
 ERP_TOPO_TIMECOURSE_HALFWIN_MS = 25    # ± window averaged into each frame's value
 
