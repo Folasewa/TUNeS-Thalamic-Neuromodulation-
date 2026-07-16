@@ -2096,10 +2096,9 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
     print(f'    Kept active={counts["kept_active"]} sham={counts["kept_sham"]}')
     if not tmp_csv.exists():
         print('    No valid burst rows written')
-    return {}
+        return {}
 
     tmp_csv.replace(out_csv)
-    pulse_df = pd.read_csv(out_csv)
     pulse_df = pd.read_csv(out_csv)
     excluded = {'participant_id', 'session', 'analysis_scope', 'condition', 'group',
                 'burst_time_s', 'n_pulses', 'burst_duration_sec', 'sleep_stage', 'brain_state'}
@@ -2171,7 +2170,6 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
         'n_active': counts['kept_active'], 'n_sham': counts['kept_sham'],
         'analysis_scope': suffix, 'event_locked_spindles': el_spindle_features,
     }
-
 
 # =============================================================================
 # Visualisations
@@ -3807,7 +3805,7 @@ def plot_erp_channel_groups(
         raw, bursts_df, session_name, participant_id, output_dir,
         suffix=group_suffix, channels_to_plot=channels_to_plot,
     )
-    
+
 def plot_tfrs(
     raw,
     bursts_df,
@@ -5327,7 +5325,7 @@ def flatten_features(peak_freq, spindle_features, sw_features, power_features, p
     return out
 
 #-----------
-#Group summaty builders
+#Group summary builders
 #--------
 
 
