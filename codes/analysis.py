@@ -1162,7 +1162,18 @@ def save_burst_locked_spindle_csv(burst_times_by_group, spindle_summary,
       - How does duration / frequency / RMS compare?
     """
     fname = f'{participant_id}_{session_name}_{suffix}_burst_locked_spindles.csv'
-    if _already_done(output_dir, fname):
+    fname = f'{participant_id}_{session_name}_{suffix}_burst_locked_spindles.csv'
+    out_path = Path(output_dir) / fname
+    summary_name = f'{participant_id}_{session_name}_{suffix}_burst_locked_spindles_summary.csv'
+    summary_path = Path(output_dir) / summary_name
+
+    if out_path.exists():
+        print(f'    [skip] already exists: {fname}')
+        if not summary_path.exists():
+            existing_df = pd.read_csv(out_path)
+            _save_burst_locked_spindle_summary(
+                existing_df, session_name, participant_id, output_dir, suffix
+            )
         return
 
     if spindle_summary is None or spindle_summary.empty:
@@ -1321,7 +1332,7 @@ def compute_evoked_band_responses(raw, bursts_df, session_name, participant_id,
     pre_samples  = int(TUS_EPOCH_PRE_SEC * sfreq)
     post_samples = int(TUS_EPOCH_POST_SEC * sfreq)
     times        = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC,
-                                pre_samples + post_samples)
+                                pre_samples + post_samples,  endpoint=False)
 
     raw_data         = raw.get_data(picks=channels) * 1e6
     sw_filtered      = _butter_filter(raw_data, sfreq, *SW_EVOKED_BAND)
@@ -1396,7 +1407,7 @@ def compute_sw_locked_sigma_timecourse(raw, sw_starts_sec, burst_times_sec,
     sfreq = raw.info['sfreq']
     pre_samples, post_samples = int(pre_sec * sfreq), int(post_sec * sfreq)
     n_samples = pre_samples + post_samples
-    times_sec = np.linspace(-pre_sec, post_sec, n_samples)
+    times_sec = np.linspace(-pre_sec, post_sec, n_samples,  endpoint=False)
 
     burst_times_sec = np.asarray(burst_times_sec)
     near_mask = np.array([
@@ -2009,9 +2020,10 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
     out_csv = Path(output_dir) / f'{participant_id}_{session_name}_{suffix}_per_pulse_features.csv'
     tmp_csv = Path(output_dir) / f'{participant_id}_{session_name}_{suffix}_per_pulse_features.tmp.csv'
 
-    if tmp_csv.exists():
-        tmp_csv.unlink()
-
+# Build the new file atomically so reruns cannot mix old and new rows.
+    for p in (tmp_csv, out_csv):
+        if p.exists():
+            p.unlink()
     BATCH_SIZE = 100
     rows, first_write = [], True
     burst_times_by_group = {'active': [], 'sham': []}
@@ -2072,7 +2084,7 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
         counts[f'kept_{group}'] += 1
         burst_times_by_group[group].append(burst_time_sec)
         if len(rows) >= BATCH_SIZE:
-            pd.DataFrame(rows).to_csv(out_csv, mode='a', header=first_write, index=False)
+            pd.DataFrame(rows).to_csv(tmp_csv, mode='a', header=first_write, index=False)
             first_write = False
             rows.clear()
             gc.collect()
@@ -2083,7 +2095,8 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
 
     print(f'    Kept active={counts["kept_active"]} sham={counts["kept_sham"]}')
     if not tmp_csv.exists():
-        return {}
+        print('    No valid burst rows written')
+    return {}
 
     tmp_csv.replace(out_csv)
     pulse_df = pd.read_csv(out_csv)
@@ -2169,6 +2182,7 @@ def safe_plot(fn, *args, **kwargs):
         fn(*args, **kwargs)
     except Exception as e:
         print(f'    Plot failed ({fn.__name__}): {e}')
+        traceback.print_exc()
     finally:
         plt.close('all')
         gc.collect()
@@ -2179,6 +2193,7 @@ def safe_plot_returning(fn, *args, **kwargs):
         return fn(*args, **kwargs)
     except Exception as e:
         print(f'    Plot failed ({fn.__name__}): {e}')
+        traceback.print_exc()
         return None
     finally:
         plt.close('all')
@@ -3275,7 +3290,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
     pre_samples  = int(TUS_EPOCH_PRE_SEC * sfreq)
     post_samples = int(TUS_EPOCH_POST_SEC * sfreq)
     n_samples    = pre_samples + post_samples
-    times        = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples)
+    times        = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples,  endpoint=False)
     times_ms     = times * 1000
 
     hab_start = pre_samples + int(HABITUATION_WINDOW_SEC[0] * sfreq)
@@ -3332,7 +3347,15 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
             n_trials      = all_epochs[channels[0]][group_label].shape[0]
             good_channels = []
             bad_channels  = []
-
+            if n_trials == 0:
+                print(f'      [{group_label}] No trials — skipping')
+                for ch in channels:
+                    clean_trials_by_channel.append(np.empty((0, n_samples)))
+                    mean_erps.append(np.full(n_samples, np.nan))
+                mean_erps_by_condition[group_label] = mean_erps
+                clean_trials_by_condition[group_label] = clean_trials_by_channel
+                peak_amp_by_condition[group_label] = {ch: np.nan for ch in channels}
+                continue
             for ch in channels:
                 raw_trials  = all_epochs[ch][group_label].copy()
                 corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
@@ -3814,7 +3837,7 @@ def plot_tfrs(
     pre_samples = int(TUS_EPOCH_PRE_SEC * sfreq)
     post_samples = int(TUS_EPOCH_POST_SEC * sfreq)
     n_samples = pre_samples + post_samples
-    times = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples)
+    times = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples,  endpoint=False)
 
     freqs = np.arange(1.0, 21.0, 1.0)
     n_cycles = freqs / 2.0
