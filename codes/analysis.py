@@ -211,6 +211,11 @@ def find_vmrk(participant_id, target):
     This is the ONLY access to the raw subjects folder in analysis.py.
     """
     subject_folder = Path(MARKERS_ROOT) / participant_id
+    if not subject_folder.exists():
+        print(f'    Marker folder not found: {subject_folder}')
+        return []
+
+    matches = []
     for folder in sorted(subject_folder.iterdir()):
         if not folder.is_dir():
             continue
@@ -218,10 +223,9 @@ def find_vmrk(participant_id, target):
         if target.lower().replace('ventricle', 'vent') not in text and \
            target.lower() not in text:
             continue
-        vmrk_files = sorted(folder.glob('*.vmrk'))
-        if vmrk_files:
-            return [str(p) for p in vmrk_files]
-    return []
+        matches.extend(sorted(folder.glob('*.vmrk')))
+
+    return [str(p) for p in matches]
 
 
 # statistics helpers
@@ -326,13 +330,21 @@ def _add_sig_bracket(ax, x1, x2, y, p_corrected, color='#222', fontsize=8,
 def _bracket_y(*value_arrays, pad_frac=0.10):
     """
     Compute a sensible y position for a significance bracket, sitting
-    just above the highest data point (incl. whiskers) across the
-    given arrays. Falls back to 0 if everything is empty.
+    just above the highest data point. Falls back to 0 if everything is empty.
     """
-    all_vals = np.concatenate([np.asarray(v, dtype=float).ravel()
-                                for v in value_arrays if len(v)])
+    arrays = [
+        np.asarray(v, dtype=float).ravel()
+        for v in value_arrays
+        if len(v)
+    ]
+    if not arrays:
+        return 0.0, 1.0
+
+    all_vals = np.concatenate(arrays)
+    all_vals = all_vals[np.isfinite(all_vals)]
     if len(all_vals) == 0:
         return 0.0, 1.0
+
     lo, hi = np.nanmin(all_vals), np.nanmax(all_vals)
     span = hi - lo if hi > lo else max(abs(hi), 1.0)
     return hi + span * pad_frac, span
@@ -457,7 +469,7 @@ def _regression_baseline_correct(epochs_2d, pre_samples, baseline_window_idx):
  
     For each timepoint t, fits:  y_t = beta0 + beta1 * baseline_mean + eps
     across trials, then returns the RESIDUALS (y_t - beta1*baseline_mean),
-    re-centred to preserve the grand mean at each timepoint. This is the
+    retaining the per-timepoint mean structure already present in y. This is the
     single-condition analogue of Alday's regression-based baseline
     correction (per-timepoint OLS on the trial's own pre-stimulus mean).
     """
@@ -473,7 +485,6 @@ def _regression_baseline_correct(epochs_2d, pre_samples, baseline_window_idx):
     x = baseline_mean - baseline_mean.mean()
     denom = np.sum(x ** 2)
     out = np.empty_like(epochs_2d)
-    grand_mean_per_t = epochs_2d.mean(axis=0)
     for t in range(n_times):
         y = epochs_2d[:, t]
         beta1 = float(np.sum(x * (y - y.mean())) / denom) if denom > 0 else 0.0
@@ -484,8 +495,7 @@ def _rank_biserial_effect(vals_a, vals_b):
     """
     Rank-biserial correlation effect size + p-value from a Mann-Whitney U
     test between two independent samples (e.g. 1W vs 60W trial-level
-    sigma power). r = 1 - 2U/(n1*n2); sign convention here is
-    (vals_b - vals_a), i.e. positive = group b (typically 60W) higher.
+    sigma power). Positive = vals_b higher than vals_a.
     """
     vals_a = np.asarray(vals_a, dtype=float)
     vals_b = np.asarray(vals_b, dtype=float)
@@ -495,8 +505,9 @@ def _rank_biserial_effect(vals_a, vals_b):
         u_stat, p = _mwu(vals_b, vals_a, alternative='two-sided')
     except ValueError:
         return np.nan, np.nan
+
     n1, n2 = len(vals_b), len(vals_a)
-    r_rb = 1 - (2 * u_stat) / (n1 * n2)
+    r_rb = (2 * u_stat) / (n1 * n2) - 1
     return float(r_rb), float(p)
 
 # =============================================================================
@@ -917,7 +928,10 @@ def parse_tus_markers_bursts(vmrk_path: str,
         n_b   = len(b_markers_sorted)
         n_csv = len(csv_conditions)
         n_use = min(n_b, n_csv)
-        if n_b != n_csv:
+
+        if n_b == 0:
+            print('    [CSV path] WARNING: no B-markers found — falling back to A-burst order')
+        elif n_b != n_csv:
             print(f'    [CSV path] WARNING: {n_b} vmrk B-markers vs '
                   f'{n_csv} CSV delivered trials — using first {n_use} of each')
 
@@ -928,30 +942,95 @@ def parse_tus_markers_bursts(vmrk_path: str,
             df['gap_sec'].isna() | (df['gap_sec'] > burst_gap_threshold)
         ).cumsum()
 
+        grouped_bursts = []
+        for burst_id, group in df.groupby('burst_id'):
+            group = group.sort_values('sample_original')
+            grouped_bursts.append((burst_id, group))
+
         burst_rows = []
         cond_seq   = {}
-        for burst_idx, (burst_id, group) in enumerate(df.groupby('burst_id')):
-            if burst_idx >= n_use:
-                break
-            condition = csv_conditions[burst_idx]
-            if condition == 'unknown':
-                continue
-            group = group.sort_values('sample_original')
-            cond_seq[condition] = cond_seq.get(condition, 0) + 1
-            burst_rows.append({
-                'burst_id':                    int(burst_id),
-                'sample_original':             int(group['sample_original'].iloc[0]),
-                'time_sec':                    float(group['time_sec'].iloc[0]),
-                'condition':                   condition,
-                'n_pulses':                    len(group),
-                'duration_sec':                float(
-                    group['time_sec'].iloc[-1] - group['time_sec'].iloc[0]
-                ),
-                'first_trigger_seq_all':       int(group.index[0]  + 1),
-                'last_trigger_seq_all':        int(group.index[-1] + 1),
-                'first_trigger_seq_condition': cond_seq[condition],
-                'last_trigger_seq_condition':  cond_seq[condition],
-            })
+        used_burst_ids = set()
+
+        if n_b > 0:
+            burst_lookup = []
+            for burst_id, group in grouped_bursts:
+                first_sample = int(group['sample_original'].iloc[0])
+                last_sample  = int(group['sample_original'].iloc[-1])
+                mid_sample   = (first_sample + last_sample) / 2
+                burst_lookup.append((burst_id, group, first_sample, last_sample, mid_sample))
+
+            for trial_idx in range(n_use):
+                condition = csv_conditions[trial_idx]
+                if condition == 'unknown':
+                    continue
+
+                b_sample = int(b_markers_sorted[trial_idx]['sample_original'])
+
+                containing = [
+                    item for item in burst_lookup
+                    if item[2] <= b_sample <= item[3]
+                    and item[0] not in used_burst_ids
+                ]
+
+                if containing:
+                    burst_id, group, _, _, _ = containing[0]
+                else:
+                    available = [
+                        item for item in burst_lookup
+                        if item[0] not in used_burst_ids
+                    ]
+                    if not available:
+                        break
+                    burst_id, group, _, _, _ = min(
+                        available,
+                        key=lambda item: abs(item[4] - b_sample)
+                    )
+
+                used_burst_ids.add(burst_id)
+                cond_seq[condition] = cond_seq.get(condition, 0) + 1
+
+                burst_rows.append({
+                    'burst_id':                    int(burst_id),
+                    'sample_original':             int(group['sample_original'].iloc[0]),
+                    'time_sec':                    float(group['time_sec'].iloc[0]),
+                    'condition':                   condition,
+                    'n_pulses':                    len(group),
+                    'duration_sec':                float(
+                        group['time_sec'].iloc[-1] - group['time_sec'].iloc[0]
+                    ),
+                    'first_trigger_seq_all':       int(group.index[0]  + 1),
+                    'last_trigger_seq_all':        int(group.index[-1] + 1),
+                    'first_trigger_seq_condition': cond_seq[condition],
+                    'last_trigger_seq_condition':  cond_seq[condition],
+                    'matched_b_marker_sample':     b_sample,
+                    'matched_b_marker_time_sec':   float(b_sample / original_sfreq),
+                })
+
+        else:
+            n_use = min(len(grouped_bursts), n_csv)
+            for burst_idx, (burst_id, group) in enumerate(grouped_bursts[:n_use]):
+                condition = csv_conditions[burst_idx]
+                if condition == 'unknown':
+                    continue
+
+                cond_seq[condition] = cond_seq.get(condition, 0) + 1
+
+                burst_rows.append({
+                    'burst_id':                    int(burst_id),
+                    'sample_original':             int(group['sample_original'].iloc[0]),
+                    'time_sec':                    float(group['time_sec'].iloc[0]),
+                    'condition':                   condition,
+                    'n_pulses':                    len(group),
+                    'duration_sec':                float(
+                        group['time_sec'].iloc[-1] - group['time_sec'].iloc[0]
+                    ),
+                    'first_trigger_seq_all':       int(group.index[0]  + 1),
+                    'last_trigger_seq_all':        int(group.index[-1] + 1),
+                    'first_trigger_seq_condition': cond_seq[condition],
+                    'last_trigger_seq_condition':  cond_seq[condition],
+                    'matched_b_marker_sample':     np.nan,
+                    'matched_b_marker_time_sec':   np.nan,
+                })
 
         if not burst_rows:
             print('    [CSV path] No bursts matched — check CSV files and vmrk')
@@ -1927,10 +2006,13 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
     counts = {'total': len(bursts), 'skipped_condition': 0, 'skipped_bounds': 0,
               'skipped_nrem': 0, 'skipped_spindle': 0, 'kept_active': 0, 'kept_sham': 0, 'skipped_bad_segment': 0}
     suffix      = 'nrem' if analysis_is_nrem else 'full_recording'
-    out_csv     = Path(output_dir) / f'{participant_id}_{session_name}_{suffix}_per_pulse_features.csv'
-    if out_csv.exists():
-        out_csv.unlink()
-    BATCH_SIZE  = 100
+    out_csv = Path(output_dir) / f'{participant_id}_{session_name}_{suffix}_per_pulse_features.csv'
+    tmp_csv = Path(output_dir) / f'{participant_id}_{session_name}_{suffix}_per_pulse_features.tmp.csv'
+
+    if tmp_csv.exists():
+        tmp_csv.unlink()
+
+    BATCH_SIZE = 100
     rows, first_write = [], True
     burst_times_by_group = {'active': [], 'sham': []}
 
@@ -1995,14 +2077,16 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
             rows.clear()
             gc.collect()
     if rows:
-        pd.DataFrame(rows).to_csv(out_csv, mode='a', header=first_write, index=False)
+        pd.DataFrame(rows).to_csv(tmp_csv, mode='a', header=first_write, index=False)
         rows.clear()
         gc.collect()
 
     print(f'    Kept active={counts["kept_active"]} sham={counts["kept_sham"]}')
-    if not out_csv.exists():
+    if not tmp_csv.exists():
         return {}
 
+    tmp_csv.replace(out_csv)
+    pulse_df = pd.read_csv(out_csv)
     pulse_df = pd.read_csv(out_csv)
     excluded = {'participant_id', 'session', 'analysis_scope', 'condition', 'group',
                 'burst_time_s', 'n_pulses', 'burst_duration_sec', 'sleep_stage', 'brain_state'}
@@ -2039,7 +2123,7 @@ def run_pulse_level_analysis(raw, vmrk_path, hypno_int, hypno_up,
     save_burst_locked_slowwave_csv(burst_times_by_group, sw_summary_full,session_name, participant_id, output_dir, suffix, post_window_sec=TUS_EPOCH_POST_SEC)
     # Save MNE Epochs
     try:
-        eeg_all     = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude='bads')]
+        eeg_all     = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude='bads') if raw.ch_names[i] not in EXCLUDE_CHANNELS]
         raw_epo     = raw.copy().pick_channels(eeg_all) if eeg_all else raw.copy()
         burst_df_epo = pd.read_csv(out_csv) if out_csv.exists() else pd.DataFrame()
         if not burst_df_epo.empty:
@@ -2153,7 +2237,7 @@ def plot_spectrogram(raw, hypno_int, session_name, participant_id, output_dir,
     if _already_done(output_dir, fname):
         return
  
-    channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude='bads')]
+    channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude='bads') if raw.ch_names[i] not in EXCLUDE_CHANNELS]
     if not channels:
         return
     
@@ -3694,9 +3778,10 @@ def plot_erp_channel_groups(
     """
     if channels_to_plot is None:
         channels_to_plot = SPINDLE_CHANNELS + SW_CHANNELS
+    group_suffix = f'{suffix}_spindle_slowwave_channels' if suffix else 'spindle_slowwave_channels'
     plot_erp_extended(
         raw, bursts_df, session_name, participant_id, output_dir,
-        suffix=suffix, channels_to_plot=channels_to_plot,
+        suffix=group_suffix, channels_to_plot=channels_to_plot,
     )
 def plot_tfrs(
     raw,
@@ -4604,6 +4689,10 @@ def plot_group_paired_bar_grid(df_effects, measures, output_path):
          ('spindle_rate', 'Spindle rate'), ('spindle_amplitude', 'Amplitude'),
          ('spindle_duration', 'Duration'), ('spindle_frequency', 'Frequency')]
     """
+    required = {'subject', 'measure', 'thal_delta', 'vent_delta'}
+    if df_effects is None or df_effects.empty or not required.issubset(df_effects.columns):
+        print('  Group paired bar grid skipped: no group effects data')
+        return
     ncols = 3
     nrows = int(np.ceil(len(measures) / ncols))
     fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4.2 * nrows), squeeze=False)
@@ -4729,6 +4818,13 @@ def build_group_summary_table(df_trials):
     One row per subject-session-region: effect_rb, p_value from
     _rank_biserial_effect(1W trials, 60W trials).
     """
+    required = {'subject', 'session', 'region', 'window', 'sigma_db'}
+    if df_trials is None or df_trials.empty or not required.issubset(df_trials.columns):
+        return pd.DataFrame(columns=[
+            'subject', 'session', 'region',
+            'effect_rb', 'p_value', 'artifact_limited'
+        ])
+
     rows = []
     for (subj, session, region), grp in df_trials.groupby(['subject', 'session', 'region']):
         sham   = grp.loc[grp['window'] == '1W',  'sigma_db'].values
@@ -4739,6 +4835,7 @@ def build_group_summary_table(df_trials):
             'effect_rb': r_rb, 'p_value': p,
             'artifact_limited': (len(sham) < 5 or len(active) < 5),
         })
+
     return pd.DataFrame(rows).dropna(subset=['effect_rb'])
 
 def build_group_effects_table(participants, output_dir=None):
