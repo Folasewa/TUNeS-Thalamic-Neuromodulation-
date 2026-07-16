@@ -46,6 +46,12 @@ from scipy.stats import wilcoxon, mannwhitneyu
 from scipy.signal import butter, filtfilt
 from scipy.stats import linregress
 from scipy.signal import hilbert
+from mne.stats import permutation_cluster_test, permutation_cluster_1samp_test, spatio_temporal_cluster_test,spatio_temporal_cluster_1samp_test
+from mne.channels import find_ch_adjacency
+from scipy.stats import gaussian_kde
+from matplotlib.gridspec import GridSpec
+from scipy.signal import find_peaks
+from scipy.stats import mannwhitneyu as _mwu
 mne.set_log_level('WARNING')
 
 
@@ -67,8 +73,8 @@ RUN_SLEEP_STAGING = True
 BANDPASS_LOW   = 0.1
 BANDPASS_HIGH  = 40.0
 
-SPINDLE_CHANNELS = ['C3', 'C4']
-SW_CHANNELS      = ['F3', 'F4']
+SPINDLE_CHANNELS = ['C3', 'C4', 'Cz']
+SW_CHANNELS      = ['F3', 'F4', 'Fz']
 POWER_CHANNELS   = ['C3', 'C4', 'F3', 'F4', 'Fz', 'Cz', 'Pz']
 STAGING_EEG_CH   = 'C4'
 STAGING_EOG_CH   = 'HEOG'
@@ -331,6 +337,167 @@ def _bracket_y(*value_arrays, pad_frac=0.10):
     span = hi - lo if hi > lo else max(abs(hi), 1.0)
     return hi + span * pad_frac, span
 
+def _cluster_permutation_1d(trials_a, trials_b, n_permutations=5000,
+                             threshold=None, tail=0, seed=42):
+    """
+    Two-sample cluster-based permutation test across a 1D time axis
+    (e.g. active vs sham trials for one ERP channel).
+ 
+    trials_a, trials_b : arrays, shape (n_trials, n_times)
+    Returns a list of (start_idx, end_idx, p_value) for clusters with p<0.05.
+    """
+    trials_a = np.asarray(trials_a)
+    trials_b = np.asarray(trials_b)
+    if len(trials_a) < 3 or len(trials_b) < 3:
+        return []
+    try:
+        _, clusters, cluster_pv, _ = permutation_cluster_test(
+            [trials_a, trials_b], n_permutations=n_permutations, tail=tail,
+            threshold=threshold, seed=seed, out_type='mask', verbose=False,
+        )
+    except Exception as exc:
+        print(f'    Cluster permutation test failed: {exc}')
+        return []
+    sig = []
+    for c, p in zip(clusters, cluster_pv):
+        if p < 0.05:
+            idx = np.where(c)[0]
+            if len(idx):
+                sig.append((int(idx[0]), int(idx[-1]), float(p)))
+    return sig
+
+def _cluster_permutation_tfr_2samp(power_a, power_b, n_permutations=500,
+                                    threshold=None, tail=0, seed=42):
+    """
+    Two-sample cluster-based permutation test over a 2D (freq x time) map.
+ 
+    power_a, power_b : arrays, shape (n_trials, n_freqs, n_times)
+    Returns a boolean mask (n_freqs, n_times) that is True wherever any
+    significant (p<0.05) cluster covers that freq/time bin, plus the list
+    of (mask, p_value) tuples for cluster-level annotation.
+    """
+    
+    power_a = np.asarray(power_a)
+    power_b = np.asarray(power_b)
+    if len(power_a) < 3 or len(power_b) < 3:
+        return None, []
+    try:
+        _, clusters, cluster_pv, _ = permutation_cluster_test(
+            [power_a, power_b], n_permutations=n_permutations, tail=tail,
+            threshold=threshold, seed=seed, out_type='mask', verbose=False,
+        )
+    except Exception as exc:
+        print(f'    TFR cluster permutation test failed: {exc}')
+        return None, []
+    sig_mask = np.zeros(power_a.shape[1:], dtype=bool)
+    sig_clusters = []
+    for c, p in zip(clusters, cluster_pv):
+        if p < 0.05:
+            sig_mask |= c
+            sig_clusters.append((c, float(p)))
+    return sig_mask, sig_clusters
+
+def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
+                                   ch_names, info, n_permutations=500, seed=42):
+    """
+    Spatio-temporal cluster test (active vs sham) across channels AND time,
+    used to decide which channels get a significance marker on a topomap.
+ 
+    trials_by_channel_a/b : dict[ch] -> array (n_trials, n_times)
+    Returns dict[ch] -> bool (True if that channel falls inside >=1
+    significant spatio-temporal cluster at any time point).
+    """
+
+ 
+    common = [ch for ch in ch_names
+              if ch in trials_by_channel_a and ch in trials_by_channel_b]
+    if len(common) < 3:
+        return {ch: False for ch in ch_names}
+ 
+    n_a = min(len(trials_by_channel_a[ch]) for ch in common)
+    n_b = min(len(trials_by_channel_b[ch]) for ch in common)
+    if n_a < 3 or n_b < 3:
+        return {ch: False for ch in ch_names}
+ 
+    # shape needed by spatio_temporal_cluster_test: (n_trials, n_times, n_channels)
+    Xa = np.stack([trials_by_channel_a[ch][:n_a] for ch in common], axis=-1)
+    Xb = np.stack([trials_by_channel_b[ch][:n_b] for ch in common], axis=-1)
+ 
+    try:
+        adjacency, _ = find_ch_adjacency(info, ch_type='eeg')
+        _, clusters, cluster_pv, _ = spatio_temporal_cluster_test(
+            [Xa, Xb], n_permutations=n_permutations, tail=0,
+            adjacency=adjacency, seed=seed, out_type='mask', verbose=False,
+        )
+    except Exception as exc:
+        print(f'    Spatio-temporal cluster test failed: {exc}')
+        return {ch: False for ch in ch_names}
+ 
+    ch_sig = {ch: False for ch in ch_names}
+    for c, p in zip(clusters, cluster_pv):
+        if p < 0.05:
+            ch_mask_any_time = c.any(axis=0)  # (n_channels,)
+            for ch, is_sig in zip(common, ch_mask_any_time):
+                if is_sig:
+                    ch_sig[ch] = True
+    return ch_sig
+
+def _shade_significant_clusters(ax, times, clusters, color='#F1C40F', alpha=0.18):
+    """Shade [start,end] windows returned by _cluster_permutation_1d."""
+    for start_idx, end_idx, p in clusters:
+        ax.axvspan(times[start_idx], times[min(end_idx, len(times) - 1)],
+                   color=color, alpha=alpha, zorder=0)
+        
+def _regression_baseline_correct(epochs_2d, pre_samples, baseline_window_idx):
+    """
+    epochs_2d : array, shape (n_trials, n_times) — single channel, single condition
+    pre_samples : index of stimulus onset within the time axis
+    baseline_window_idx : (start_idx, end_idx) into epochs_2d's time axis,
+        defining the baseline period used as the regression predictor.
+ 
+    For each timepoint t, fits:  y_t = beta0 + beta1 * baseline_mean + eps
+    across trials, then returns the RESIDUALS (y_t - beta1*baseline_mean),
+    re-centred to preserve the grand mean at each timepoint. This is the
+    single-condition analogue of Alday's regression-based baseline
+    correction (per-timepoint OLS on the trial's own pre-stimulus mean).
+    """
+    epochs_2d = np.asarray(epochs_2d, dtype=float)
+    n_trials, n_times = epochs_2d.shape
+    bl_s, bl_e = baseline_window_idx
+    baseline_mean = epochs_2d[:, bl_s:bl_e].mean(axis=1)  # (n_trials,)
+ 
+    if n_trials < 5 or np.std(baseline_mean) == 0:
+        # Fall back to simple mean-subtraction if regression is ill-posed
+        return epochs_2d - baseline_mean.mean()
+ 
+    x = baseline_mean - baseline_mean.mean()
+    denom = np.sum(x ** 2)
+    out = np.empty_like(epochs_2d)
+    grand_mean_per_t = epochs_2d.mean(axis=0)
+    for t in range(n_times):
+        y = epochs_2d[:, t]
+        beta1 = float(np.sum(x * (y - y.mean())) / denom) if denom > 0 else 0.0
+        out[:, t] = y - beta1 * x  # remove baseline-linked variance, keep grand mean
+    return out
+
+def _rank_biserial_effect(vals_a, vals_b):
+    """
+    Rank-biserial correlation effect size + p-value from a Mann-Whitney U
+    test between two independent samples (e.g. 1W vs 60W trial-level
+    sigma power). r = 1 - 2U/(n1*n2); sign convention here is
+    (vals_b - vals_a), i.e. positive = group b (typically 60W) higher.
+    """
+    vals_a = np.asarray(vals_a, dtype=float)
+    vals_b = np.asarray(vals_b, dtype=float)
+    if len(vals_a) < 3 or len(vals_b) < 3:
+        return np.nan, np.nan
+    try:
+        u_stat, p = _mwu(vals_b, vals_a, alternative='two-sided')
+    except ValueError:
+        return np.nan, np.nan
+    n1, n2 = len(vals_b), len(vals_a)
+    r_rb = 1 - (2 * u_stat) / (n1 * n2)
+    return float(r_rb), float(p)
 
 # =============================================================================
 # Sleep staging
@@ -1249,7 +1416,7 @@ def plot_sw_locked_sigma_single_region(participant_id, target, output_dir):
 
     fig, ax = plt.subplots(figsize=(8, 5))
     ax.fill_between(t, m - sem, m + sem, color=color, alpha=0.25)
-    ax.plot(t, m, color=color, lw=2.2, label=f'{label} (n={n_trials})')
+    ax.plot(t, m, color=color, lw=2.2, label=label)
     ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7, label='Slow wave trough')
     ax.axhline(0, color='grey', lw=0.6, ls=':')
     ax.set_xlabel('Time relative to slow wave (s)')
@@ -1289,7 +1456,7 @@ def plot_sw_locked_sigma_thalamus_vs_ventricle(participant_id, output_dir):
         d = np.load(path)
         t, m, sem = d['times_sec'], d['mean_z'], d['sem_z']
         ax.fill_between(t, m - sem, m + sem, color=color, alpha=0.25)
-        ax.plot(t, m, color=color, lw=2.0, label=f'{label} (n={int(d["n_trials"])})')
+        ax.plot(t, m, color=color, lw=2.0, label=label)
     ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7, label='Slow wave trough')
     ax.axhline(0, color='grey', lw=0.6, ls=':')
     ax.set_xlabel('Time relative to slow wave (s)')
@@ -1412,7 +1579,7 @@ def plot_erp_thalamus_vs_ventricle(participant_id, output_dir):
 
                     color, linestyle, label = style[(target, group_label)]
                     ax.plot(times * 1000, mean_erp, color=color, lw=1.8, linestyle=linestyle,
-                            label=f'{label} (n={n_tr})')
+                            label=label)
                     any_plotted = True
 
             if not any_plotted:
@@ -2119,12 +2286,12 @@ FOCUS_CHANNEL_PRIORITY = ['C4', 'C3', 'Cz']
 
 HABITUATION_WINDOW_SEC   = (0.0, 1.0)
 TFR_BANDS = {
-    'delta': (0.5, 4.0),
-    'theta': (4.0, 8.0),
-    'alpha': (8.0, 12.0),
-    'sigma': (12.0, 15.0),
-    'beta':  (15.0, 30.0),
-}
+        'delta': (0.5, 4.0),
+        'theta': (4.0, 8.0),
+        'alpha': (8.0, 12.0),
+        'sigma': (12.0, 15.0),
+        'beta':  (15.0, 20.0),   # was (15.0, 30.0)
+    }
 SW_EVOKED_BAND        = (0.1, 4.0)     # evoked SW analysis band
 SPINDLE_EVOKED_BAND   = (11.0, 16.0)   # evoked spindle analysis band
 SW_PTP_WINDOWS        = ((0.5, 0.6), (0.8, 1.0))   # (early, late) windows, sec post-onset
@@ -2490,7 +2657,14 @@ def _habituation_plot_all_channels(all_epochs, channels, pre_samples, baseline_m
 
 
 def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
-                 session_name, participant_id, output_dir, suffix, condition, baseline_name):
+                 session_name, participant_id, output_dir, suffix, condition, baseline_name,
+                 sig_channels=None):
+    """
+    sig_channels : optional set/dict of channel names (from
+        _spatio_temporal_cluster_mask) that fall inside a significant
+        active-vs-sham spatio-temporal cluster. If provided, those
+        channels are marked on the topomap with a filled black circle.
+    """
     fname = (f'{participant_id}_{session_name}_{suffix}_'
              f'ERP_topomap_{condition}_{baseline_name}.png')
     if _already_done(output_dir, fname):
@@ -2510,18 +2684,35 @@ def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
     vlim_val = np.nanpercentile(np.abs(vals_valid), 95)
     vlim_val = vlim_val if vlim_val > 0 else 1.0
 
+    # ── build significance mask aligned to chs_valid order ──
+    sig_mask_arr = None
+    n_sig = 0
+    if sig_channels is not None:
+        sig_mask_arr = np.array([ch in sig_channels for ch in chs_valid], dtype=bool)
+        n_sig = int(sig_mask_arr.sum())
+        if not sig_mask_arr.any():
+            sig_mask_arr = None  # nothing to draw
+
     fig, ax = plt.subplots(figsize=(5, 4))
     im, _ = mne.viz.plot_topomap(
         vals_valid, info_valid,
         axes=ax, show=False, cmap='RdBu_r',
         vlim=(-vlim_val, vlim_val),
+        mask=sig_mask_arr,
+        mask_params=dict(
+            marker='o', markerfacecolor='k', markeredgecolor='k', markersize=5,
+        ),
     )
     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='RMS µV (post-stimulus)')
-    ax.set_title(
+
+    title = (
         f'{condition}  |  ERP post-stimulus RMS (0–{TUS_EPOCH_POST_SEC:.0f} s)\n'
-        f'baseline: {baseline_name}  |  n={valid_mask.sum()} channels',
-        fontsize=9
+        f'baseline: {baseline_name}  |  n={valid_mask.sum()} channels'
     )
+    if sig_channels is not None:
+        title += f'  |  {n_sig} sig. channel(s) (active vs sham)'
+    ax.set_title(title, fontsize=9)
+
     fig.tight_layout()
     fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
     plt.close(fig)
@@ -2773,63 +2964,215 @@ def _plot_erp_difference(mean_erps_active, mean_erps_sham, channels, times,
     plt.close(fig)
     print(f'      Saved ERP difference figure: {fname}')
 
-def _plot_erp_butterfly(mean_erps_by_condition, channels, times_ms, xlim_ms,
-                         session_name, participant_id, output_dir, suffix, baseline_name):
+def _drop_excluded(epochs):
     """
-    Butterfly plot: every channel's mean ERP overlaid on one axis, per condition,
-    with global field power (GFP = RMS across channels) drawn on top in bold.
-    One PNG per baseline type, sham and active side by side.
+    Drops EXCLUDE_CHANNELS, then drops any epoch whose demeaned peak
+    |amplitude| exceeds EPOCH_REJECT_UV on any remaining EEG channel —
+    the same criterion _exclude_noisy_trials() already applies elsewhere,
+    just at the whole-epoch/whole-montage level instead of per-channel.
     """
-    fname = f'{participant_id}_{session_name}_{suffix}_ERP_butterfly_{baseline_name}.png'
-    if _already_done(output_dir, fname):
-        return
+    epochs = epochs.copy()
+    present = [ch for ch in EXCLUDE_CHANNELS if ch in epochs.ch_names]
+    if present:
+        epochs.drop_channels(present)
  
-    conditions = [c for c in ('sham', 'active') if c in mean_erps_by_condition]
-    if not conditions:
-        return
+    data = epochs.get_data(picks='eeg') * 1e6  # (n_epochs, n_channels, n_times)
+    if data.shape[0] == 0:
+        return epochs
+    demeaned = data - data.mean(axis=2, keepdims=True)
+    max_abs_per_epoch = np.max(np.abs(demeaned), axis=(1, 2))
+    bad_mask = max_abs_per_epoch > EPOCH_REJECT_UV
+    n_bad = int(bad_mask.sum())
+    if n_bad:
+        print(f'    _drop_excluded: rejecting {n_bad}/{len(bad_mask)} epochs '
+              f'(> {EPOCH_REJECT_UV} uV) before butterfly cluster test')
+        epochs.drop(bad_mask, reason='amplitude_reject')
+    return epochs
+
+def _maybe_save(fig, name, fig_dir):
+    if fig_dir is not None:
+        Path(fig_dir).mkdir(parents=True, exist_ok=True)
+        fig.savefig(Path(fig_dir) / f'{name}.png', dpi=200, bbox_inches='tight')
+        print(f'    Saved: {name}.png')
+
+BASELINE = PAPER_BASELINE_SEC        
+def plot_butterfly_sig(epochs, cond_a="1w", cond_b="60w", baseline=BASELINE,
+                       tmin=-0.2, tmax=2.0, n_topo=4, band=None, evoked=None,
+                       run_cluster=True, n_permutations=1000, fig_dir=None,
+                       name="fig_butterfly_sig"):
+    """Butterfly across ALL EEG channels + global field power, with significant
+    cluster windows shaded and a row of TOPOGRAPHIES at the GFP peaks (significant
+    sensors circled). Standard butterfly+joint view, extended with the cluster test.
+
+    band   : optional (lo, hi) band-pass before averaging — e.g. (0.5, 4) to focus
+        on the **K-complex / slow oscillation**.
+    evoked : None → butterfly of the cond_b−cond_a DIFFERENCE with a TWO-sample
+        cluster test ("is the contrast significant"). A condition name (e.g. '60w')
+        → butterfly of THAT condition's evoked with a ONE-sample cluster test vs
+        zero ("is a response evoked at all") — use this with band=(0.5,4) to make
+        the frontal **K-complex** topography the headline (it is significantly
+        evoked even where the 60W−1W difference is null).
+    """
+  
+    epochs = _drop_excluded(epochs)
+    adjacency, _ = mne.channels.find_ch_adjacency(epochs.copy().pick("eeg").info, "eeg")
+
+    def _prep(cond):
+        e = epochs[cond].copy().pick("eeg")
+        if band is not None:
+            e.filter(band[0], band[1], verbose="ERROR")
+        return e.apply_baseline(baseline).crop(tmin, tmax)
+
+    if evoked is None:                                       # two-sample difference
+        A, B = _prep(cond_a), _prep(cond_b)
+        ev = mne.combine_evoked([B.average(), A.average()], weights=[1, -1])
+        cl, p = ([], [])
+        if run_cluster:
+            Xa = A.get_data().transpose(0, 2, 1) * 1e6
+            Xb = B.get_data().transpose(0, 2, 1) * 1e6
+            _, cl, p, _ = spatio_temporal_cluster_test(
+                [Xa, Xb], n_permutations=n_permutations, tail=1, adjacency=adjacency,
+                seed=42, n_jobs=-1, out_type="mask")
+        ylab, title = f"{cond_b}−{cond_a}", f"Butterfly (all EEG) — {cond_b}−{cond_a}"
+    else:                                                    # one-sample: is a response evoked?
+        E = _prep(evoked); ev = E.average(); cl, p = ([], [])
+        if run_cluster:
+            X = E.get_data().transpose(0, 2, 1) * 1e6
+            _, cl, p, _ = spatio_temporal_cluster_1samp_test(
+                X, n_permutations=n_permutations, tail=0, adjacency=adjacency,
+                seed=42, n_jobs=-1, out_type="mask")
+        ylab, title = f"{evoked} evoked", f"Butterfly (all EEG) — {evoked} evoked"
+    if band is not None:
+        title += f"  [{band[0]}–{band[1]} Hz]"
+
+    t = ev.times; data = ev.data * 1e6; gfp = data.std(0); info = ev.info
+    sig_tc = np.zeros((len(t), data.shape[0]), bool)
+    for c, pv in zip(cl, p):
+        if pv < 0.05 and c.shape == sig_tc.shape:
+            sig_tc |= c
+
+    pk, _ = find_peaks(gfp * (t > 0.05))
+    topo_t = (np.sort(t[pk][np.argsort(gfp[pk])[::-1][:n_topo]]) if len(pk) >= n_topo
+              else np.linspace(0.15, min(tmax, 1.5), n_topo))
+
+    fig = plt.figure(figsize=(3.6 * n_topo, 6))
+    gs = GridSpec(2, n_topo, figure=fig, height_ratios=[1.5, 1], hspace=0.35)
+    axb = fig.add_subplot(gs[0, :])
+    axb.plot(t, data.T, lw=0.4, color="#888", alpha=0.5)
+    axb.plot(t, gfp, color="k", lw=2.2, label="GFP")
+    axb.axvline(0, color="r", ls="--"); axb.axhline(0, color="grey", lw=0.5)
+    sig_any = sig_tc.any(1)
+    edges = np.diff(np.r_[0, sig_any.astype(int), 0])
+    for s, e in zip(np.where(edges == 1)[0], np.where(edges == -1)[0]):
+        axb.axvspan(t[s], t[min(e, len(t) - 1)], color="red", alpha=0.12)
+    for tt in topo_t:
+        axb.axvline(tt, color="b", ls=":", alpha=0.5)
+    suffix = ("  — DESCRIPTIVE (morphology & topography; not a significance test)"
+              if not run_cluster else ("  (red = sig cluster)" if sig_any.any()
+                                       else "  (no significant cluster)"))
+    axb.set(xlabel="Time (s)", ylabel=f"{ylab} (µV)", title=title + suffix)
+    axb.legend(loc="upper right", fontsize=9)
+    vlim = np.percentile(np.abs(data), 99)
+    for j, tt in enumerate(topo_t):
+        ax = fig.add_subplot(gs[1, j]); ti = int(np.argmin(np.abs(t - tt)))
+        im, _ = mne.viz.plot_topomap(data[:, ti], info, axes=ax, show=False, cmap="RdBu_r",
+                                     vlim=(-vlim, vlim), mask=sig_tc[ti],
+                                     mask_params=dict(marker="o", markerfacecolor="k", markersize=5))
+        ax.set_title(f"{tt:.2f} s", fontsize=10)
+    fig.colorbar(im, ax=fig.axes[-1], fraction=0.046, label="µV")
+    _maybe_save(fig, name, fig_dir)
+    return fig
+
+# def _plot_erp_butterfly(mean_erps_by_condition, channels, times_ms, xlim_ms,
+#                          session_name, participant_id, output_dir, suffix, baseline_name):
+#     """
+#     Butterfly plot: every channel's mean ERP overlaid on one axis, per condition,
+#     with global field power (GFP = RMS across channels) drawn on top in bold.
+#     One PNG per baseline type, sham and active side by side.
+#     """
+#     fname = f'{participant_id}_{session_name}_{suffix}_ERP_butterfly_{baseline_name}.png'
+#     if _already_done(output_dir, fname):
+#         return
  
-    cond_colors = {'sham': '#4B7BE0', 'active': '#E04B4B'}
-    fig, axes = plt.subplots(1, len(conditions), figsize=(7 * len(conditions), 5),
-                              sharex=True, sharey=True, squeeze=False)
-    axes = axes[0]
+#     conditions = [c for c in ('sham', 'active') if c in mean_erps_by_condition]
+#     if not conditions:
+#         return
  
-    for ax, cond in zip(axes, conditions):
-        erps = np.array(mean_erps_by_condition[cond])  # shape: (n_channels, n_samples)
-        valid = ~np.all(np.isnan(erps), axis=1)
+#     cond_colors = {'sham': '#4B7BE0', 'active': '#E04B4B'}
+#     fig, axes = plt.subplots(1, len(conditions), figsize=(7 * len(conditions), 5),
+#                               sharex=True, sharey=True, squeeze=False)
+#     axes = axes[0]
  
-        if not np.any(valid):
-            ax.text(0.5, 0.5, 'insufficient data', transform=ax.transAxes,
-                    ha='center', va='center', color='grey', fontsize=9)
-            ax.set_title(cond.capitalize(), fontsize=11, fontweight='bold')
-            continue
+#     for ax, cond in zip(axes, conditions):
+#         erps = np.array(mean_erps_by_condition[cond])  # shape: (n_channels, n_samples)
+#         valid = ~np.all(np.isnan(erps), axis=1)
  
-        # individual channel traces, thin and translucent
-        for ch_erp in erps[valid]:
-            ax.plot(times_ms, ch_erp, color=cond_colors[cond], lw=0.7, alpha=0.35)
+#         if not np.any(valid):
+#             ax.text(0.5, 0.5, 'insufficient data', transform=ax.transAxes,
+#                     ha='center', va='center', color='grey', fontsize=9)
+#             ax.set_title(cond.capitalize(), fontsize=11, fontweight='bold')
+#             continue
  
-        # global field power = RMS across channels at each timepoint
-        gfp = np.sqrt(np.nanmean(erps[valid] ** 2, axis=0))
-        ax.plot(times_ms, gfp, color='black', lw=1.8, label='GFP (RMS)')
+#         # individual channel traces, thin and translucent
+#         for ch_erp in erps[valid]:
+#             ax.plot(times_ms, ch_erp, color=cond_colors[cond], lw=0.7, alpha=0.35)
  
-        ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7)
-        ax.axhline(0, color='grey', lw=0.5, ls=':')
-        ax.set_xlim(*xlim_ms)
-        ax.set_xlabel('Time (ms)', fontsize=9)
-        ax.set_title(f'{cond.capitalize()}  (n_channels={valid.sum()})',
-                     fontsize=11, fontweight='bold')
-        ax.tick_params(labelsize=8)
-        ax.legend(fontsize=8, loc='upper right')
+#         # global field power = RMS across channels at each timepoint
+#         gfp = np.sqrt(np.nanmean(erps[valid] ** 2, axis=0))
+#         ax.plot(times_ms, gfp, color='black', lw=1.8, label='GFP (RMS)')
  
-    axes[0].set_ylabel('µV' if baseline_name != 'pre_zscore' else 'z-score', fontsize=9)
+#         ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7)
+#         ax.axhline(0, color='grey', lw=0.5, ls=':')
+#         ax.set_xlim(*xlim_ms)
+#         ax.set_xlabel('Time (ms)', fontsize=9)
+#         ax.set_title(f'{cond.capitalize()}', fontsize=11, fontweight='bold')
+#         ax.tick_params(labelsize=8)
+#         ax.legend(fontsize=8, loc='upper right')
  
-    fig.suptitle(
-        f'{participant_id} – {session_name}  |  ERP butterfly plot  [baseline: {baseline_name}]',
-        fontsize=12, fontweight='bold'
+#     axes[0].set_ylabel('µV' if baseline_name != 'pre_zscore' else 'z-score', fontsize=9)
+ 
+#     fig.suptitle(
+#         f'{participant_id} – {session_name}  |  ERP butterfly plot  [baseline: {baseline_name}]',
+#         fontsize=12, fontweight='bold'
+#     )
+#     fig.tight_layout(rect=[0, 0, 1, 0.93])
+#     fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
+#     plt.close(fig)
+#     print(f'      Saved ERP butterfly figure: {fname}')
+
+def run_butterfly_for_participant(participant_id, target, session_name,
+                                   output_dir, suffix, band=None, evoked=None,
+                                   run_cluster=True):
+    """
+    Loads the MNE Epochs .fif already saved by run_pulse_level_analysis()
+    for this session and calls plot_butterfly_sig on it, using
+    this pipeline's condition names (active_60w / sham_1isppa).
+    """
+    epo_path = Path(output_dir) / f'{participant_id}_{session_name}_{suffix}_epochs-epo.fif'
+    if not epo_path.exists():
+        print(f'    Butterfly skipped: no epochs file at {epo_path}')
+        return None
+    epochs = mne.read_epochs(str(epo_path), preload=True, verbose=False)
+ 
+    cond_a = 'sham_1isppa' if 'sham_1isppa' in epochs.event_id else 'sham'
+    cond_b = 'active_60w'  if 'active_60w'  in epochs.event_id else 'active'
+    if cond_a not in epochs.event_id or cond_b not in epochs.event_id:
+        print(f'    Butterfly skipped: expected conditions not in epochs.event_id '
+              f'({list(epochs.event_id)})')
+        return None
+ 
+    name = f'{participant_id}_{session_name}_{suffix}_butterfly'
+    if band is not None:
+        name += f'_{band[0]}-{band[1]}Hz'
+    if evoked is not None:
+        name += f'_{evoked}_evoked'
+ 
+    return plot_butterfly_sig(
+        epochs, cond_a=cond_a, cond_b=cond_b, baseline=BASELINE,
+        tmin=-EXTENDED_ERP_PRE_SEC, tmax=EXTENDED_ERP_POST_SEC,
+        band=band, evoked=evoked, run_cluster=run_cluster,
+        fig_dir=output_dir, name=name,
     )
-    fig.tight_layout(rect=[0, 0, 1, 0.93])
-    fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
-    plt.close(fig)
-    print(f'      Saved ERP butterfly figure: {fname}')
 
 def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_dir, suffix=''):
 
@@ -2979,13 +3322,6 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 participant_id, target, group_label, baseline_name, output_dir
             )
 
-            if info_topo is not None:
-                _erp_topomap(
-                    peak_amp_by_condition[group_label], topo_chs, info_topo,
-                    session_name, participant_id, output_dir,
-                    suffix, group_label, baseline_name,
-                )
-
             _habituation_plot_all_channels(
                 all_epochs=all_epochs,
                 channels=channels,
@@ -3008,6 +3344,44 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
             active_ranked, _ = _rank_channels_by_window(
                 mean_erps_by_condition['active'], channels, times, (0.0, ERP_DISPLAY_XLIM_SEC[1])
             )
+
+            # ── spatio-temporal cluster test (active vs sham) for topomap markers ──
+            # Computed once per (session, baseline); active and sham topomaps
+            # share the same significance mask since the test itself compares
+            # active vs sham. Restricted to the post-stimulus window
+            # (pre_samples:) to match the RMS amplitude shown on the topomap.
+            if info_topo is not None:
+                trials_by_channel_active = {}
+                trials_by_channel_sham   = {}
+                for ch in topo_chs:
+                    idx = channels.index(ch)
+                    a = clean_trials_by_condition['active'][idx]
+                    s = clean_trials_by_condition['sham'][idx]
+                    if (a.size and s.size
+                            and not np.all(np.isnan(a)) and not np.all(np.isnan(s))):
+                        trials_by_channel_active[ch] = a[:, pre_samples:]
+                        trials_by_channel_sham[ch]   = s[:, pre_samples:]
+
+                ch_sig = _spatio_temporal_cluster_mask(
+                    trials_by_channel_active, trials_by_channel_sham,
+                    ch_names=topo_chs, info=info_topo,
+                    n_permutations=1000,
+                )
+                sig_channels = {ch for ch, is_sig in ch_sig.items() if is_sig}
+
+                _erp_topomap(
+                    peak_amp_by_condition['active'], topo_chs, info_topo,
+                    session_name, participant_id, output_dir,
+                    suffix, 'active', baseline_name,
+                    sig_channels=sig_channels,
+                )
+                _erp_topomap(
+                    peak_amp_by_condition['sham'], topo_chs, info_topo,
+                    session_name, participant_id, output_dir,
+                    suffix, 'sham', baseline_name,
+                    sig_channels=sig_channels,
+                )
+
             plot_sets = [
                 ('all_channels', channels),
                 ('top10', active_ranked[:10]),
@@ -3035,6 +3409,8 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
 
                     sham_clean = clean_trials_by_condition['sham'][ch_idx]
                     sham_mean  = mean_erps_by_condition['sham'][ch_idx]
+                    clusters = _cluster_permutation_1d(clean_trials_by_condition['active'][ch_idx],clean_trials_by_condition['sham'][ch_idx],)
+                    _shade_significant_clusters(ax, times_ms / 1000.0, clusters)
                     if show_error_bands:
                         sham_sem = (sham_clean.std(axis=0) / np.sqrt(len(sham_clean))
                                     if len(sham_clean) > 1 else np.zeros(n_samples))
@@ -3075,11 +3451,6 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
                 plt.close(fig)
                 print(f'      Saved ERP figure: {fname}')
-                
-            _plot_erp_butterfly(
-                mean_erps_by_condition, channels, times_ms, xlim_ms,
-                session_name, participant_id, output_dir, suffix, baseline_name,
-            )
 
             _plot_erp_difference(
                 mean_erps_by_condition['active'], mean_erps_by_condition['sham'],
@@ -3098,109 +3469,235 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
             return ch
     return channels[0] if channels else None
 
+
+EXTENDED_ERP_PRE_SEC  = 1.0   # display window: -1 s ...
+EXTENDED_ERP_POST_SEC = 3.0   # ... to +3 s
+EXTENDED_ERP_BASELINE_SEC = (-1.0, -0.5)  # baseline window fed to the regression
+
+def plot_erp_extended(raw, bursts_df, session_name, participant_id, output_dir,
+                       suffix='', channels_to_plot=None):
+    """
+    New function: active, sham, and active-minus-sham
+    difference on ONE shared axis (distinguished by line style, not colour
+    alone), window -1 to +3 s, regression-based baseline correction
+    (Alday, 2019), 1-second x-tick steps.
+
+    """
+    if channels_to_plot is None:
+        channels_to_plot = [
+            raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude='bads')
+            if raw.ch_names[i] not in EXCLUDE_CHANNELS
+        ]
+ 
+    if 'burst_time_s' not in bursts_df.columns:
+        print('    plot_erp_extended: burst_time_s column missing — skipping')
+        return
+    bursts_df = bursts_df.copy()
+    bursts_df['burst_time_s'] = pd.to_numeric(bursts_df['burst_time_s'], errors='coerce')
+    bursts_df = bursts_df.dropna(subset=['burst_time_s'])
+    if bursts_df.empty:
+        return
+ 
+    needed_channels = [ch for ch in channels_to_plot if ch in raw.ch_names]
+    if not needed_channels:
+        return
+ 
+    sfreq = raw.info['sfreq']
+    pre_samples  = int(EXTENDED_ERP_PRE_SEC * sfreq)
+    post_samples = int(EXTENDED_ERP_POST_SEC * sfreq)
+    n_samples    = pre_samples + post_samples
+    times        = np.linspace(-EXTENDED_ERP_PRE_SEC, EXTENDED_ERP_POST_SEC, n_samples)
+ 
+    bl_s = int((EXTENDED_ERP_BASELINE_SEC[0] + EXTENDED_ERP_PRE_SEC) * sfreq)
+    bl_e = int((EXTENDED_ERP_BASELINE_SEC[1] + EXTENDED_ERP_PRE_SEC) * sfreq)
+    bl_s, bl_e = max(bl_s, 0), max(bl_e, bl_s + 1)
+ 
+    for ch in needed_channels:
+        fname = f'{participant_id}_{session_name}_{suffix}_ERP_extended_regbaseline_{ch}.png'
+        if _already_done(output_dir, fname):
+            continue
+ 
+        ch_idx = raw.ch_names.index(ch)
+        trials_by_group = {}
+        for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
+            mask = bursts_df['condition'].isin(condition_set)
+            group_df = bursts_df[mask].reset_index(drop=True)
+            trials = []
+            for _, burst in group_df.iterrows():
+                center = int(burst['burst_time_s'] * sfreq)
+                start, stop = center - pre_samples, center + post_samples
+                if start < 0 or stop > raw.n_times:
+                    continue
+                if window_overlaps_bad_annotation(raw, start / sfreq, stop / sfreq):
+                    continue
+                trial = raw.get_data(picks=[ch_idx], start=start, stop=stop)[0] * 1e6
+                demeaned = trial - trial.mean()
+                if np.max(np.abs(demeaned)) <= EPOCH_REJECT_UV:
+                    trials.append(trial)
+            trials_by_group[group_label] = np.array(trials) if trials else np.empty((0, n_samples))
+ 
+        if len(trials_by_group['sham']) < 3 or len(trials_by_group['active']) < 3:
+            print(f'    plot_erp_extended [{ch}]: too few clean trials — skipping')
+            continue
+ 
+        # Regression-based baseline correction (Alday, 2019), per condition
+        corrected = {
+            g: _regression_baseline_correct(trials_by_group[g], pre_samples, (bl_s, bl_e))
+            for g in ('sham', 'active')
+        }
+        mean_sham   = corrected['sham'].mean(axis=0)
+        mean_active = corrected['active'].mean(axis=0)
+        diff        = mean_active - mean_sham
+ 
+        clusters = _cluster_permutation_1d(corrected['active'], corrected['sham'])
+ 
+        fig, ax = plt.subplots(figsize=(10, 5.5))
+        _shade_significant_clusters(ax, times, clusters)
+        ax.plot(times, mean_sham,   color='#4B7BE0', lw=1.8, linestyle='--', label='Sham')
+        ax.plot(times, mean_active, color='#E04B4B', lw=1.8, linestyle='-',  label='Active')
+        ax.plot(times, diff,        color='#222222', lw=1.6, linestyle=':',  label='Active − Sham')
+ 
+        ax.axvline(0, color='black', lw=1.0, ls='-', alpha=0.5)
+        ax.axhline(0, color='grey',  lw=0.6, ls=':')
+        ax.set_xlim(-EXTENDED_ERP_PRE_SEC, EXTENDED_ERP_POST_SEC)
+        ax.set_xticks(np.arange(-EXTENDED_ERP_PRE_SEC, EXTENDED_ERP_POST_SEC + 0.01, 1.0))
+        ax.set_xlabel('Time (s)', fontsize=10)
+        ax.set_ylabel('µV', fontsize=10)
+        n_sig = sum(1 for *_, p in clusters if p < 0.05)
+        sig_note = f'{n_sig} significant cluster(s)' if n_sig else 'no significant clusters'
+        ax.set_title(
+            f'{participant_id} – {session_name}  |  {ch}  |  extended ERP\n'
+            f'regression baseline (Alday, 2019)  |  {sig_note}',
+            fontsize=11, fontweight='bold'
+        )
+        ax.legend(fontsize=9, loc='upper right')
+        ax.spines[['top', 'right']].set_visible(False)
+        fig.tight_layout()
+        fig.savefig(Path(output_dir) / fname, dpi=180, bbox_inches='tight')
+        plt.close(fig)
+        print(f'    Saved extended ERP: {fname}')
+
+# def plot_erp_channel_groups(
+#     raw, bursts_df, freq_band, session_name, participant_id, output_dir,
+#     channels_to_plot=None,
+#     suffix='',
+# ):
+#     """
+#     Plots one standalone ERP figure per channel (default: SPINDLE_CHANNELS + SW_CHANNELS).
+#     Each figure shows Active vs Sham overlaid for that single channel only.
+#     One PNG per channel per baseline — no subplots, no averaging.
+#     """
+#     if channels_to_plot is None:
+#         channels_to_plot = SPINDLE_CHANNELS + SW_CHANNELS
+
+#     if 'burst_time_s' not in bursts_df.columns:
+#         print('    plot_erp_channel_groups: burst_time_s column missing — skipping')
+#         return None
+#     bursts_df['burst_time_s'] = pd.to_numeric(bursts_df['burst_time_s'], errors='coerce')
+#     bursts_df = bursts_df.dropna(subset=['burst_time_s'])
+#     if bursts_df.empty:
+#         return None
+
+#     sfreq        = raw.info['sfreq']
+#     pre_samples  = int(TUS_EPOCH_PRE_SEC * sfreq)
+#     post_samples = int(TUS_EPOCH_POST_SEC * sfreq)
+#     n_samples    = pre_samples + post_samples
+#     times_ms     = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples) * 1000
+#     xlim_ms      = (ERP_DISPLAY_XLIM_SEC[0] * 1000, ERP_DISPLAY_XLIM_SEC[1] * 1000)
+
+#     needed_channels = [ch for ch in channels_to_plot if ch in raw.ch_names]
+#     missing = [ch for ch in channels_to_plot if ch not in raw.ch_names]
+#     if missing:
+#         print(f'    plot_erp_channel_groups: channels not found in recording, skipping: {missing}')
+#     if not needed_channels:
+#         return None
+
+#     epochs_by_channel = {ch: {} for ch in needed_channels}
+#     for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
+#         mask     = bursts_df['condition'].isin(condition_set)
+#         group_df = bursts_df[mask].reset_index(drop=True)
+#         for ch in needed_channels:
+#             ch_idx = raw.ch_names.index(ch)
+#             trials = []
+#             for _, burst in group_df.iterrows():
+#                 center = int(burst['burst_time_s'] * sfreq)
+#                 start, stop = center - pre_samples, center + post_samples
+#                 if start < 0 or stop > raw.n_times:
+#                     trials.append(np.full(n_samples, np.nan))
+#                     continue
+#                 if window_overlaps_bad_annotation(raw, start / sfreq, stop / sfreq):
+#                     trials.append(np.full(n_samples, np.nan))
+#                     continue
+#                 trial = raw.get_data(picks=[ch_idx], start=start, stop=stop)[0] * 1e6
+#                 trials.append(trial)
+#             epochs_by_channel[ch][group_label] = np.array(trials)
+
+#     for baseline_name, baseline_mode in ERP_BASELINES.items():
+#         for ch in needed_channels:
+
+#             fname = f'{participant_id}_{session_name}_{suffix}_ERP_{baseline_name}_{ch}.png'
+#             if _already_done(output_dir, fname):
+#                 continue
+
+#             fig, ax = plt.subplots(figsize=(8, 5))
+
+#             for group_label, color, linestyle, plot_label in (
+#                 ('active', '#E04B4B', '-', 'Active'),
+#                 ('sham',   '#4B7BE0', '--', 'Sham'),
+#             ):
+#                 raw_trials  = epochs_by_channel[ch][group_label].copy()
+#                 corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
+#                 finite_mask = np.all(np.isfinite(corrected), axis=1)
+#                 finite_trials = corrected[finite_mask]
+#                 if len(finite_trials) == 0:
+#                     continue
+#                 noise_mask, _ = _exclude_noisy_trials(finite_trials)
+#                 clean = finite_trials[noise_mask]
+#                 if len(clean) == 0:
+#                     continue
+
+#                 mean_erp = clean.mean(axis=0)
+#                 sem_erp  = clean.std(axis=0) / np.sqrt(len(clean)) if len(clean) > 1 else np.zeros(n_samples)
+
+#                 ax.fill_between(times_ms, mean_erp - sem_erp, mean_erp + sem_erp, color=color, alpha=0.2)
+#                 ax.plot(times_ms, mean_erp, color=color, lw=1.8, linestyle=linestyle,
+#                         label=f'{plot_label} (n={len(clean)})')
+
+#             ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.6)
+#             ax.axhline(0, color='grey', lw=0.5, ls=':')
+#             ax.set_xlim(*xlim_ms)
+#             ax.set_xlabel('Time (ms)', fontsize=10)
+#             ax.set_ylabel('µV' if baseline_name != 'pre_zscore' else 'z-score', fontsize=10)
+#             ax.set_title(
+#                 f'{participant_id} – {session_name}  |  {ch}  ERP  [baseline: {baseline_name}]',
+#                 fontsize=11, fontweight='bold'
+#             )
+#             ax.tick_params(labelsize=8)
+#             ax.legend(fontsize=9, loc='upper right')
+
+#             fig.tight_layout()
+#             fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
+#             plt.close(fig)
+#             print(f'      Saved ERP figure: {fname}')
+
+
 def plot_erp_channel_groups(
     raw, bursts_df, freq_band, session_name, participant_id, output_dir,
     channels_to_plot=None,
     suffix='',
 ):
     """
-    Plots one standalone ERP figure per channel (default: SPINDLE_CHANNELS + SW_CHANNELS).
-    Each figure shows Active vs Sham overlaid for that single channel only.
-    One PNG per channel per baseline — no subplots, no averaging.
+    Zoomed-in version of plot_erp_extended(), restricted to
+    SPINDLE_CHANNELS + SW_CHANNELS. Same extended window, regression
+    baseline, combined active/sham/diff axis, and cluster-permutation
+    stats — narrower channel scope only.
     """
     if channels_to_plot is None:
         channels_to_plot = SPINDLE_CHANNELS + SW_CHANNELS
-
-    if 'burst_time_s' not in bursts_df.columns:
-        print('    plot_erp_channel_groups: burst_time_s column missing — skipping')
-        return None
-    bursts_df['burst_time_s'] = pd.to_numeric(bursts_df['burst_time_s'], errors='coerce')
-    bursts_df = bursts_df.dropna(subset=['burst_time_s'])
-    if bursts_df.empty:
-        return None
-
-    sfreq        = raw.info['sfreq']
-    pre_samples  = int(TUS_EPOCH_PRE_SEC * sfreq)
-    post_samples = int(TUS_EPOCH_POST_SEC * sfreq)
-    n_samples    = pre_samples + post_samples
-    times_ms     = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples) * 1000
-    xlim_ms      = (ERP_DISPLAY_XLIM_SEC[0] * 1000, ERP_DISPLAY_XLIM_SEC[1] * 1000)
-
-    needed_channels = [ch for ch in channels_to_plot if ch in raw.ch_names]
-    missing = [ch for ch in channels_to_plot if ch not in raw.ch_names]
-    if missing:
-        print(f'    plot_erp_channel_groups: channels not found in recording, skipping: {missing}')
-    if not needed_channels:
-        return None
-
-    epochs_by_channel = {ch: {} for ch in needed_channels}
-    for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
-        mask     = bursts_df['condition'].isin(condition_set)
-        group_df = bursts_df[mask].reset_index(drop=True)
-        for ch in needed_channels:
-            ch_idx = raw.ch_names.index(ch)
-            trials = []
-            for _, burst in group_df.iterrows():
-                center = int(burst['burst_time_s'] * sfreq)
-                start, stop = center - pre_samples, center + post_samples
-                if start < 0 or stop > raw.n_times:
-                    trials.append(np.full(n_samples, np.nan))
-                    continue
-                if window_overlaps_bad_annotation(raw, start / sfreq, stop / sfreq):
-                    trials.append(np.full(n_samples, np.nan))
-                    continue
-                trial = raw.get_data(picks=[ch_idx], start=start, stop=stop)[0] * 1e6
-                trials.append(trial)
-            epochs_by_channel[ch][group_label] = np.array(trials)
-
-    for baseline_name, baseline_mode in ERP_BASELINES.items():
-        for ch in needed_channels:
-
-            fname = f'{participant_id}_{session_name}_{suffix}_ERP_{baseline_name}_{ch}.png'
-            if _already_done(output_dir, fname):
-                continue
-
-            fig, ax = plt.subplots(figsize=(8, 5))
-
-            for group_label, color, linestyle, plot_label in (
-                ('active', '#E04B4B', '-', 'Active'),
-                ('sham',   '#4B7BE0', '--', 'Sham'),
-            ):
-                raw_trials  = epochs_by_channel[ch][group_label].copy()
-                corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
-                finite_mask = np.all(np.isfinite(corrected), axis=1)
-                finite_trials = corrected[finite_mask]
-                if len(finite_trials) == 0:
-                    continue
-                noise_mask, _ = _exclude_noisy_trials(finite_trials)
-                clean = finite_trials[noise_mask]
-                if len(clean) == 0:
-                    continue
-
-                mean_erp = clean.mean(axis=0)
-                sem_erp  = clean.std(axis=0) / np.sqrt(len(clean)) if len(clean) > 1 else np.zeros(n_samples)
-
-                ax.fill_between(times_ms, mean_erp - sem_erp, mean_erp + sem_erp, color=color, alpha=0.2)
-                ax.plot(times_ms, mean_erp, color=color, lw=1.8, linestyle=linestyle,
-                        label=f'{plot_label} (n={len(clean)})')
-
-            ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.6)
-            ax.axhline(0, color='grey', lw=0.5, ls=':')
-            ax.set_xlim(*xlim_ms)
-            ax.set_xlabel('Time (ms)', fontsize=10)
-            ax.set_ylabel('µV' if baseline_name != 'pre_zscore' else 'z-score', fontsize=10)
-            ax.set_title(
-                f'{participant_id} – {session_name}  |  {ch}  ERP  [baseline: {baseline_name}]',
-                fontsize=11, fontweight='bold'
-            )
-            ax.tick_params(labelsize=8)
-            ax.legend(fontsize=9, loc='upper right')
-
-            fig.tight_layout()
-            fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
-            plt.close(fig)
-            print(f'      Saved ERP figure: {fname}')
-
+    plot_erp_extended(
+        raw, bursts_df, session_name, participant_id, output_dir,
+        suffix=suffix, channels_to_plot=channels_to_plot,
+    )
 def plot_tfrs(
     raw,
     bursts_df,
@@ -3218,7 +3715,6 @@ def plot_tfrs(
     bursts_df["burst_time_s"] = pd.to_numeric(
         bursts_df["burst_time_s"], errors="coerce"
     )
-
     bursts_df = bursts_df.dropna(subset=["burst_time_s"])
 
     channels = [
@@ -3235,7 +3731,7 @@ def plot_tfrs(
     n_samples = pre_samples + post_samples
     times = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples)
 
-    freqs = np.arange(1.0, 31.0, 1.0)
+    freqs = np.arange(1.0, 21.0, 1.0)
     n_cycles = freqs / 2.0
 
     hab_start_idx = pre_samples + int(HABITUATION_WINDOW_SEC[0] * sfreq)
@@ -3302,10 +3798,12 @@ def plot_tfrs(
             epochs = all_trials_uv
             if len(epochs) >= 2:
                 raw_power[(ch, group_label)] = morlet_tfr(np.array(epochs))
+
     for bl_name, (bl_start, bl_end) in TFR_BASELINES.items():
         print(f"\n    TFR baseline: {bl_name}  ({bl_start:.2f} to {bl_end:.2f} s)")
         band_power_rows = []
 
+        # ── band-power CSV extraction (unchanged, still per-group) ──
         for group_label, condition_set in [
             ("sham", SHAM_CONDITIONS),
             ("active", ACTIVE_CONDITIONS),
@@ -3326,60 +3824,6 @@ def plot_tfrs(
                 if key not in raw_power:
                     continue
                 power_3d = apply_tfr_baseline(raw_power[key], bl_start, bl_end)
-                mean_tfr = power_3d.mean(axis=0)
-                n_used = power_3d.shape[0]
-
-                fname = (
-                    f"{participant_id}_{session_name}_{suffix}_"
-                    f"TFR_{ch}_{group_label}_{bl_name}.png"
-                )
-                if not _already_done(output_dir, fname):
-                    vmax = np.nanpercentile(np.abs(mean_tfr), 97)
-                    fig, ax = plt.subplots(figsize=(12, 5))
-                    pcm = ax.pcolormesh(
-                        times,
-                        freqs,
-                        mean_tfr,
-                        cmap="RdBu_r",
-                        vmin=-vmax,
-                        vmax=vmax,
-                        shading="gouraud",
-                    )
-                    fig.colorbar(pcm, ax=ax, label="dB (re: baseline)")
-                    ax.axvline(
-                        0, color="black", lw=1.2, ls="--", alpha=0.8, label="TUS onset"
-                    )
-                    ax.axhspan(
-                        freq_band[0],
-                        freq_band[1],
-                        color="yellow",
-                        alpha=0.15,
-                        label="Spindle band",
-                    )
-                    ax.axvspan(
-                        bl_start,
-                        bl_end,
-                        color="lime",
-                        alpha=0.12,
-                        label="Baseline window",
-                    )
-                    ax.set_xlabel("Time (s)")
-                    ax.set_ylabel("Frequency (Hz)")
-                    ax.set_title(
-                        f"{group_label.upper()}  |  {ch}  (n={n_used} trials)",
-                        fontsize=11,
-                        fontweight="bold",
-                    )
-                    ax.legend(fontsize=8, loc="upper right")
-                    fig.suptitle(
-                        f"{participant_id} – {session_name}  |  {ch}  TFR  "
-                        f"[Morlet]  |  baseline: {bl_name}",
-                        fontsize=11,
-                        fontweight="bold",
-                    )
-                    fig.tight_layout()
-                    fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches="tight")
-                    plt.close(fig)
 
                 for band_name, (b_low, b_high) in TFR_BANDS.items():
                     freq_mask = (freqs >= b_low) & (freqs <= b_high)
@@ -3402,6 +3846,116 @@ def plot_tfrs(
                             }
                         )
 
+        if band_power_rows:
+            bp_df = pd.DataFrame(band_power_rows)
+            bp_csv = (
+                Path(output_dir)
+                / f"{participant_id}_{session_name}_{suffix}_TFR_band_power_{bl_name}.csv"
+            )
+            bp_df.to_csv(bp_csv, index=False)
+            print(f"      Saved TFR band-power CSV: {bp_csv.name}")
+
+        # ── main comparison figure: sham | active | active-sham + cluster test ──
+        for ch in channels:
+            key_sham = (ch, "sham")
+            key_active = (ch, "active")
+            if key_sham not in raw_power or key_active not in raw_power:
+                continue
+
+            power_sham = apply_tfr_baseline(raw_power[key_sham], bl_start, bl_end)
+            power_active = apply_tfr_baseline(raw_power[key_active], bl_start, bl_end)
+
+            fname = (
+                f"{participant_id}_{session_name}_{suffix}_"
+                f"TFR_{ch}_sham_active_diff_{bl_name}.png"
+            )
+            if _already_done(output_dir, fname):
+                continue
+
+            mean_sham = power_sham.mean(axis=0)
+            mean_active = power_active.mean(axis=0)
+            diff = mean_active - mean_sham
+            n_sham = power_sham.shape[0]
+            n_active = power_active.shape[0]
+
+            sig_mask, sig_clusters = _cluster_permutation_tfr_2samp(
+                power_active, power_sham
+            )
+
+            vmax_common = max(
+                np.nanpercentile(np.abs(mean_sham), 97),
+                np.nanpercentile(np.abs(mean_active), 97),
+            )
+            vmax_diff = np.nanpercentile(np.abs(diff), 97)
+
+            fig, axes = plt.subplots(1, 3, figsize=(20, 5), sharey=True)
+
+            for ax, data, title, in zip(
+                axes[:2],
+                [mean_sham, mean_active],
+                ["SHAM", "ACTIVE"],
+            ):
+                pcm = ax.pcolormesh(
+                    times, freqs, data, cmap="RdBu_r",
+                    vmin=-vmax_common, vmax=vmax_common, shading="gouraud",
+                )
+                fig.colorbar(pcm, ax=ax, label="dB (re: baseline)")
+                ax.axvline(0, color="black", lw=1.2, ls="--", alpha=0.8, label="TUS onset")
+                ax.axhspan(freq_band[0], freq_band[1], color="yellow", alpha=0.15,
+                           label="Spindle band")
+                ax.axvspan(bl_start, bl_end, color="lime", alpha=0.12,
+                           label="Baseline window")
+                ax.set_xlabel("Time (s)")
+                ax.set_title(title, fontsize=11, fontweight="bold")
+            axes[0].set_ylabel("Frequency (Hz)")
+            axes[0].legend(fontsize=7, loc="upper right")
+
+            ax_diff = axes[2]
+            pcm_diff = ax_diff.pcolormesh(
+                times, freqs, diff, cmap="RdBu_r",
+                vmin=-vmax_diff, vmax=vmax_diff, shading="gouraud",
+            )
+            fig.colorbar(pcm_diff, ax=ax_diff, label="Δ dB (active − sham)")
+            ax_diff.axvline(0, color="black", lw=1.2, ls="--", alpha=0.8)
+            ax_diff.axhspan(freq_band[0], freq_band[1], color="yellow", alpha=0.15)
+            ax_diff.axvspan(bl_start, bl_end, color="lime", alpha=0.12)
+            ax_diff.set_xlabel("Time (s)")
+
+            if sig_mask is not None and sig_mask.any():
+                ax_diff.contour(
+                    times, freqs, sig_mask.astype(float),
+                    levels=[0.5], colors="black", linewidths=1.5,
+                )
+                n_sig_bins = int(sig_mask.sum())
+                ax_diff.set_title(
+                    f"ACTIVE − SHAM  ({len(sig_clusters)} sig. cluster(s))",
+                    fontsize=11, fontweight="bold",
+                )
+                print(
+                    f"      Cluster permutation [{ch}, {bl_name}]: "
+                    f"{len(sig_clusters)} sig cluster(s), {n_sig_bins} bins "
+                    f"(p<0.05)"
+                )
+            else:
+                ax_diff.set_title("ACTIVE − SHAM  (n.s.)", fontsize=11, fontweight="bold")
+                print(f"      Cluster permutation [{ch}, {bl_name}]: no significant clusters")
+
+            fig.suptitle(
+                f"{participant_id} – {session_name}  |  {ch}  TFR  [Morlet]  |  "
+                f"baseline: {bl_name}",
+                fontsize=12,
+                fontweight="bold",
+            )
+            fig.tight_layout()
+            fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            print(f"      Saved TFR sham/active/diff: {fname}")
+
+        # ── per-trial + topomap plots (unchanged) ──
+        for group_label, condition_set in [
+            ("sham", SHAM_CONDITIONS),
+            ("active", ACTIVE_CONDITIONS),
+        ]:
             key_focus = (focus_channel, group_label)
             if key_focus in raw_power:
                 power_3d_focus = apply_tfr_baseline(
@@ -3418,23 +3972,17 @@ def plot_tfrs(
                     ncols = 4
                     nrows = int(np.ceil(n_show / ncols))
                     fig, axes = plt.subplots(
-                        nrows,
-                        ncols,
+                        nrows, ncols,
                         figsize=(ncols * 4, nrows * 3),
-                        sharex=True,
-                        sharey=True,
+                        sharex=True, sharey=True,
                     )
                     axes = np.array(axes).ravel()
                     vmax_focus = np.nanpercentile(np.abs(power_3d_focus), 97)
                     for ti in range(n_show):
                         ax = axes[ti]
-                        pcm = ax.pcolormesh(
-                            times,
-                            freqs,
-                            power_3d_focus[ti],
-                            cmap="RdBu_r",
-                            vmin=-vmax_focus,
-                            vmax=vmax_focus,
+                        ax.pcolormesh(
+                            times, freqs, power_3d_focus[ti],
+                            cmap="RdBu_r", vmin=-vmax_focus, vmax=vmax_focus,
                             shading="gouraud",
                         )
                         ax.axvline(0, color="white", lw=0.8, ls="--", alpha=0.7)
@@ -3444,8 +3992,7 @@ def plot_tfrs(
                     fig.suptitle(
                         f"{participant_id} – {session_name}  |  {focus_channel}  "
                         f"per-trial TFR  [{group_label.upper()}]  |  baseline: {bl_name}",
-                        fontsize=11,
-                        fontweight="bold",
+                        fontsize=11, fontweight="bold",
                     )
                     fig.tight_layout()
                     fig.savefig(
@@ -3511,35 +4058,19 @@ def plot_tfrs(
 
                     fig, ax = plt.subplots(figsize=(5, 4))
                     im, _ = mne.viz.plot_topomap(
-                        vals_valid,
-                        info_valid,
-                        axes=ax,
-                        show=False,
-                        cmap="RdBu_r",
-                        vlim=(-vlim_tfr, vlim_tfr),
+                        vals_valid, info_valid, axes=ax, show=False,
+                        cmap="RdBu_r", vlim=(-vlim_tfr, vlim_tfr),
                     )
-                    fig.colorbar(
-                        im, ax=ax, fraction=0.046, pad=0.04, label="dB (re: baseline)"
-                    )
+                    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="dB (re: baseline)")
                     ax.set_title(
                         f"{group_label}  |  {band_name}  power (0–{HABITUATION_WINDOW_SEC[1]:.0f} s)\n"
                         f"baseline: {bl_name}  |  n={valid_mask.sum()} channels",
                         fontsize=9,
                     )
                     fig.tight_layout()
-                    fig.savefig(
-                        Path(output_dir) / fname_topo, dpi=150, bbox_inches="tight"
-                    )
+                    fig.savefig(Path(output_dir) / fname_topo, dpi=150, bbox_inches="tight")
                     plt.close(fig)
                     print(f"      Saved TFR topomap: {fname_topo}")
-        if band_power_rows:
-            bp_df = pd.DataFrame(band_power_rows)
-            bp_csv = (
-                Path(output_dir)
-                / f"{participant_id}_{session_name}_{suffix}_TFR_band_power_{bl_name}.csv"
-            )
-            bp_df.to_csv(bp_csv, index=False)
-            print(f"      Saved TFR band-power CSV: {bp_csv.name}")
 
 
 # =============================================================================
@@ -3944,6 +4475,188 @@ def plot_spindle_violins(pulse_df, session_info, output_dir, suffix=''):
     plt.close(fig)
     print(f'    Saved violin plots: {fname}')
 
+def _half_violin(ax, data, center, width=0.35, side='right', color='grey', alpha=0.5):
+    """Manual half-violin (density curve) used by the raincloud panels."""
+    data = np.asarray(data, dtype=float)
+    data = data[~np.isnan(data)]
+    if len(data) < 3 or np.std(data) == 0:
+        return
+    kde = gaussian_kde(data)
+    y_grid = np.linspace(data.min(), data.max(), 200)
+    density = kde(y_grid)
+    density = density / density.max() * width
+    x_base = np.full_like(y_grid, center)
+    if side == 'right':
+        ax.fill_betweenx(y_grid, x_base, x_base + density, color=color, alpha=alpha, lw=0)
+    else:
+        ax.fill_betweenx(y_grid, x_base - density, x_base, color=color, alpha=alpha, lw=0)
+
+def plot_group_effect_lollipop_raincloud(df_summary, df_trials, example_subjects,
+                                          output_path, region_colors=None):
+    """
+    df_summary : DataFrame with columns
+        subject, region ('thal'/'vent'), condition ('active'/'sham'),
+        effect_rb, p_value
+        (one row per subject-session; 'artifact_limited' bool column optional)
+    df_trials  : long-format DataFrame with columns
+        subject, session, region ('thal'/'vent'), window ('1W'/'60W'), sigma_db
+    example_subjects : list of 2 subject IDs to raincloud-plot. Both
+        available regions (thal AND vent) are shown for each subject.
+    output_path : where to save the PNG
+    """
+    if region_colors is None:
+        region_colors = {'thal': '#C0392B', 'vent': '#16A085', 'artifact': '#2E86C1'}
+ 
+    fig = plt.figure(figsize=(15, 7.5))
+    gs = fig.add_gridspec(2, 3, width_ratios=[1.6, 1, 1], wspace=0.45, hspace=0.5)
+ 
+    # ---- Panel 1: forest / lollipop (spans both rows, left column) -------
+    ax_lol = fig.add_subplot(gs[:, 0])
+    df_summary = df_summary.copy()
+    df_summary['label'] = df_summary['subject'].astype(str) + ' · ' + df_summary['region']
+    df_summary = df_summary.sort_values(['region', 'effect_rb']).reset_index(drop=True)
+ 
+    y_pos = np.arange(len(df_summary))
+    for y, row in zip(y_pos, df_summary.itertuples()):
+        is_artifact = bool(getattr(row, 'artifact_limited', False))
+        color = region_colors['artifact'] if is_artifact else region_colors.get(row.region, '#888')
+        facecolor = 'none' if is_artifact else color
+        ax_lol.hlines(y, 0, row.effect_rb, color=color, lw=1.4, zorder=2)
+        ax_lol.scatter(row.effect_rb, y, s=55, facecolors=facecolor, edgecolors=color,
+                       linewidths=1.4, zorder=3)
+        if not np.isnan(row.p_value) and row.p_value < 0.05:
+            ax_lol.text(row.effect_rb + np.sign(row.effect_rb) * 0.03, y, '*',
+                        va='center', ha='left' if row.effect_rb >= 0 else 'right',
+                        fontsize=13, color=color, fontweight='bold')
+ 
+    ax_lol.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7)
+    ax_lol.set_yticks(y_pos)
+    ax_lol.set_yticklabels(df_summary['label'], fontsize=8)
+    ax_lol.set_xlabel('Rank-biserial effect (post-burst sigma)', fontsize=9)
+    ax_lol.text(0.0, -0.06, '← 60W lowers sigma', transform=ax_lol.transAxes,
+               ha='left', fontsize=8, color='#555')
+    ax_lol.text(1.0, -0.06, '60W raises sigma →', transform=ax_lol.transAxes,
+               ha='right', fontsize=8, color='#555')
+    ax_lol.spines[['top', 'right']].set_visible(False)
+    ax_lol.set_title('Per-session effect (60W − 1W)', fontsize=10, fontweight='bold')
+ 
+    # ---- Panels 2-5: raincloud, 2 subjects (rows) x 2 regions (columns) --
+    def _raincloud_panel(ax, subj, region):
+        sub_df = df_trials[(df_trials['subject'] == subj) & (df_trials['region'] == region)]
+        if sub_df.empty:
+            ax.text(0.5, 0.5, f'{subj} · {region}\nno data', transform=ax.transAxes,
+                    ha='center', va='center', fontsize=9, color='grey')
+            ax.set_xticks([]); ax.set_yticks([])
+            for spine in ax.spines.values():
+                spine.set_visible(False)
+            return
+ 
+        positions = {'1W': 0, '60W': 1.1}
+        for window, color in [('1W', '#4B7BE0'), ('60W', '#E04B4B')]:
+            vals = sub_df.loc[sub_df['window'] == window, 'sigma_db'].values
+            center = positions[window]
+            _half_violin(ax, vals, center + 0.14, side='right', color=color, alpha=0.35)
+            bp = ax.boxplot([vals], positions=[center], widths=0.12, patch_artist=True,
+                            medianprops=dict(color='white', linewidth=1.6),
+                            showfliers=False)
+            bp['boxes'][0].set_facecolor(color)
+            bp['boxes'][0].set_alpha(0.85)
+            rng = np.random.default_rng(0)
+            jitter = rng.uniform(-0.05, 0.05, len(vals))
+            ax.scatter(np.full(len(vals), center - 0.14) + jitter, vals,
+                       s=10, color=color, alpha=0.5, linewidths=0)
+ 
+        sham_vals   = sub_df.loc[sub_df['window'] == '1W',  'sigma_db'].values
+        active_vals = sub_df.loc[sub_df['window'] == '60W', 'sigma_db'].values
+        r_rb, p_val = _rank_biserial_effect(sham_vals, active_vals)
+        ax.axhline(0, color='grey', lw=0.6, ls='--')
+        ax.set_xticks(list(positions.values()))
+        ax.set_xticklabels(list(positions.keys()))
+        ax.set_ylabel('Sigma power (dB)', fontsize=9)
+        region_label = 'Thalamus' if region == 'thal' else 'Ventricle'
+        title_color = region_colors.get(region, '#888')
+        ax.set_title(f'{subj} · {region_label}\nr_rb={r_rb:.2f}, p={p_val:.3f}',
+                    fontsize=9, fontweight='bold', color=title_color)
+        ax.spines[['top', 'right']].set_visible(False)
+ 
+    for i, subj in enumerate(example_subjects[:2]):
+        for j, region in enumerate(('thal', 'vent')):
+            ax = fig.add_subplot(gs[i, 1 + j])
+            _raincloud_panel(ax, subj, region)
+ 
+    fig.suptitle('Active stimulation modulates post-burst spindle-band (sigma) power bidirectionally',
+                 fontsize=13, fontweight='bold')
+    fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Saved group lollipop/raincloud figure: {output_path}')
+
+def plot_group_paired_bar_grid(df_effects, measures, output_path):
+    """
+    df_effects : DataFrame, one row per (subject, measure), columns:
+        subject, measure, thal_delta, vent_delta,
+        thal_p (optional), vent_p (optional)
+        where *_delta = within-subject (active - sham) effect for that
+        region, and *_p is the associated p-value (for the significance
+        stars) — feed these from _paired_wilcoxon()/_unpaired_mannwhitney()
+        on your per-pulse feature CSVs, one test per subject per measure.
+    measures : ordered list of (measure_key, display_label) tuples, e.g.
+        [('sigma_power', 'Sigma power'), ('delta_power', 'Delta power'),
+         ('spindle_rate', 'Spindle rate'), ('spindle_amplitude', 'Amplitude'),
+         ('spindle_duration', 'Duration'), ('spindle_frequency', 'Frequency')]
+    """
+    ncols = 3
+    nrows = int(np.ceil(len(measures) / ncols))
+    fig, axes = plt.subplots(nrows, ncols, figsize=(6 * ncols, 4.2 * nrows), squeeze=False)
+    axes_flat = axes.ravel()
+ 
+    for idx, (measure_key, measure_label) in enumerate(measures):
+        ax = axes_flat[idx]
+        sub = df_effects[df_effects['measure'] == measure_key].sort_values('subject')
+        if sub.empty:
+            ax.set_visible(False)
+            continue
+ 
+        subjects = sub['subject'].tolist()
+        x = np.arange(len(subjects))
+        width = 0.38
+ 
+        bars_thal = ax.bar(x - width / 2, sub['thal_delta'], width,
+                           color='#C0392B', label='Thalamus (Δ active−sham)')
+        bars_vent = ax.bar(x + width / 2, sub['vent_delta'], width,
+                           color='#16A085', label='Ventricle (Δ active−sham)')
+ 
+        for bars, pcol in [(bars_thal, 'thal_p'), (bars_vent, 'vent_p')]:
+            for bar, (_, row) in zip(bars, sub.iterrows()):
+                h = bar.get_height()
+                va = 'bottom' if h >= 0 else 'top'
+                offset = 0.02 * (1 if h >= 0 else -1) * max(abs(sub[['thal_delta', 'vent_delta']].values).max(), 1e-6)
+                ax.text(bar.get_x() + bar.get_width() / 2, h + offset, f'{h:.2f}',
+                        ha='center', va=va, fontsize=6.5)
+                p = row.get(pcol, np.nan)
+                if pd.notna(p) and p < 0.05:
+                    star_y = h + offset * 2.2
+                    ax.text(bar.get_x() + bar.get_width() / 2, star_y, _p_to_stars(p),
+                            ha='center', va=va, fontsize=9, color='black', fontweight='bold')
+ 
+        ax.axhline(0, color='grey', lw=0.7, ls='--')
+        ax.set_xticks(x)
+        ax.set_xticklabels(subjects, fontsize=7, rotation=45, ha='right')
+        ax.set_title(measure_label, fontsize=10, fontweight='bold')
+        ax.spines[['top', 'right']].set_visible(False)
+        if idx == 0:
+            ax.legend(fontsize=8, loc='upper right')
+ 
+    for idx in range(len(measures), nrows * ncols):
+        axes_flat[idx].set_visible(False)
+ 
+    fig.suptitle('Within-subject stimulation effect (active − sham), by region',
+                 fontsize=12, fontweight='bold')
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+    fig.savefig(output_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+    print(f'  Saved group paired bar grid: {output_path}')
+ 
+
 # =============================================================================
 # Feature assembly + session runner
 # =============================================================================
@@ -3959,6 +4672,136 @@ def flatten_features(peak_freq, spindle_features, sw_features, power_features, p
     el = (pulse_results or {}).get('event_locked_spindles', {})
     out.update(el)
     return out
+
+#-----------
+#Group summaty builders
+#--------
+
+
+def _load_per_pulse_csv(output_dir, participant_id, target):
+    """Load whichever suffix (nrem / full_recording) exists for this session."""
+    for suffix in ('nrem', 'full_recording'):
+        p = (Path(output_dir) / participant_id /
+             f'{participant_id}_{participant_id}_{target}_{suffix}_per_pulse_features.csv')
+        if p.exists():
+            return pd.read_csv(p), suffix
+    return None, None
+
+def build_group_trials_table(participants, output_dir=None):
+    """
+    Long-format trial table: subject, session, target, region (thal/vent),
+    window (1W/60W), sigma_db — one row per burst, per SPINDLE_CHANNELS
+    channel averaged. sigma_db = 10*log10(post_sigma_power / pre_sigma_power),
+    i.e. the same dB-re-baseline convention used elsewhere in the pipeline.
+    """
+    if output_dir is None:
+        output_dir = OUTPUT_DIR
+    region_map = {'thalamus': 'thal', 'ventricle': 'vent'}
+    rows = []
+    for pid in participants:
+        for target in ('thalamus', 'ventricle'):
+            df, suffix = _load_per_pulse_csv(output_dir, pid, target)
+            if df is None:
+                continue
+            sigma_cols = [f'{ch}_post_sigma_power' for ch in SPINDLE_CHANNELS
+                          if f'{ch}_post_sigma_power' in df.columns]
+            pre_cols   = [f'{ch}_pre_sigma_power' for ch in SPINDLE_CHANNELS
+                          if f'{ch}_pre_sigma_power' in df.columns]
+            if not sigma_cols or not pre_cols:
+                continue
+            post = df[sigma_cols].mean(axis=1)
+            pre  = df[pre_cols].mean(axis=1)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                sigma_db = 10 * np.log10(post / pre)
+            for group, sdb in zip(df['group'], sigma_db):
+                if not np.isfinite(sdb):
+                    continue
+                rows.append({
+                    'subject': pid, 'session': f'{pid}_{target}', 'target': target,
+                    'region': region_map[target],
+                    'window': '60W' if group == 'active' else '1W',
+                    'sigma_db': float(sdb),
+                })
+    return pd.DataFrame(rows)
+
+def build_group_summary_table(df_trials):
+    """
+    One row per subject-session-region: effect_rb, p_value from
+    _rank_biserial_effect(1W trials, 60W trials).
+    """
+    rows = []
+    for (subj, session, region), grp in df_trials.groupby(['subject', 'session', 'region']):
+        sham   = grp.loc[grp['window'] == '1W',  'sigma_db'].values
+        active = grp.loc[grp['window'] == '60W', 'sigma_db'].values
+        r_rb, p = _rank_biserial_effect(sham, active)
+        rows.append({
+            'subject': subj, 'session': session, 'region': region,
+            'effect_rb': r_rb, 'p_value': p,
+            'artifact_limited': (len(sham) < 5 or len(active) < 5),
+        })
+    return pd.DataFrame(rows).dropna(subset=['effect_rb'])
+
+def build_group_effects_table(participants, output_dir=None):
+    """
+    Per-subject, per-measure thal_delta / vent_delta (+ p-values) table for
+    plot_group_paired_bar_grid(). Pulls band power from per_pulse CSVs and
+    spindle rate/amplitude/duration/frequency from the burst-locked spindle
+    summary CSVs saved by save_burst_locked_spindle_csv().
+    """
+    if output_dir is None:
+        output_dir = OUTPUT_DIR
+ 
+    measure_cols = {
+        'sigma_power': ('post_sigma_power', 'per_pulse'),
+        'delta_power': ('post_delta_power', 'per_pulse'),
+        'spindle_rate':      ('mean_spindles_per_burst', 'spindle_summary'),
+        'spindle_amplitude': ('mean_amplitude_uv',        'spindle_summary'),
+        'spindle_duration':  ('mean_duration_sec',        'spindle_summary'),
+        'spindle_frequency': ('mean_frequency_hz',         'spindle_summary'),
+    }
+ 
+    rows = {}  # (subject, measure) -> row dict
+    for pid in participants:
+        for target, region_key in (('thalamus', 'thal_delta'), ('ventricle', 'vent_delta')):
+            p_key = 'thal_p' if region_key == 'thal_delta' else 'vent_p'
+ 
+            pulse_df, suffix = _load_per_pulse_csv(output_dir, pid, target)
+            for measure_key, (col_suffix, source) in measure_cols.items():
+                if source == 'per_pulse':
+                    if pulse_df is None:
+                        continue
+                    cols = [f'{ch}_{col_suffix}' for ch in SPINDLE_CHANNELS
+                            if f'{ch}_{col_suffix}' in pulse_df.columns]
+                    if not cols:
+                        continue
+                    vals = pulse_df[cols].mean(axis=1)
+                    sham   = vals[pulse_df['group'] == 'sham'].values
+                    active = vals[pulse_df['group'] == 'active'].values
+                    if len(sham) < 3 or len(active) < 3:
+                        continue
+                    delta = float(np.nanmean(active) - np.nanmean(sham))
+                    p = _unpaired_mannwhitney(sham, active)
+                else:
+                    summary_path = (Path(output_dir) / pid /
+                                     f'{pid}_{pid}_{target}_{suffix}_burst_locked_spindles_summary.csv')
+                    if not summary_path.exists():
+                        continue
+                    sdf = pd.read_csv(summary_path)
+                    sham_row   = sdf.loc[sdf['condition'] == 'sham',   col_suffix]
+                    active_row = sdf.loc[sdf['condition'] == 'active', col_suffix]
+                    if sham_row.empty or active_row.empty:
+                        continue
+                    delta = float(active_row.iloc[0] - sham_row.iloc[0])
+                    p = np.nan  # per-burst distributions aren't in the summary CSV; leave blank
+ 
+                key = (pid, measure_key)
+                rows.setdefault(key, {'subject': pid, 'measure': measure_key,
+                                      'thal_delta': np.nan, 'vent_delta': np.nan,
+                                      'thal_p': np.nan, 'vent_p': np.nan})
+                rows[key][region_key] = delta
+                rows[key][p_key] = p
+ 
+    return pd.DataFrame(rows.values())
 
 
 def process_one_session(participant_id, target, session_name, is_adaptation,
@@ -4052,6 +4895,9 @@ def process_one_session(participant_id, target, session_name, is_adaptation,
             safe_plot(plot_erp_topomap_evolution, raw, bursts_df, freq_band, session_name, participant_id, participant_output_dir, suffix)
             safe_plot(plot_tfrs, raw, bursts_df, freq_band,session_name, participant_id,participant_output_dir, suffix,focus_ch,)
             safe_plot(compute_evoked_band_responses, raw, bursts_df, session_name, participant_id, participant_output_dir, suffix, hypno_int)
+            safe_plot(plot_erp_extended, raw, bursts_df, session_name, participant_id, participant_output_dir, suffix)
+            safe_plot(run_butterfly_for_participant, participant_id, target, session_name, participant_output_dir, suffix)
+
         del raw, hypno_up
         gc.collect()
         print('    Raw released')
@@ -4136,7 +4982,6 @@ def process_participant(participant_id):
     safe_plot(plot_erp_thalamus_vs_ventricle, participant_id, str(out_dir))
     return df
 
-
 # =============================================================================
 # Entry point
 # =============================================================================
@@ -4162,5 +5007,38 @@ if __name__ == '__main__':
         group_path = Path(OUTPUT_DIR) / 'all_session_features.csv'
         group_df.to_csv(group_path, index=False)
         print(f'\nGroup feature table → {group_path}')
+        trials_df  = build_group_trials_table(participants, OUTPUT_DIR)
+        summary_df = build_group_summary_table(trials_df)
+        effects_df = build_group_effects_table(participants, OUTPUT_DIR)
+
+        # Pick 2 example subjects for the raincloud panels. 
+        EXAMPLE_SUBJECT_IDS = ['03', '06']
+
+        example_sessions = []
+        for subj in EXAMPLE_SUBJECT_IDS:
+            subj_sessions = summary_df.loc[summary_df['subject'] == subj, 'session']
+            if subj_sessions.empty:
+                print(f'  Warning: no trial data for example subject {subj} — skipping')
+                continue
+            # if a subject has both thal and vent sessions, take whichever has
+            # more trials so the raincloud isn't sparse
+            best_session = (
+                trials_df[trials_df['subject'] == subj]
+                .groupby('session').size().idxmax()
+            )
+            example_sessions.append((subj, best_session))
+
+        plot_group_effect_lollipop_raincloud(
+            summary_df, trials_df, example_sessions,
+            Path(OUTPUT_DIR) / 'group_lollipop_raincloud.png',
+        )
+        measures = [
+            ('sigma_power', 'Sigma power'), ('delta_power', 'Delta power'),
+            ('spindle_rate', 'Spindle rate'), ('spindle_amplitude', 'Amplitude'),
+            ('spindle_duration', 'Duration'), ('spindle_frequency', 'Frequency'),
+        ]
+        plot_group_paired_bar_grid(
+            effects_df, measures, Path(OUTPUT_DIR) / 'group_paired_bar_grid.png',
+        )
     else:
         print('\nNo participant tables produced.')
