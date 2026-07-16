@@ -378,7 +378,7 @@ def _cluster_permutation_1d(trials_a, trials_b, n_permutations=5000,
                 sig.append((int(idx[0]), int(idx[-1]), float(p)))
     return sig
 
-def _cluster_permutation_tfr_2samp(power_a, power_b, n_permutations=500,
+def _cluster_permutation_tfr_2samp(power_a, power_b, n_permutations=5000,
                                     threshold=None, tail=0, seed=42):
     """
     Two-sample cluster-based permutation test over a 2D (freq x time) map.
@@ -410,26 +410,32 @@ def _cluster_permutation_tfr_2samp(power_a, power_b, n_permutations=500,
     return sig_mask, sig_clusters
 
 def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
-                                   ch_names, info, n_permutations=500, seed=42):
+                                   ch_names, info, n_permutations=5000, seed=42):
     """
     Spatio-temporal cluster test (active vs sham) across channels AND time,
     used to decide which channels get a significance marker on a topomap.
  
     trials_by_channel_a/b : dict[ch] -> array (n_trials, n_times)
-    Returns dict[ch] -> bool (True if that channel falls inside >=1
-    significant spatio-temporal cluster at any time point).
+    Returns:
+        ch_sig : dict[ch] -> bool (True if that channel falls inside >=1
+            significant spatio-temporal cluster at any time point).
+        min_p  : float or None. The smallest cluster p-value observed
+            (regardless of whether it cleared the 0.05 threshold), so
+            captions can report the actual statistic rather than just a
+            channel count. None if the test couldn't be run at all (too
+            few channels/trials, or the test raised an exception).
     """
 
  
     common = [ch for ch in ch_names
               if ch in trials_by_channel_a and ch in trials_by_channel_b]
     if len(common) < 3:
-        return {ch: False for ch in ch_names}
+        return {ch: False for ch in ch_names}, None
  
     n_a = min(len(trials_by_channel_a[ch]) for ch in common)
     n_b = min(len(trials_by_channel_b[ch]) for ch in common)
     if n_a < 3 or n_b < 3:
-        return {ch: False for ch in ch_names}
+        return {ch: False for ch in ch_names}, None
  
     # shape needed by spatio_temporal_cluster_test: (n_trials, n_times, n_channels)
     Xa = np.stack([trials_by_channel_a[ch][:n_a] for ch in common], axis=-1)
@@ -443,7 +449,7 @@ def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
         )
     except Exception as exc:
         print(f'    Spatio-temporal cluster test failed: {exc}')
-        return {ch: False for ch in ch_names}
+        return {ch: False for ch in ch_names}, None
  
     ch_sig = {ch: False for ch in ch_names}
     for c, p in zip(clusters, cluster_pv):
@@ -452,7 +458,8 @@ def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
             for ch, is_sig in zip(common, ch_mask_any_time):
                 if is_sig:
                     ch_sig[ch] = True
-    return ch_sig
+    min_p = float(np.min(cluster_pv)) if len(cluster_pv) else None
+    return ch_sig, min_p
 
 def _shade_significant_clusters(ax, times, clusters, color='#F1C40F', alpha=0.18):
     """Shade [start,end] windows returned by _cluster_permutation_1d, and
@@ -2760,15 +2767,18 @@ def _habituation_plot_all_channels(all_epochs, channels, pre_samples, baseline_m
     plt.close(fig)
     print(f'      Saved habituation plot (all channels): {fname}')
 
-
 def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
                  session_name, participant_id, output_dir, suffix, condition, baseline_name,
-                 sig_channels=None):
+                 sig_channels=None, cluster_p=None):
     """
     sig_channels : optional set/dict of channel names (from
         _spatio_temporal_cluster_mask) that fall inside a significant
         active-vs-sham spatio-temporal cluster. If provided, those
         channels are marked on the topomap with a filled black circle.
+    cluster_p : optional float, the minimum cluster p-value returned
+        alongside sig_channels by _spatio_temporal_cluster_mask. Shown in
+        the title so the figure reports the actual statistic rather than
+        just a channel count.
     """
     fname = (f'{participant_id}_{session_name}_{suffix}_'
              f'ERP_topomap_{condition}_{baseline_name}.png')
@@ -2816,12 +2826,76 @@ def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
     )
     if sig_channels is not None:
         title += f'  |  {n_sig} sig. channel(s) (active vs sham)'
+        if cluster_p is not None:
+            title += f', p={cluster_p:.3f}'
     ax.set_title(title, fontsize=9)
 
     fig.tight_layout()
     fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
     plt.close(fig)
     print(f'      Saved ERP topomap: {fname}')
+
+# def _erp_topomap(mean_amp_by_channel, ch_names_topo, info_topo,
+#                  session_name, participant_id, output_dir, suffix, condition, baseline_name,
+#                  sig_channels=None):
+#     """
+#     sig_channels : optional set/dict of channel names (from
+#         _spatio_temporal_cluster_mask) that fall inside a significant
+#         active-vs-sham spatio-temporal cluster. If provided, those
+#         channels are marked on the topomap with a filled black circle.
+#     """
+#     fname = (f'{participant_id}_{session_name}_{suffix}_'
+#              f'ERP_topomap_{condition}_{baseline_name}.png')
+#     if _already_done(output_dir, fname):
+#         return
+
+#     vals = np.array([mean_amp_by_channel.get(ch, np.nan) for ch in ch_names_topo])
+#     valid_mask = ~np.isnan(vals)
+#     if not valid_mask.any():
+#         return
+
+#     vals_valid   = vals[valid_mask]
+#     chs_valid    = [ch for ch, ok in zip(ch_names_topo, valid_mask) if ok]
+#     info_valid   = mne.create_info(chs_valid, sfreq=info_topo['sfreq'], ch_types='eeg')
+#     montage      = mne.channels.make_standard_montage('standard_1020')
+#     info_valid.set_montage(montage, on_missing='ignore')
+
+#     vlim_val = np.nanpercentile(np.abs(vals_valid), 95)
+#     vlim_val = vlim_val if vlim_val > 0 else 1.0
+
+#     # ── build significance mask aligned to chs_valid order ──
+#     sig_mask_arr = None
+#     n_sig = 0
+#     if sig_channels is not None:
+#         sig_mask_arr = np.array([ch in sig_channels for ch in chs_valid], dtype=bool)
+#         n_sig = int(sig_mask_arr.sum())
+#         if not sig_mask_arr.any():
+#             sig_mask_arr = None  # nothing to draw
+
+#     fig, ax = plt.subplots(figsize=(5, 4))
+#     im, _ = mne.viz.plot_topomap(
+#         vals_valid, info_valid,
+#         axes=ax, show=False, cmap='RdBu_r',
+#         vlim=(-vlim_val, vlim_val),
+#         mask=sig_mask_arr,
+#         mask_params=dict(
+#             marker='o', markerfacecolor='k', markeredgecolor='k', markersize=5,
+#         ),
+#     )
+#     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label='RMS µV (post-stimulus)')
+
+#     title = (
+#         f'{condition}  |  ERP post-stimulus RMS (0–{TUS_EPOCH_POST_SEC:.0f} s)\n'
+#         f'baseline: {baseline_name}  |  n={valid_mask.sum()} channels'
+#     )
+#     if sig_channels is not None:
+#         title += f'  |  {n_sig} sig. channel(s) (active vs sham)'
+#     ax.set_title(title, fontsize=9)
+
+#     fig.tight_layout()
+#     fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
+#     plt.close(fig)
+#     print(f'      Saved ERP topomap: {fname}')
 
 def plot_erp_topomap_evolution(raw, bursts_df, freq_band, session_name, participant_id,
                                 output_dir, suffix=''):
@@ -2885,12 +2959,12 @@ def plot_erp_topomap_evolution(raw, bursts_df, freq_band, session_name, particip
     halfwin_samples = int(ERP_TOPO_TIMECOURSE_HALFWIN_MS / 1000 * sfreq)
 
     for baseline_name, baseline_mode in ERP_BASELINES.items():
+        # ── Pass 1: clean each condition's per-channel trials first ──
+        # We need both conditions' cleaned trials in hand before we can run
+        # the active-vs-sham cluster test, so this is split out from the
+        # frame-rendering loop below (which used to do sham/active independently).
+        per_group_data = {}
         for group_label in ('sham', 'active'):
-            fname = (f'{participant_id}_{session_name}_{suffix}_'
-                     f'ERP_topomap_evolution_{group_label}_{baseline_name}.png')
-            if _already_done(output_dir, fname):
-                continue
-
             n_trials = all_epochs[topo_chs[0]][group_label].shape[0]
             if n_trials == 0:
                 continue
@@ -2923,15 +2997,35 @@ def plot_erp_topomap_evolution(raw, bursts_df, freq_band, session_name, particip
                 global_keep  &= trial_keep
 
             mean_erp_by_ch = {}
+            clean_by_ch = {}
             for ch in good_channels:
                 raw_trials = all_epochs[ch][group_label].copy()
                 corrected  = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
                 clean      = corrected[global_keep]
+                clean_by_ch[ch] = clean
                 mean_erp_by_ch[ch] = (clean.mean(axis=0)
                                       if len(clean) and not np.all(np.isnan(clean))
                                       else np.full(n_samples, np.nan))
             if not mean_erp_by_ch:
                 continue
+
+            per_group_data[group_label] = {
+                'mean_erp_by_ch': mean_erp_by_ch,
+                'clean_by_ch': clean_by_ch,
+            }
+
+        # ── Descriptive grids: sham and active, each on their own color scale, ──
+        # ── no significance markers — the active-vs-sham comparison lives in ──
+        # ── the diff grid built further down.                                 ──
+        for group_label in ('sham', 'active'):
+            if group_label not in per_group_data:
+                continue
+            fname = (f'{participant_id}_{session_name}_{suffix}_'
+                     f'ERP_topomap_evolution_{group_label}_{baseline_name}.png')
+            if _already_done(output_dir, fname):
+                continue
+
+            mean_erp_by_ch = per_group_data[group_label]['mean_erp_by_ch']
 
             # --- shared color scale across all frames ---
             frame_vals = []
@@ -2970,6 +3064,7 @@ def plot_erp_topomap_evolution(raw, bursts_df, freq_band, session_name, particip
                 chs_valid  = [ch for ch, ok in zip(topo_chs, valid_mask) if ok]
                 info_valid = mne.create_info(chs_valid, sfreq=sfreq, ch_types='eeg')
                 info_valid.set_montage(montage, on_missing='ignore')
+
                 im, _ = mne.viz.plot_topomap(
                     vals_valid, info_valid, axes=ax, show=False,
                     cmap='RdBu_r', vlim=(-vlim, vlim), contours=4,
@@ -2989,12 +3084,304 @@ def plot_erp_topomap_evolution(raw, bursts_df, freq_band, session_name, particip
             fig.suptitle(
                 f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP topomap evolution\n'
                 f'baseline: {baseline_name}  |  −{ERP_TOPO_TIMECOURSE_PRE_MS} to '
-                f'+{ERP_TOPO_TIMECOURSE_POST_MS} ms  (step: {ERP_TOPO_TIMECOURSE_STEP_MS} ms)',
+                f'+{ERP_TOPO_TIMECOURSE_POST_MS} ms  (step: {ERP_TOPO_TIMECOURSE_STEP_MS} ms)  |  descriptive only',
                 fontsize=12, fontweight='bold'
             )
             fig.savefig(Path(output_dir) / fname, dpi=180, bbox_inches='tight')
             plt.close(fig)
             print(f'      Saved ERP topomap evolution: {fname}')
+
+        # ── Diff grid: active minus sham, with the active-vs-sham cluster ──
+        # ── test's significance dots and p-value. This is the inferential ──
+        # ── figure — the sham/active grids above are descriptive context. ──
+        if 'active' not in per_group_data or 'sham' not in per_group_data:
+            continue
+
+        fname_diff = (f'{participant_id}_{session_name}_{suffix}_'
+                      f'ERP_topomap_evolution_diff_{baseline_name}.png')
+        if _already_done(output_dir, fname_diff):
+            continue
+
+        trials_active, trials_sham = {}, {}
+        for ch in topo_chs:
+            a = per_group_data['active']['clean_by_ch'].get(ch)
+            s = per_group_data['sham']['clean_by_ch'].get(ch)
+            if (a is not None and s is not None and a.size and s.size
+                    and not np.all(np.isnan(a)) and not np.all(np.isnan(s))):
+                trials_active[ch] = a[:, pre_samples:]
+                trials_sham[ch]   = s[:, pre_samples:]
+
+        info_topo_evo = mne.create_info(topo_chs, sfreq=sfreq, ch_types='eeg')
+        info_topo_evo.set_montage(montage, on_missing='ignore')
+        ch_sig, cluster_p = _spatio_temporal_cluster_mask(
+            trials_active, trials_sham,
+            ch_names=topo_chs, info=info_topo_evo,
+            n_permutations=5000,
+        )
+        sig_channels = {ch for ch, is_sig in ch_sig.items() if is_sig}
+
+        mean_active_by_ch = per_group_data['active']['mean_erp_by_ch']
+        mean_sham_by_ch   = per_group_data['sham']['mean_erp_by_ch']
+        diff_by_ch = {
+            ch: mean_active_by_ch[ch] - mean_sham_by_ch[ch]
+            for ch in topo_chs
+            if ch in mean_active_by_ch and ch in mean_sham_by_ch
+        }
+        if not diff_by_ch:
+            continue
+
+        frame_vals = []
+        for t_ms in time_points:
+            t_idx = int(np.argmin(np.abs(times_ms - t_ms)))
+            s0, s1 = max(t_idx - halfwin_samples, 0), min(t_idx + halfwin_samples, n_samples)
+            vals = np.array([
+                np.nanmean(diff_by_ch[ch][s0:s1]) if ch in diff_by_ch else np.nan
+                for ch in topo_chs
+            ])
+            frame_vals.append(vals)
+        all_frame_vals = np.array(frame_vals)
+        finite_vals = all_frame_vals[np.isfinite(all_frame_vals)]
+        if len(finite_vals) == 0:
+            continue
+        vlim = np.nanpercentile(np.abs(finite_vals), 95)
+        vlim = vlim if vlim > 0 else 1.0
+
+        ncols = 5
+        nrows = int(np.ceil(len(time_points) / ncols))
+        fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.2 * nrows))
+        axes_flat = np.array(axes).ravel()
+
+        last_im = None
+        for i, t_ms in enumerate(time_points):
+            ax = axes_flat[i]
+            vals = all_frame_vals[i]
+            valid_mask = np.isfinite(vals)
+            if valid_mask.sum() < 3:
+                ax.text(0.5, 0.5, 'n/a', transform=ax.transAxes,
+                        ha='center', va='center', fontsize=8, color='grey')
+                ax.set_axis_off()
+                ax.set_title(f'{int(t_ms)} ms', fontsize=9)
+                continue
+            vals_valid = vals[valid_mask]
+            chs_valid  = [ch for ch, ok in zip(topo_chs, valid_mask) if ok]
+            info_valid = mne.create_info(chs_valid, sfreq=sfreq, ch_types='eeg')
+            info_valid.set_montage(montage, on_missing='ignore')
+
+            # Only mark significance on post-stimulus frames — the cluster
+            # test above was run on the post_samples: window, so pre-stim
+            # (baseline) frames have no corresponding test result.
+            sig_mask_arr = None
+            if sig_channels and t_ms >= 0:
+                candidate = np.array([ch in sig_channels for ch in chs_valid], dtype=bool)
+                if candidate.any():
+                    sig_mask_arr = candidate
+
+            im, _ = mne.viz.plot_topomap(
+                vals_valid, info_valid, axes=ax, show=False,
+                cmap='RdBu_r', vlim=(-vlim, vlim), contours=4,
+                mask=sig_mask_arr,
+                mask_params=dict(
+                    marker='o', markerfacecolor='k', markeredgecolor='k', markersize=4,
+                ),
+            )
+            last_im = im
+            title_color = 'black' if t_ms < 0 else '#922B21'
+            ax.set_title(f'{int(t_ms)} ms', fontsize=9, fontweight='bold', color=title_color)
+
+        for j in range(len(time_points), nrows * ncols):
+            axes_flat[j].set_visible(False)
+
+        if last_im is not None:
+            fig.subplots_adjust(right=0.90, top=0.88)
+            cax = fig.add_axes([0.92, 0.15, 0.015, 0.65])
+            fig.colorbar(last_im, cax=cax, label='µV (active − sham)')
+
+        suptitle = (
+            f'{participant_id} – {session_name}  |  ACTIVE − SHAM  ERP topomap evolution\n'
+            f'baseline: {baseline_name}  |  −{ERP_TOPO_TIMECOURSE_PRE_MS} to '
+            f'+{ERP_TOPO_TIMECOURSE_POST_MS} ms  (step: {ERP_TOPO_TIMECOURSE_STEP_MS} ms)'
+        )
+        if sig_channels:
+            suptitle += f'\n{len(sig_channels)} sig. channel(s), cluster p={cluster_p:.3f} (spatio-temporal permutation test, post-stim window)'
+        elif cluster_p is not None:
+            suptitle += f'\nno significant cluster (smallest cluster p={cluster_p:.3f})'
+        fig.suptitle(suptitle, fontsize=12, fontweight='bold')
+        fig.savefig(Path(output_dir) / fname_diff, dpi=180, bbox_inches='tight')
+        plt.close(fig)
+        print(f'      Saved ERP topomap evolution (diff): {fname_diff}')
+
+# def plot_erp_topomap_evolution(raw, bursts_df, freq_band, session_name, participant_id,
+#                                 output_dir, suffix=''):
+#     """
+#     Shows how the ERP scalp topography evolves over time, from
+#     -ERP_TOPO_TIMECOURSE_PRE_MS to +ERP_TOPO_TIMECOURSE_POST_MS relative to
+#     TUS onset, for Active and Sham separately, across all baseline
+#     corrections. One figure per (condition, baseline) — a grid of topomap
+#     snapshots at ERP_TOPO_TIMECOURSE_STEP_MS intervals.
+#     """
+#     if 'burst_time_s' not in bursts_df.columns:
+#         print('    plot_erp_topomap_evolution: burst_time_s column missing — skipping')
+#         return
+#     bursts_df = bursts_df.copy()
+#     bursts_df['burst_time_s'] = pd.to_numeric(bursts_df['burst_time_s'], errors='coerce')
+#     bursts_df = bursts_df.dropna(subset=['burst_time_s'])
+
+#     channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude='bads')
+#                 if raw.ch_names[i] not in EXCLUDE_CHANNELS]
+#     if not channels or bursts_df.empty:
+#         return
+
+#     montage   = mne.channels.make_standard_montage('standard_1020')
+#     known_chs = set(montage.ch_names)
+#     topo_chs  = [ch for ch in channels if ch in known_chs]
+#     if len(topo_chs) < 3:
+#         print('    plot_erp_topomap_evolution: too few channels with known positions — skipping')
+#         return
+
+#     sfreq        = raw.info['sfreq']
+#     pre_samples  = int(TUS_EPOCH_PRE_SEC * sfreq)
+#     post_samples = int(TUS_EPOCH_POST_SEC * sfreq)
+#     n_samples    = pre_samples + post_samples
+#     times_ms     = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples) * 1000
+
+#     time_points = np.arange(-ERP_TOPO_TIMECOURSE_PRE_MS,
+#                             ERP_TOPO_TIMECOURSE_POST_MS + 1,
+#                             ERP_TOPO_TIMECOURSE_STEP_MS)
+
+#     # Extract epochs once (reused across all baselines/conditions below)
+#     all_epochs = {ch: {} for ch in topo_chs}
+#     for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
+#         mask = bursts_df['condition'].isin(condition_set)
+#         group_df = bursts_df[mask].reset_index(drop=True)
+#         for ch in topo_chs:
+#             ch_idx = raw.ch_names.index(ch)
+#             trials = []
+#             for _, burst in group_df.iterrows():
+#                 center = int(burst['burst_time_s'] * sfreq)
+#                 start, stop = center - pre_samples, center + post_samples
+#                 if start < 0 or stop > raw.n_times:
+#                     trials.append(np.full(n_samples, np.nan))
+#                     continue
+#                 if window_overlaps_bad_annotation(raw, start / sfreq, stop / sfreq):
+#                     trials.append(np.full(n_samples, np.nan))
+#                     continue
+#                 trial = raw.get_data(picks=[ch_idx], start=start, stop=stop)[0] * 1e6
+#                 trials.append(trial)
+#             all_epochs[ch][group_label] = np.array(trials)
+
+#     halfwin_samples = int(ERP_TOPO_TIMECOURSE_HALFWIN_MS / 1000 * sfreq)
+
+#     for baseline_name, baseline_mode in ERP_BASELINES.items():
+#         for group_label in ('sham', 'active'):
+#             fname = (f'{participant_id}_{session_name}_{suffix}_'
+#                      f'ERP_topomap_evolution_{group_label}_{baseline_name}.png')
+#             if _already_done(output_dir, fname):
+#                 continue
+
+#             n_trials = all_epochs[topo_chs[0]][group_label].shape[0]
+#             if n_trials == 0:
+#                 continue
+
+#             # Same noisy-channel / noisy-trial exclusion logic as plot_erps,
+#             # so this figure stays consistent with the main ERP figures.
+#             BAD_CHANNEL_REJECTION_RATE = 0.30
+#             good_channels = []
+#             for ch in topo_chs:
+#                 raw_trials  = all_epochs[ch][group_label].copy()
+#                 corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
+#                 finite_mask = np.all(np.isfinite(corrected), axis=1)
+#                 if finite_mask.sum() == 0:
+#                     continue
+#                 noise_mask, _ = _exclude_noisy_trials(corrected[finite_mask])
+#                 n_rejected = int((~noise_mask).sum())
+#                 if (n_rejected / n_trials) <= BAD_CHANNEL_REJECTION_RATE:
+#                     good_channels.append(ch)
+#             if not good_channels:
+#                 continue
+
+#             global_keep = np.ones(n_trials, dtype=bool)
+#             for ch in good_channels:
+#                 raw_trials  = all_epochs[ch][group_label].copy()
+#                 corrected   = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
+#                 finite_mask = np.all(np.isfinite(corrected), axis=1)
+#                 noise_mask, _ = _exclude_noisy_trials(corrected[finite_mask])
+#                 trial_keep    = np.zeros(n_trials, dtype=bool)
+#                 trial_keep[np.where(finite_mask)[0][noise_mask]] = True
+#                 global_keep  &= trial_keep
+
+#             mean_erp_by_ch = {}
+#             for ch in good_channels:
+#                 raw_trials = all_epochs[ch][group_label].copy()
+#                 corrected  = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
+#                 clean      = corrected[global_keep]
+#                 mean_erp_by_ch[ch] = (clean.mean(axis=0)
+#                                       if len(clean) and not np.all(np.isnan(clean))
+#                                       else np.full(n_samples, np.nan))
+#             if not mean_erp_by_ch:
+#                 continue
+
+#             # --- shared color scale across all frames ---
+#             frame_vals = []
+#             for t_ms in time_points:
+#                 t_idx = int(np.argmin(np.abs(times_ms - t_ms)))
+#                 s0, s1 = max(t_idx - halfwin_samples, 0), min(t_idx + halfwin_samples, n_samples)
+#                 vals = np.array([
+#                     np.nanmean(mean_erp_by_ch[ch][s0:s1]) if ch in mean_erp_by_ch else np.nan
+#                     for ch in topo_chs
+#                 ])
+#                 frame_vals.append(vals)
+#             all_frame_vals = np.array(frame_vals)
+#             finite_vals = all_frame_vals[np.isfinite(all_frame_vals)]
+#             if len(finite_vals) == 0:
+#                 continue
+#             vlim = np.nanpercentile(np.abs(finite_vals), 95)
+#             vlim = vlim if vlim > 0 else 1.0
+
+#             ncols = 5
+#             nrows = int(np.ceil(len(time_points) / ncols))
+#             fig, axes = plt.subplots(nrows, ncols, figsize=(3.2 * ncols, 3.2 * nrows))
+#             axes_flat = np.array(axes).ravel()
+
+#             last_im = None
+#             for i, t_ms in enumerate(time_points):
+#                 ax = axes_flat[i]
+#                 vals = all_frame_vals[i]
+#                 valid_mask = np.isfinite(vals)
+#                 if valid_mask.sum() < 3:
+#                     ax.text(0.5, 0.5, 'n/a', transform=ax.transAxes,
+#                             ha='center', va='center', fontsize=8, color='grey')
+#                     ax.set_axis_off()
+#                     ax.set_title(f'{int(t_ms)} ms', fontsize=9)
+#                     continue
+#                 vals_valid = vals[valid_mask]
+#                 chs_valid  = [ch for ch, ok in zip(topo_chs, valid_mask) if ok]
+#                 info_valid = mne.create_info(chs_valid, sfreq=sfreq, ch_types='eeg')
+#                 info_valid.set_montage(montage, on_missing='ignore')
+#                 im, _ = mne.viz.plot_topomap(
+#                     vals_valid, info_valid, axes=ax, show=False,
+#                     cmap='RdBu_r', vlim=(-vlim, vlim), contours=4,
+#                 )
+#                 last_im = im
+#                 title_color = 'black' if t_ms < 0 else '#922B21'
+#                 ax.set_title(f'{int(t_ms)} ms', fontsize=9, fontweight='bold', color=title_color)
+
+#             for j in range(len(time_points), nrows * ncols):
+#                 axes_flat[j].set_visible(False)
+
+#             if last_im is not None:
+#                 fig.subplots_adjust(right=0.90, top=0.88)
+#                 cax = fig.add_axes([0.92, 0.15, 0.015, 0.65])
+#                 fig.colorbar(last_im, cax=cax, label='µV (re: baseline)')
+
+#             fig.suptitle(
+#                 f'{participant_id} – {session_name}  |  {group_label.upper()}  ERP topomap evolution\n'
+#                 f'baseline: {baseline_name}  |  −{ERP_TOPO_TIMECOURSE_PRE_MS} to '
+#                 f'+{ERP_TOPO_TIMECOURSE_POST_MS} ms  (step: {ERP_TOPO_TIMECOURSE_STEP_MS} ms)',
+#                 fontsize=12, fontweight='bold'
+#             )
+#             fig.savefig(Path(output_dir) / fname, dpi=180, bbox_inches='tight')
+#             plt.close(fig)
+#             print(f'      Saved ERP topomap evolution: {fname}')
 
 def _plot_erp_difference(mean_erps_active, mean_erps_sham, channels, times,
                           pre_samples, session_name, participant_id,
@@ -3104,7 +3491,7 @@ def _maybe_save(fig, name, fig_dir):
 BASELINE = PAPER_BASELINE_SEC        
 def plot_butterfly_sig(epochs, cond_a="1w", cond_b="60w", baseline=BASELINE,
                        tmin=-0.2, tmax=2.0, n_topo=4, band=None, evoked=None,
-                       run_cluster=True, n_permutations=1000, fig_dir=None,
+                       run_cluster=True, n_permutations=5000, fig_dir=None,
                        name="fig_butterfly_sig"):
     """Butterfly across ALL EEG channels + global field power, with significant
     cluster windows shaded and a row of TOPOGRAPHIES at the GFP peaks (significant
@@ -3476,10 +3863,10 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                         trials_by_channel_active[ch] = a[:, pre_samples:]
                         trials_by_channel_sham[ch]   = s[:, pre_samples:]
 
-                ch_sig = _spatio_temporal_cluster_mask(
+                ch_sig, cluster_p = _spatio_temporal_cluster_mask(
                     trials_by_channel_active, trials_by_channel_sham,
                     ch_names=topo_chs, info=info_topo,
-                    n_permutations=1000,
+                    n_permutations=5000,
                 )
                 sig_channels = {ch for ch, is_sig in ch_sig.items() if is_sig}
 
@@ -3487,13 +3874,13 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     peak_amp_by_condition['active'], topo_chs, info_topo,
                     session_name, participant_id, output_dir,
                     suffix, 'active', baseline_name,
-                    sig_channels=sig_channels,
+                    sig_channels=sig_channels, cluster_p=cluster_p,
                 )
                 _erp_topomap(
                     peak_amp_by_condition['sham'], topo_chs, info_topo,
                     session_name, participant_id, output_dir,
                     suffix, 'sham', baseline_name,
-                    sig_channels=sig_channels,
+                    sig_channels=sig_channels, cluster_p=cluster_p,
                 )
 
             plot_sets = [
@@ -4249,6 +4636,9 @@ def plot_tfrs(
                         )
 
         if info_topo is not None:
+            # ── Descriptive topomaps: sham and active, each per band, no ──
+            # ── significance markers — the active-vs-sham comparison lives ──
+            # ── in the diff topomap built further below.                   ──
             for group_label, condition_set in [
                 ("sham", SHAM_CONDITIONS),
                 ("active", ACTIVE_CONDITIONS),
@@ -4294,15 +4684,600 @@ def plot_tfrs(
                         cmap="RdBu_r", vlim=(-vlim_tfr, vlim_tfr),
                     )
                     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="dB (re: baseline)")
-                    ax.set_title(
+                    title = (
                         f"{group_label}  |  {band_name}  power (0–{HABITUATION_WINDOW_SEC[1]:.0f} s)\n"
-                        f"baseline: {bl_name}  |  n={valid_mask.sum()} channels",
-                        fontsize=9,
+                        f"baseline: {bl_name}  |  n={valid_mask.sum()} channels  |  descriptive only"
                     )
+                    ax.set_title(title, fontsize=9)
                     fig.tight_layout()
                     fig.savefig(Path(output_dir) / fname_topo, dpi=150, bbox_inches="tight")
                     plt.close(fig)
                     print(f"      Saved TFR topomap: {fname_topo}")
+
+            # ── Diff topomap: active minus sham power, per band, with the ──
+            # ── active-vs-sham cluster test's significance dots and p-value. ──
+            # ── This is the inferential figure. Uses per-trial, per-timepoint ──
+            # ── band power within the habituation window (not the ──
+            # ── time-collapsed mean), so the cluster test has temporal ──
+            # ── structure to work with.                                     ──
+            for band_name, (b_low, b_high) in TFR_BANDS.items():
+                freq_mask = (freqs >= b_low) & (freqs <= b_high)
+                if not freq_mask.any():
+                    continue
+                fname_diff = (
+                    f"{participant_id}_{session_name}_{suffix}_"
+                    f"TFR_topomap_diff_{band_name}_{bl_name}.png"
+                )
+                if _already_done(output_dir, fname_diff):
+                    continue
+
+                trials_by_channel_active = {}
+                trials_by_channel_sham = {}
+                diff_vals = {}
+                for ch in topo_chs:
+                    key_active = (ch, "active")
+                    key_sham = (ch, "sham")
+                    if key_active not in raw_power or key_sham not in raw_power:
+                        continue
+                    p_active = apply_tfr_baseline(raw_power[key_active], bl_start, bl_end)
+                    p_sham = apply_tfr_baseline(raw_power[key_sham], bl_start, bl_end)
+                    band_active_by_time = p_active[:, freq_mask, :][
+                        :, :, hab_start_idx:hab_end_idx
+                    ].mean(axis=1)
+                    band_sham_by_time = p_sham[:, freq_mask, :][
+                        :, :, hab_start_idx:hab_end_idx
+                    ].mean(axis=1)
+                    trials_by_channel_active[ch] = band_active_by_time
+                    trials_by_channel_sham[ch] = band_sham_by_time
+                    diff_vals[ch] = float(
+                        band_active_by_time.mean() - band_sham_by_time.mean()
+                    )
+
+                if not diff_vals:
+                    continue
+
+                ch_sig, cluster_p = _spatio_temporal_cluster_mask(
+                    trials_by_channel_active, trials_by_channel_sham,
+                    ch_names=topo_chs, info=info_topo,
+                    n_permutations=5000,
+                )
+                sig_channels = {ch for ch, is_sig in ch_sig.items() if is_sig}
+
+                vals_arr = np.array([diff_vals.get(ch, np.nan) for ch in topo_chs])
+                valid_mask = ~np.isnan(vals_arr)
+                if not valid_mask.any():
+                    continue
+
+                vals_valid = vals_arr[valid_mask]
+                chs_valid = [ch for ch, ok in zip(topo_chs, valid_mask) if ok]
+                info_valid = mne.create_info(
+                    chs_valid, sfreq=info_topo["sfreq"], ch_types="eeg"
+                )
+                montage_t = mne.channels.make_standard_montage("standard_1020")
+                info_valid.set_montage(montage_t, on_missing="ignore")
+
+                vlim_tfr = np.nanpercentile(np.abs(vals_valid), 95)
+                vlim_tfr = vlim_tfr if vlim_tfr > 0 else 1.0
+
+                sig_mask_arr = None
+                n_sig = 0
+                if sig_channels:
+                    sig_mask_arr = np.array([ch in sig_channels for ch in chs_valid], dtype=bool)
+                    n_sig = int(sig_mask_arr.sum())
+                    if not sig_mask_arr.any():
+                        sig_mask_arr = None
+
+                fig, ax = plt.subplots(figsize=(5, 4))
+                im, _ = mne.viz.plot_topomap(
+                    vals_valid, info_valid, axes=ax, show=False,
+                    cmap="RdBu_r", vlim=(-vlim_tfr, vlim_tfr),
+                    mask=sig_mask_arr,
+                    mask_params=dict(
+                        marker="o", markerfacecolor="k", markeredgecolor="k", markersize=5,
+                    ),
+                )
+                fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="dB (active − sham)")
+                title = (
+                    f"ACTIVE − SHAM  |  {band_name}  power (0–{HABITUATION_WINDOW_SEC[1]:.0f} s)\n"
+                    f"baseline: {bl_name}  |  n={valid_mask.sum()} channels"
+                )
+                if sig_channels:
+                    title += f"\n{n_sig} sig. channel(s), cluster p={cluster_p:.3f}"
+                elif cluster_p is not None:
+                    title += f"\nno significant cluster (smallest cluster p={cluster_p:.3f})"
+                ax.set_title(title, fontsize=9)
+                fig.tight_layout()
+                fig.savefig(Path(output_dir) / fname_diff, dpi=150, bbox_inches="tight")
+                plt.close(fig)
+                print(f"      Saved TFR topomap (diff): {fname_diff}")
+
+# def plot_tfrs(
+#     raw,
+#     bursts_df,
+#     freq_band,
+#     session_name,
+#     participant_id,
+#     output_dir,
+#     suffix="",
+#     focus_channel=None,
+# ):
+#     # ── FIX: the per-pulse CSV stores burst time as 'burst_time_s', not 'time_sec'
+#     if "burst_time_s" not in bursts_df.columns:
+#         print("    plot_tfrs: burst_time_s column missing — skipping")
+#         return
+#     bursts_df["burst_time_s"] = pd.to_numeric(
+#         bursts_df["burst_time_s"], errors="coerce"
+#     )
+#     bursts_df = bursts_df.dropna(subset=["burst_time_s"])
+
+#     channels = [
+#         raw.ch_names[i]
+#         for i in mne.pick_types(raw.info, eeg=True, exclude='bads')
+#         if raw.ch_names[i] not in EXCLUDE_CHANNELS
+#     ]
+#     if not channels or bursts_df.empty:
+#         return
+
+#     sfreq = raw.info["sfreq"]
+#     pre_samples = int(TUS_EPOCH_PRE_SEC * sfreq)
+#     post_samples = int(TUS_EPOCH_POST_SEC * sfreq)
+#     n_samples = pre_samples + post_samples
+#     times = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples,  endpoint=False)
+
+#     freqs = np.arange(1.0, 21.0, 1.0)
+#     n_cycles = freqs / 2.0
+
+#     hab_start_idx = pre_samples + int(HABITUATION_WINDOW_SEC[0] * sfreq)
+#     hab_end_idx = pre_samples + int(HABITUATION_WINDOW_SEC[1] * sfreq)
+
+#     montage = mne.channels.make_standard_montage("standard_1020")
+#     known_chs = set(montage.ch_names)
+#     topo_chs = [ch for ch in channels if ch in known_chs]
+#     info_topo = None
+#     if len(topo_chs) >= 3:
+#         info_topo = mne.create_info(topo_chs, sfreq=sfreq, ch_types="eeg")
+#         info_topo.set_montage(montage, on_missing="ignore")
+
+#     # ── Fixed-ROI focus channels: ALL of FOCUS_CHANNEL_PRIORITY that survive
+#     # exclusion/bad-channel handling for this session, not just the first match.
+#     # An explicit `focus_channel=` override still narrows this to one channel.
+#     if focus_channel is not None and focus_channel in channels:
+#         focus_channels = [focus_channel]
+#     else:
+#         focus_channels = [ch for ch in FOCUS_CHANNEL_PRIORITY if ch in channels]
+#         if not focus_channels:
+#             focus_channels = [channels[0]]
+#     print(
+#         f"    TFR focus channels (fixed ROI): {focus_channels}  "
+#         f"(priority list: {FOCUS_CHANNEL_PRIORITY}, available: {channels})"
+#     )
+
+#     def morlet_tfr(epochs_2d):
+#         data_3d = epochs_2d[:, np.newaxis, :]
+#         power_4d = mne.time_frequency.tfr_array_morlet(
+#             data_3d,
+#             sfreq=sfreq,
+#             freqs=freqs,
+#             n_cycles=n_cycles,
+#             output="power",
+#             verbose=False,
+#         )
+#         return power_4d[:, 0, :, :]
+
+#     def apply_tfr_baseline(power_3d, bl_start_sec, bl_end_sec):
+#         bl_s = pre_samples + int(bl_start_sec * sfreq)
+#         bl_e = pre_samples + int(bl_end_sec * sfreq)
+#         bl_s = max(bl_s, 0)
+#         bl_e = min(bl_e, n_samples)
+#         bl_power = power_3d[:, :, bl_s:bl_e].mean(axis=2, keepdims=True)
+#         return 10 * np.log10(power_3d / (bl_power + 1e-30))
+
+#     raw_power = {}
+#     for group_label, condition_set in [
+#         ("sham", SHAM_CONDITIONS),
+#         ("active", ACTIVE_CONDITIONS),
+#     ]:
+#         mask = bursts_df["condition"].isin(condition_set)
+#         group_df = bursts_df[mask].reset_index(drop=True)
+#         if len(group_df) < 2:
+#             continue
+#         for ch in channels:
+#             ch_idx = raw.ch_names.index(ch)
+#             all_trials_uv = []
+#             for _, burst in group_df.iterrows():
+#                 center = int(burst["burst_time_s"] * sfreq)
+#                 start, stop = center - pre_samples, center + post_samples
+#                 if start < 0 or stop > raw.n_times:
+#                     continue
+#                 if window_overlaps_bad_annotation(raw, start / sfreq, stop / sfreq):
+#                     continue
+#                 trial = raw.get_data(start=start, stop=stop)[ch_idx] * 1e6
+#                 demeaned = trial - trial.mean()
+#                 if np.max(np.abs(demeaned)) <= EPOCH_REJECT_UV:
+#                     all_trials_uv.append(trial)
+#             if len(all_trials_uv) < 2:
+#                 continue
+#             epochs = all_trials_uv
+#             if len(epochs) >= 2:
+#                 raw_power[(ch, group_label)] = morlet_tfr(np.array(epochs))
+
+#     for bl_name, (bl_start, bl_end) in TFR_BASELINES.items():
+#         print(f"\n    TFR baseline: {bl_name}  ({bl_start:.2f} to {bl_end:.2f} s)")
+#         band_power_rows = []
+
+#         # ── band-power CSV extraction (unchanged, still per-group) ──
+#         for group_label, condition_set in [
+#             ("sham", SHAM_CONDITIONS),
+#             ("active", ACTIVE_CONDITIONS),
+#         ]:
+#             mask = bursts_df["condition"].isin(condition_set)
+#             group_df = bursts_df[mask].reset_index(drop=True)
+#             n_trials = sum(
+#                 1
+#                 for _, burst in group_df.iterrows()
+#                 if 0 <= int(burst["burst_time_s"] * sfreq) - pre_samples
+#                 and int(burst["burst_time_s"] * sfreq) + post_samples <= raw.n_times
+#             )
+#             if n_trials < 2:
+#                 continue
+
+#             for ch in channels:
+#                 key = (ch, group_label)
+#                 if key not in raw_power:
+#                     continue
+#                 power_3d = apply_tfr_baseline(raw_power[key], bl_start, bl_end)
+
+#                 for band_name, (b_low, b_high) in TFR_BANDS.items():
+#                     freq_mask = (freqs >= b_low) & (freqs <= b_high)
+#                     if not freq_mask.any():
+#                         continue
+#                     trial_band_power = power_3d[:, freq_mask, :][
+#                         :, :, hab_start_idx:hab_end_idx
+#                     ].mean(axis=(1, 2))
+#                     for t_idx, bp in enumerate(trial_band_power):
+#                         band_power_rows.append(
+#                             {
+#                                 "participant_id": participant_id,
+#                                 "session": session_name,
+#                                 "baseline": bl_name,
+#                                 "condition": group_label,
+#                                 "channel": ch,
+#                                 "band": band_name,
+#                                 "trial": t_idx + 1,
+#                                 "mean_power_db": round(float(bp), 6),
+#                             }
+#                         )
+
+#         if band_power_rows:
+#             bp_df = pd.DataFrame(band_power_rows)
+#             bp_csv = (
+#                 Path(output_dir)
+#                 / f"{participant_id}_{session_name}_{suffix}_TFR_band_power_{bl_name}.csv"
+#             )
+#             bp_df.to_csv(bp_csv, index=False)
+#             print(f"      Saved TFR band-power CSV: {bp_csv.name}")
+
+#         # ── main comparison figure: sham | active | active-sham + cluster test ──
+#         # Stash each channel's sig_mask so the FOCUS-channel diff figures below
+#         # (built after this loop) can reuse it without recomputing the cluster test.
+#         sig_masks_by_ch = {}
+#         sig_clusters_by_ch = {}
+
+#         for ch in channels:
+#             key_sham = (ch, "sham")
+#             key_active = (ch, "active")
+#             if key_sham not in raw_power or key_active not in raw_power:
+#                 continue
+
+#             power_sham = apply_tfr_baseline(raw_power[key_sham], bl_start, bl_end)
+#             power_active = apply_tfr_baseline(raw_power[key_active], bl_start, bl_end)
+
+#             fname = (
+#                 f"{participant_id}_{session_name}_{suffix}_"
+#                 f"TFR_{ch}_sham_active_diff_{bl_name}.png"
+#             )
+
+#             mean_sham = power_sham.mean(axis=0)
+#             mean_active = power_active.mean(axis=0)
+#             diff = mean_active - mean_sham
+#             n_sham = power_sham.shape[0]
+#             n_active = power_active.shape[0]
+
+#             sig_mask, sig_clusters = _cluster_permutation_tfr_2samp(
+#                 power_active, power_sham
+#             )
+#             sig_masks_by_ch[ch] = sig_mask
+#             sig_clusters_by_ch[ch] = sig_clusters
+
+#             if not _already_done(output_dir, fname):
+#                 vmax_common = max(
+#                     np.nanpercentile(np.abs(mean_sham), 97),
+#                     np.nanpercentile(np.abs(mean_active), 97),
+#                 )
+#                 vmax_diff = np.nanpercentile(np.abs(diff), 97)
+
+#                 fig, axes = plt.subplots(1, 3, figsize=(20, 5), sharey=True)
+
+#                 for ax, data, title, in zip(
+#                     axes[:2],
+#                     [mean_sham, mean_active],
+#                     ["SHAM", "ACTIVE"],
+#                 ):
+#                     pcm = ax.pcolormesh(
+#                         times, freqs, data, cmap="RdBu_r",
+#                         vmin=-vmax_common, vmax=vmax_common, shading="gouraud",
+#                     )
+#                     fig.colorbar(pcm, ax=ax, label="dB (re: baseline)")
+#                     ax.axvline(0, color="black", lw=1.2, ls="--", alpha=0.8, label="TUS onset")
+#                     ax.axhspan(freq_band[0], freq_band[1], color="yellow", alpha=0.15,
+#                                label="Spindle band")
+#                     ax.axvspan(bl_start, bl_end, color="lime", alpha=0.12,
+#                                label="Baseline window")
+#                     ax.set_xlabel("Time (s)")
+#                     ax.set_title(title, fontsize=11, fontweight="bold")
+#                 axes[0].set_ylabel("Frequency (Hz)")
+#                 axes[0].legend(fontsize=7, loc="upper right")
+
+#                 ax_diff = axes[2]
+#                 pcm_diff = ax_diff.pcolormesh(
+#                     times, freqs, diff, cmap="RdBu_r",
+#                     vmin=-vmax_diff, vmax=vmax_diff, shading="gouraud",
+#                 )
+#                 fig.colorbar(pcm_diff, ax=ax_diff, label="Δ dB (active − sham)")
+#                 ax_diff.axvline(0, color="black", lw=1.2, ls="--", alpha=0.8)
+#                 ax_diff.axhspan(freq_band[0], freq_band[1], color="yellow", alpha=0.15)
+#                 ax_diff.axvspan(bl_start, bl_end, color="lime", alpha=0.12)
+#                 ax_diff.set_xlabel("Time (s)")
+
+#                 if sig_mask is not None and sig_mask.any():
+#                     ax_diff.contour(
+#                         times, freqs, sig_mask.astype(float),
+#                         levels=[0.5], colors="black", linewidths=1.5,
+#                     )
+#                     n_sig_bins = int(sig_mask.sum())
+#                     p_str = ', '.join(f'p={p:.3f}' for _, p in sig_clusters)
+#                     ax_diff.set_title(
+#                         f"ACTIVE − SHAM\n"
+#                         f"cluster permutation: F, tail=0, {len(sig_clusters)} sig. cluster(s), {p_str}",
+#                         fontsize=10, fontweight="bold",
+#                     )
+#                     print(
+#                         f"      Cluster permutation [{ch}, {bl_name}]: "
+#                         f"{len(sig_clusters)} sig cluster(s), {n_sig_bins} bins "
+#                         f"(p<0.05)"
+#                     )
+#                 else:
+#                     ax_diff.set_title(
+#                         "ACTIVE − SHAM\ncluster permutation: F, tail=0, no significant clusters",
+#                         fontsize=10, fontweight="bold",
+#                     )
+#                     print(f"      Cluster permutation [{ch}, {bl_name}]: no significant clusters")
+
+#                 fig.suptitle(
+#                     f"{participant_id} – {session_name}  |  {ch}  TFR  [Morlet]  |  "
+#                     f"baseline: {bl_name}",
+#                     fontsize=12,
+#                     fontweight="bold",
+#                 )
+#                 fig.tight_layout()
+#                 fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches="tight")
+#                 plt.close(fig)
+#                 print(f"      Saved TFR sham/active/diff: {fname}")
+
+#         # ── FOCUS-channel per-trial diff figures (larger panels, writeup-ready) ──
+#         # Runs once for EACH channel in focus_channels (e.g. C4, C3, Cz, F3, F4, Fz —
+#         # whichever of FOCUS_CHANNEL_PRIORITY are present), not just a single winner.
+#         for fch in focus_channels:
+#             key_sham_focus = (fch, "sham")
+#             key_active_focus = (fch, "active")
+#             if key_sham_focus not in raw_power or key_active_focus not in raw_power:
+#                 continue
+
+#             power_sham_focus = apply_tfr_baseline(raw_power[key_sham_focus], bl_start, bl_end)
+#             power_active_focus = apply_tfr_baseline(raw_power[key_active_focus], bl_start, bl_end)
+#             n_pairs_focus = min(power_sham_focus.shape[0], power_active_focus.shape[0])
+#             sig_mask_focus = sig_masks_by_ch.get(fch)
+#             sig_clusters_focus = sig_clusters_by_ch.get(fch, [])
+
+#             if n_pairs_focus < 1:
+#                 continue
+
+#             fname_diff_focus = (
+#                 f"{participant_id}_{session_name}_{suffix}_"
+#                 f"TFR_per_trial_diff_FOCUS_{fch}_{bl_name}.png"
+#             )
+#             if _already_done(output_dir, fname_diff_focus):
+#                 continue
+
+#             trial_diffs_focus = (
+#                 power_active_focus[:n_pairs_focus] - power_sham_focus[:n_pairs_focus]
+#             )
+
+#             n_show_focus = min(n_pairs_focus, 12)
+#             ncols = 3
+#             nrows = int(np.ceil(n_show_focus / ncols))
+#             fig, axes = plt.subplots(
+#                 nrows, ncols,
+#                 figsize=(ncols * 5.5, nrows * 4.5),
+#                 sharex=True, sharey=True,
+#             )
+#             axes = np.array(axes).ravel()
+
+#             vmax_focus_diff = np.nanpercentile(
+#                 np.abs(trial_diffs_focus[:n_show_focus]), 97
+#             )
+#             vmax_focus_diff = vmax_focus_diff if vmax_focus_diff > 0 else 1.0
+
+#             for ti in range(n_show_focus):
+#                 ax = axes[ti]
+#                 pcm = ax.pcolormesh(
+#                     times, freqs, trial_diffs_focus[ti],
+#                     cmap="RdBu_r", vmin=-vmax_focus_diff, vmax=vmax_focus_diff,
+#                     shading="gouraud",
+#                 )
+#                 ax.axvline(0, color="black", lw=1.0, ls="--", alpha=0.8)
+#                 ax.axhspan(freq_band[0], freq_band[1], color="yellow", alpha=0.12)
+#                 if sig_mask_focus is not None and sig_mask_focus.any():
+#                     ax.contour(
+#                         times, freqs, sig_mask_focus.astype(float),
+#                         levels=[0.5], colors="black", linewidths=1.4,
+#                     )
+#                 ax.set_title(f"Trial pair {ti+1}", fontsize=10)
+#                 ax.set_xlabel("Time (s)")
+#                 if ti % ncols == 0:
+#                     ax.set_ylabel("Frequency (Hz)")
+
+#             for j in range(n_show_focus, len(axes)):
+#                 axes[j].set_visible(False)
+
+#             fig.colorbar(
+#                 pcm, ax=axes[:n_show_focus].tolist(),
+#                 label="Δ dB (active − sham)", fraction=0.02, pad=0.02,
+#             )
+
+#             if sig_clusters_focus:
+#                 p_str = ', '.join(f'p={p:.3f}' for _, p in sig_clusters_focus)
+#                 sig_note_focus = f'{len(sig_clusters_focus)} sig. cluster(s), {p_str}'
+#             else:
+#                 sig_note_focus = 'no significant clusters'
+#             fig.suptitle(
+#                 f"{participant_id} – {session_name}  |  FOCUS: {fch}  "
+#                 f"per-trial ACTIVE − SHAM  |  baseline: {bl_name}\n"
+#                 f"(paired by trial order, n={n_pairs_focus}; black contour = cluster-perm sig.)\n"
+#                 f"cluster permutation: F, tail=0, {sig_note_focus}",
+#                 fontsize=11, fontweight="bold",
+#             )
+#             fig.savefig(
+#                 Path(output_dir) / fname_diff_focus, dpi=150, bbox_inches="tight"
+#             )
+#             plt.close(fig)
+#             print(f"      Saved FOCUS per-trial ACTIVE−SHAM diff TFR: {fname_diff_focus}")
+
+#         # ── per-trial + topomap plots (unchanged, now looped over ALL focus_channels) ──
+#         for fch in focus_channels:
+#             for group_label, condition_set in [
+#                 ("sham", SHAM_CONDITIONS),
+#                 ("active", ACTIVE_CONDITIONS),
+#             ]:
+#                 key_focus = (fch, group_label)
+#                 if key_focus in raw_power:
+#                     power_3d_focus = apply_tfr_baseline(
+#                         raw_power[key_focus], bl_start, bl_end
+#                     )
+#                     n_focus_trials = power_3d_focus.shape[0]
+#                     n_show = min(n_focus_trials, 16)
+
+#                     fname_pertrial = (
+#                         f"{participant_id}_{session_name}_{suffix}_"
+#                         f"TFR_per_trial_{fch}_{group_label}_{bl_name}.png"
+#                     )
+#                     if not _already_done(output_dir, fname_pertrial):
+#                         ncols = 4
+#                         nrows = int(np.ceil(n_show / ncols))
+#                         fig, axes = plt.subplots(
+#                             nrows, ncols,
+#                             figsize=(ncols * 4, nrows * 3),
+#                             sharex=True, sharey=True,
+#                         )
+#                         axes = np.array(axes).ravel()
+#                         vmax_focus = np.nanpercentile(np.abs(power_3d_focus), 97)
+#                         for ti in range(n_show):
+#                             ax = axes[ti]
+#                             ax.pcolormesh(
+#                                 times, freqs, power_3d_focus[ti],
+#                                 cmap="RdBu_r", vmin=-vmax_focus, vmax=vmax_focus,
+#                                 shading="gouraud",
+#                             )
+#                             ax.axvline(0, color="white", lw=0.8, ls="--", alpha=0.7)
+#                             ax.set_title(f"Trial {ti+1}", fontsize=8)
+#                         for j in range(n_show, len(axes)):
+#                             axes[j].set_visible(False)
+#                         fig.suptitle(
+#                             f"{participant_id} – {session_name}  |  {fch}  "
+#                             f"per-trial TFR  [{group_label.upper()}]  |  baseline: {bl_name}",
+#                             fontsize=11, fontweight="bold",
+#                         )
+#                         fig.tight_layout()
+#                         fig.savefig(
+#                             Path(output_dir) / fname_pertrial, dpi=150, bbox_inches="tight"
+#                         )
+#                         plt.close(fig)
+#                         print(f"      Saved per-trial TFR: {fname_pertrial}")
+
+#                     for band_name, (b_low, b_high) in TFR_BANDS.items():
+#                         freq_mask = (freqs >= b_low) & (freqs <= b_high)
+#                         if not freq_mask.any():
+#                             continue
+#                         trial_bp = power_3d_focus[:, freq_mask, :][
+#                             :, :, hab_start_idx:hab_end_idx
+#                         ].mean(axis=(1, 2))
+#                         _habituation_plot(
+#                             trial_amplitudes=trial_bp,
+#                             trial_numbers=np.arange(1, len(trial_bp) + 1),
+#                             ch_name=fch,
+#                             condition=group_label,
+#                             session_name=session_name,
+#                             participant_id=participant_id,
+#                             output_dir=output_dir,
+#                             suffix=f"{suffix}_{bl_name}",
+#                             kind=band_name,
+#                         )
+
+#         if info_topo is not None:
+#             for group_label, condition_set in [
+#                 ("sham", SHAM_CONDITIONS),
+#                 ("active", ACTIVE_CONDITIONS),
+#             ]:
+#                 for band_name, (b_low, b_high) in TFR_BANDS.items():
+#                     freq_mask = (freqs >= b_low) & (freqs <= b_high)
+#                     if not freq_mask.any():
+#                         continue
+#                     fname_topo = (
+#                         f"{participant_id}_{session_name}_{suffix}_"
+#                         f"TFR_topomap_{group_label}_{band_name}_{bl_name}.png"
+#                     )
+#                     if _already_done(output_dir, fname_topo):
+#                         continue
+#                     topo_vals = {}
+#                     for ch in topo_chs:
+#                         key = (ch, group_label)
+#                         if key not in raw_power:
+#                             continue
+#                         p3d = apply_tfr_baseline(raw_power[key], bl_start, bl_end)
+#                         topo_vals[ch] = float(
+#                             p3d[:, freq_mask, :][:, :, hab_start_idx:hab_end_idx].mean()
+#                         )
+#                     vals_arr = np.array([topo_vals.get(ch, np.nan) for ch in topo_chs])
+#                     valid_mask = ~np.isnan(vals_arr)
+#                     if not valid_mask.any():
+#                         continue
+
+#                     vals_valid = vals_arr[valid_mask]
+#                     chs_valid = [ch for ch, ok in zip(topo_chs, valid_mask) if ok]
+#                     info_valid = mne.create_info(
+#                         chs_valid, sfreq=info_topo["sfreq"], ch_types="eeg"
+#                     )
+#                     montage_t = mne.channels.make_standard_montage("standard_1020")
+#                     info_valid.set_montage(montage_t, on_missing="ignore")
+
+#                     vlim_tfr = np.nanpercentile(np.abs(vals_valid), 95)
+#                     vlim_tfr = vlim_tfr if vlim_tfr > 0 else 1.0
+
+#                     fig, ax = plt.subplots(figsize=(5, 4))
+#                     im, _ = mne.viz.plot_topomap(
+#                         vals_valid, info_valid, axes=ax, show=False,
+#                         cmap="RdBu_r", vlim=(-vlim_tfr, vlim_tfr),
+#                     )
+#                     fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04, label="dB (re: baseline)")
+#                     ax.set_title(
+#                         f"{group_label}  |  {band_name}  power (0–{HABITUATION_WINDOW_SEC[1]:.0f} s)\n"
+#                         f"baseline: {bl_name}  |  n={valid_mask.sum()} channels",
+#                         fontsize=9,
+#                     )
+#                     fig.tight_layout()
+#                     fig.savefig(Path(output_dir) / fname_topo, dpi=150, bbox_inches="tight")
+#                     plt.close(fig)
+#                     print(f"      Saved TFR topomap: {fname_topo}")
 
 # def plot_tfrs(
 #     raw,
