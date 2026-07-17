@@ -410,8 +410,8 @@ def _cluster_permutation_tfr_2samp(power_a, power_b, n_permutations=5000,
     return sig_mask, sig_clusters
 
 def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
-                                   ch_names, info, n_permutations=5000, seed=42,
-                                   n_jobs=-1, decim=1, adjacency=None):
+                                   ch_names, info, n_permutations=500, seed=42,
+                                   n_jobs=-1, decim=1, adjacency=None, times=None):
     """
     Spatio-temporal cluster test (active vs sham) across channels AND time,
     used to decide which channels get a significance marker on a topomap.
@@ -433,26 +433,42 @@ def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
         repeatedly with the same `info` (e.g. once per band in a loop) so
         the adjacency graph isn't rebuilt from scratch every call. If None
         (default), it's computed internally as before.
+    times : optional, 1D array of length n_times matching the time axis of
+        trials_by_channel_a/b (e.g. in ms), taken BEFORE binning. If
+        provided, it's binned the same way as the data (mean per bin) and
+        returned as bin_times, alongside ch_time_sig — a per-channel,
+        per-bin significance mask. This lets a caller with a time-evolution
+        figure mark only the frames that actually fall inside a significant
+        cluster, instead of blanket-marking every post-test frame with the
+        same any-time result. If None (default), ch_time_sig and bin_times
+        are both None — use this for single-topomap callers that don't need
+        per-frame resolution (e.g. an RMS-amplitude topomap).
     Returns:
-        ch_sig : dict[ch] -> bool (True if that channel falls inside >=1
-            significant spatio-temporal cluster at any time point).
-        min_p  : float or None. The smallest cluster p-value observed
+        ch_sig      : dict[ch] -> bool (True if that channel falls inside
+            >=1 significant spatio-temporal cluster at any time point).
+        min_p       : float or None. The smallest cluster p-value observed
             (regardless of whether it cleared the 0.05 threshold), so
             captions can report the actual statistic rather than just a
             channel count. None if the test couldn't be run at all (too
             few channels/trials, or the test raised an exception).
+        ch_time_sig : dict[ch] -> boolean array of shape (n_bins,), True at
+            bins that fall inside a significant cluster for that channel.
+            None if `times` wasn't provided or the test couldn't be run.
+        bin_times   : 1D array of length n_bins — the binned time value
+            (mean of the original time points within each bin) for each
+            entry in ch_time_sig's arrays. None if not applicable.
     """
 
  
     common = [ch for ch in ch_names
               if ch in trials_by_channel_a and ch in trials_by_channel_b]
     if len(common) < 3:
-        return {ch: False for ch in ch_names}, None
+        return {ch: False for ch in ch_names}, None, None, None
  
     n_a = min(len(trials_by_channel_a[ch]) for ch in common)
     n_b = min(len(trials_by_channel_b[ch]) for ch in common)
     if n_a < 3 or n_b < 3:
-        return {ch: False for ch in ch_names}, None
+        return {ch: False for ch in ch_names}, None, None, None
 
     def _bin_time(arr, decim):
         """Average non-overlapping bins of `decim` samples along axis=1."""
@@ -468,6 +484,15 @@ def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
     # shape needed by spatio_temporal_cluster_test: (n_trials, n_times, n_channels)
     Xa = np.stack([_bin_time(trials_by_channel_a[ch][:n_a], decim) for ch in common], axis=-1)
     Xb = np.stack([_bin_time(trials_by_channel_b[ch][:n_b], decim) for ch in common], axis=-1)
+
+    bin_times = None
+    if times is not None:
+        times_arr = np.asarray(times, dtype=float)
+        n_bins = (len(times_arr) // decim) if decim > 1 else len(times_arr)
+        if decim > 1 and n_bins >= 1:
+            bin_times = times_arr[:n_bins * decim].reshape(n_bins, decim).mean(axis=1)
+        else:
+            bin_times = times_arr[:Xa.shape[1]]
  
     try:
         if adjacency is None:
@@ -479,17 +504,22 @@ def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
         )
     except Exception as exc:
         print(f'    Spatio-temporal cluster test failed: {exc}')
-        return {ch: False for ch in ch_names}, None
- 
+        return {ch: False for ch in ch_names}, None, None, None
+
+    n_bins_result = Xa.shape[1]
     ch_sig = {ch: False for ch in ch_names}
+    ch_time_sig = ({ch: np.zeros(n_bins_result, dtype=bool) for ch in ch_names}
+                   if bin_times is not None else None)
     for c, p in zip(clusters, cluster_pv):
         if p < 0.05:
             ch_mask_any_time = c.any(axis=0)  # (n_channels,)
-            for ch, is_sig in zip(common, ch_mask_any_time):
+            for ch_idx, (ch, is_sig) in enumerate(zip(common, ch_mask_any_time)):
                 if is_sig:
                     ch_sig[ch] = True
+                if ch_time_sig is not None:
+                    ch_time_sig[ch] |= c[:, ch_idx]  # (n_bins,) for this channel
     min_p = float(np.min(cluster_pv)) if len(cluster_pv) else None
-    return ch_sig, min_p
+    return ch_sig, min_p, ch_time_sig, bin_times
 
 # def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
 #                                    ch_names, info, n_permutations=5000, seed=42):
@@ -3195,10 +3225,11 @@ def plot_erp_topomap_evolution(raw, bursts_df, freq_band, session_name, particip
 
         info_topo_evo = mne.create_info(topo_chs, sfreq=sfreq, ch_types='eeg')
         info_topo_evo.set_montage(montage, on_missing='ignore')
-        ch_sig, cluster_p = _spatio_temporal_cluster_mask(
+        ch_sig, cluster_p, ch_time_sig, bin_times = _spatio_temporal_cluster_mask(
             trials_active, trials_sham,
             ch_names=topo_chs, info=info_topo_evo,
-            n_permutations=5000,
+            n_permutations=5000, decim=25,  # 500Hz / 25 -> 50ms bins
+            times=times_ms[pre_samples:],
         )
         sig_channels = {ch for ch, is_sig in ch_sig.items() if is_sig}
 
@@ -3249,12 +3280,18 @@ def plot_erp_topomap_evolution(raw, bursts_df, freq_band, session_name, particip
             info_valid = mne.create_info(chs_valid, sfreq=sfreq, ch_types='eeg')
             info_valid.set_montage(montage, on_missing='ignore')
 
-            # Only mark significance on post-stimulus frames — the cluster
-            # test above was run on the post_samples: window, so pre-stim
-            # (baseline) frames have no corresponding test result.
+            # Mark significance per-frame: look up the nearest tested time
+            # bin and only mark channels that are significant AT THAT BIN,
+            # rather than blanket-marking every post-stim frame with the
+            # channel's any-time result. Pre-stim frames (t_ms < 0) have no
+            # corresponding bin, since the test only covers times_ms[pre_samples:].
             sig_mask_arr = None
-            if sig_channels and t_ms >= 0:
-                candidate = np.array([ch in sig_channels for ch in chs_valid], dtype=bool)
+            if ch_time_sig is not None and bin_times is not None and t_ms >= 0:
+                bin_idx = int(np.argmin(np.abs(bin_times - t_ms)))
+                candidate = np.array([
+                    ch in ch_time_sig and ch_time_sig[ch][bin_idx]
+                    for ch in chs_valid
+                ], dtype=bool)
                 if candidate.any():
                     sig_mask_arr = candidate
 
@@ -3284,7 +3321,8 @@ def plot_erp_topomap_evolution(raw, bursts_df, freq_band, session_name, particip
             f'+{ERP_TOPO_TIMECOURSE_POST_MS} ms  (step: {ERP_TOPO_TIMECOURSE_STEP_MS} ms)'
         )
         if sig_channels:
-            suptitle += f'\n{len(sig_channels)} sig. channel(s), cluster p={cluster_p:.3f} (spatio-temporal permutation test, post-stim window)'
+            suptitle += (f'\n{len(sig_channels)} sig. channel(s) overall, cluster p={cluster_p:.3f} '
+                         f'(dots shown only on frames within the significant time window)')
         elif cluster_p is not None:
             suptitle += f'\nno significant cluster (smallest cluster p={cluster_p:.3f})'
         fig.suptitle(suptitle, fontsize=12, fontweight='bold')
@@ -3750,28 +3788,28 @@ def run_butterfly_for_participant(participant_id, target, session_name,
     )
 
 def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_dir, suffix=''):
-
+ 
     if 'burst_time_s' not in bursts_df.columns:
         print('    plot_erps: burst_time_s column missing — skipping')
         return None
     bursts_df['burst_time_s'] = pd.to_numeric(bursts_df['burst_time_s'], errors='coerce')
     bursts_df = bursts_df.dropna(subset=['burst_time_s'])
-
+ 
     channels = [raw.ch_names[i] for i in mne.pick_types(raw.info, eeg=True, exclude='bads')
             if raw.ch_names[i] not in EXCLUDE_CHANNELS]
     if not channels or bursts_df.empty:
         return None
-
+ 
     sfreq        = raw.info['sfreq']
     pre_samples  = int(TUS_EPOCH_PRE_SEC * sfreq)
     post_samples = int(TUS_EPOCH_POST_SEC * sfreq)
     n_samples    = pre_samples + post_samples
     times        = np.linspace(-TUS_EPOCH_PRE_SEC, TUS_EPOCH_POST_SEC, n_samples,  endpoint=False)
     times_ms     = times * 1000
-
+ 
     hab_start = pre_samples + int(HABITUATION_WINDOW_SEC[0] * sfreq)
     hab_end   = pre_samples + int(HABITUATION_WINDOW_SEC[1] * sfreq)
-
+ 
     montage   = mne.channels.make_standard_montage('standard_1020')
     known_chs = set(montage.ch_names)
     topo_chs  = [ch for ch in channels if ch in known_chs]
@@ -3779,7 +3817,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
     if len(topo_chs) >= 3:
         info_topo = mne.create_info(topo_chs, sfreq=sfreq, ch_types='eeg')
         info_topo.set_montage(montage, on_missing='ignore')
-
+ 
     all_epochs = {ch: {} for ch in channels}
     for group_label, condition_set in [('sham', SHAM_CONDITIONS), ('active', ACTIVE_CONDITIONS)]:
         mask     = bursts_df['condition'].isin(condition_set)
@@ -3799,26 +3837,26 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 trial = raw.get_data(picks=[ch_idx], start=start, stop=stop)[0] * 1e6
                 trials.append(trial)
             all_epochs[ch][group_label] = np.array(trials)
-
+ 
     focus_channel_by_condition = {}
     xlim_ms = (ERP_DISPLAY_XLIM_SEC[0] * 1000, ERP_DISPLAY_XLIM_SEC[1] * 1000)
-
+ 
     # target = 'thalamus' or 'ventricle', derived from session_name
     # (session_name is always f'{participant_id}_{target}', set in process_participant)
     target = (session_name[len(participant_id) + 1:]
               if session_name.startswith(participant_id + '_') else session_name)
-
+ 
     for baseline_name, baseline_mode in ERP_BASELINES.items():
         print(f'\n    ERP baseline: {baseline_name}')
-
+ 
         mean_erps_by_condition    = {}
         clean_trials_by_condition = {}
         peak_amp_by_condition     = {}
-
+ 
         for group_label in ('sham', 'active'):
             mean_erps               = []
             clean_trials_by_channel = []
-
+ 
             BAD_CHANNEL_REJECTION_RATE = 0.30
             n_trials      = all_epochs[channels[0]][group_label].shape[0]
             good_channels = []
@@ -3843,7 +3881,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     bad_channels.append((ch, round(rejection_rate * 100, 1)))
                 else:
                     good_channels.append(ch)
-
+ 
             if bad_channels:
                 print(f'      [{group_label}] Excluded noisy channels '
                       f'(>{BAD_CHANNEL_REJECTION_RATE*100:.0f}% trials rejected):')
@@ -3851,7 +3889,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     print(f'        {ch}: {pct}% rejected')
             print(f'      [{group_label}] Clean channels for ERP: '
                   f'{len(good_channels)} / {len(channels)}')
-
+ 
             if not good_channels:
                 print(f'      [{group_label}] No clean channels — skipping')
                 for ch in channels:
@@ -3861,7 +3899,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 clean_trials_by_condition[group_label] = clean_trials_by_channel
                 peak_amp_by_condition[group_label]     = {ch: np.nan for ch in channels}
                 continue
-
+ 
             global_keep = np.ones(n_trials, dtype=bool)
             for ch in good_channels:
                 raw_trials  = all_epochs[ch][group_label].copy()
@@ -3871,11 +3909,11 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 trial_keep    = np.zeros(n_trials, dtype=bool)
                 trial_keep[np.where(finite_mask)[0][noise_mask]] = True
                 global_keep  &= trial_keep
-
+ 
             n_kept = int(global_keep.sum())
             print(f'      [{group_label}] Global trial mask: {n_kept} / {n_trials} trials kept '
                   f'(across {len(good_channels)} clean channels)')
-
+ 
             for ch in channels:
                 raw_trials = all_epochs[ch][group_label].copy()
                 corrected  = _apply_erp_baseline(raw_trials, pre_samples, baseline_mode, sfreq)
@@ -3885,26 +3923,26 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     clean.mean(axis=0) if (len(clean) and not np.all(np.isnan(clean)))
                     else np.full(n_samples, np.nan)
                 )
-
+ 
             mean_erps_by_condition[group_label]    = mean_erps
             clean_trials_by_condition[group_label] = clean_trials_by_channel
-
+ 
             # Rank channels by peak |amplitude| within the displayed post-stimulus window
             ranked_chs, scores = _rank_channels_by_window(mean_erps, channels, times, (0.0, ERP_DISPLAY_XLIM_SEC[1]))
             peak_amp_by_condition[group_label] = scores
             if group_label == 'active':
                 focus_channel_by_condition['active'] = ranked_chs[0]
-
+ 
             print(f'      [{group_label}] Channel ranking (peak |ERP|, 0–{int(ERP_DISPLAY_XLIM_SEC[1]*1000)}ms):')
             for i, rc in enumerate(ranked_chs[:5], 1):
                 print(f'        {i}. {rc}  {scores[rc]:.2f} µV')
-
+ 
             # Cache traces for the thalamus-vs-ventricle participant-level comparison
             _save_erp_traces_npz(
                 mean_erps, clean_trials_by_channel, channels, times,
                 participant_id, target, group_label, baseline_name, output_dir
             )
-
+ 
             _habituation_plot_all_channels(
                 all_epochs=all_epochs,
                 channels=channels,
@@ -3921,13 +3959,13 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 kind='ERP',
                 best_channel=ranked_chs[0],
             )
-
+ 
         # ── Combined sham+active overlay figures (all / top10 / top3) ──────
         if 'active' in mean_erps_by_condition and 'sham' in mean_erps_by_condition:
             active_ranked, _ = _rank_channels_by_window(
                 mean_erps_by_condition['active'], channels, times, (0.0, ERP_DISPLAY_XLIM_SEC[1])
             )
-
+ 
             # ── spatio-temporal cluster test (active vs sham) for topomap markers ──
             # Computed once per (session, baseline); active and sham topomaps
             # share the same significance mask since the test itself compares
@@ -3944,14 +3982,14 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                             and not np.all(np.isnan(a)) and not np.all(np.isnan(s))):
                         trials_by_channel_active[ch] = a[:, pre_samples:]
                         trials_by_channel_sham[ch]   = s[:, pre_samples:]
-
-                ch_sig, cluster_p = _spatio_temporal_cluster_mask(
+ 
+                ch_sig, cluster_p, _, _ = _spatio_temporal_cluster_mask(
                     trials_by_channel_active, trials_by_channel_sham,
                     ch_names=topo_chs, info=info_topo,
-                    n_permutations=5000,
+                    n_permutations=5000, decim=25,  # 500Hz / 25 -> 50ms bins
                 )
                 sig_channels = {ch for ch, is_sig in ch_sig.items() if is_sig}
-
+ 
                 _erp_topomap(
                     peak_amp_by_condition['active'], topo_chs, info_topo,
                     session_name, participant_id, output_dir,
@@ -3964,32 +4002,32 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     suffix, 'sham', baseline_name,
                     sig_channels=sig_channels, cluster_p=cluster_p,
                 )
-
+ 
             plot_sets = [
                 ('all_channels', channels),
                 ('top10', active_ranked[:10]),
                 ('top3', active_ranked[:3]),
             ]
-
+ 
             for subset_name, ch_list in plot_sets:
                 if not ch_list:
                     continue
                 fname = f'{participant_id}_{session_name}_{suffix}_ERP_{baseline_name}_{subset_name}.png'
                 if _already_done(output_dir, fname):
                     continue
-
+ 
                 ncols = 3 if subset_name != 'top3' else 1
                 nrows = int(np.ceil(len(ch_list) / ncols))
                 fig, axes = plt.subplots(nrows, ncols, figsize=(7 * ncols, 4 * nrows),
                                           sharex=True, squeeze=False)
                 axes_flat = axes.ravel()
-
+ 
                 show_error_bands = (subset_name == 'top3')
-
+ 
                 for idx_ch, ch in enumerate(ch_list):
                     ax = axes_flat[idx_ch]
                     ch_idx = channels.index(ch)
-
+ 
                     sham_clean = clean_trials_by_condition['sham'][ch_idx]
                     sham_mean  = mean_erps_by_condition['sham'][ch_idx]
                     clusters = _cluster_permutation_1d(clean_trials_by_condition['active'][ch_idx],clean_trials_by_condition['sham'][ch_idx],)
@@ -4000,7 +4038,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                         ax.fill_between(times_ms, sham_mean - sham_sem, sham_mean + sham_sem,
                                          color='#4B7BE0', alpha=0.2)
                     ax.plot(times_ms, sham_mean, color='#4B7BE0', lw=1.4, label='Sham')
-
+ 
                     act_clean = clean_trials_by_condition['active'][ch_idx]
                     act_mean  = mean_erps_by_condition['active'][ch_idx]
                     if show_error_bands:
@@ -4009,7 +4047,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                         ax.fill_between(times_ms, act_mean - act_sem, act_mean + act_sem,
                                          color='#E04B4B', alpha=0.2)
                     ax.plot(times_ms, act_mean, color='#E04B4B', lw=1.4, label='Active')
-
+ 
                     ax.axvline(0, color='black', lw=1.0, ls='--', alpha=0.7)
                     ax.axhline(0, color='grey', lw=0.5, ls=':')
                     ax.set_xlim(*xlim_ms)
@@ -4018,13 +4056,13 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                     ax.tick_params(labelsize=7)
                     if idx_ch == 0:
                         ax.legend(fontsize=8, loc='upper right')
-
+ 
                 for idx_remaining in range(len(ch_list), nrows * ncols):
                     axes_flat[idx_remaining].set_visible(False)
                 for ax in axes_flat:
                     if ax.get_visible():
                         ax.set_xlabel('Time (ms)', fontsize=8)
-
+ 
                 fig.suptitle(
                     f'{participant_id} – {session_name}  |  ERP  [baseline: {baseline_name}]\n'
                     f'{subset_name.replace("_", " ").title()}  |  Active vs Sham',
@@ -4034,7 +4072,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 fig.savefig(Path(output_dir) / fname, dpi=150, bbox_inches='tight')
                 plt.close(fig)
                 print(f'      Saved ERP figure: {fname}')
-
+ 
             _plot_erp_difference(
                 mean_erps_by_condition['active'], mean_erps_by_condition['sham'],
                 channels, times, pre_samples,
@@ -4046,7 +4084,7 @@ def plot_erps(raw, bursts_df, freq_band, session_name, participant_id, output_di
                 session_name, participant_id, output_dir, suffix, baseline_name,
                 t_min=ERP_DISPLAY_XLIM_SEC[0], t_max=ERP_DISPLAY_XLIM_SEC[1],
             )
-
+ 
     for ch in FOCUS_CHANNEL_PRIORITY:
         if ch in channels:
             return ch
@@ -4781,16 +4819,18 @@ def plot_tfrs(
             # ── This is the inferential figure. Uses per-trial, per-timepoint ──
             # ── band power within the habituation window (not the ──
             # ── time-collapsed mean), so the cluster test has temporal ──
-            # ── structure to work with.  
+            # ── structure to work with.                                     ──
+            #
             # The adjacency graph only depends on the channel layout
             # (info_topo), not on band or trial data, so it's computed once
             # here rather than being rebuilt inside _spatio_temporal_cluster_mask
             # on every band iteration.
             try:
-                tfr_adjacency, _ = find_ch_adjacency(info_topo, ch_type='eeg')  
+                tfr_adjacency, _ = find_ch_adjacency(info_topo, ch_type='eeg')
             except Exception as exc:
                 print(f'    find_ch_adjacency failed: {exc}')
-                tfr_adjacency = None                                 
+                tfr_adjacency = None
+
             for band_name, (b_low, b_high) in TFR_BANDS.items():
                 freq_mask = (freqs >= b_low) & (freqs <= b_high)
                 if not freq_mask.any():
@@ -4827,10 +4867,11 @@ def plot_tfrs(
                 if not diff_vals:
                     continue
 
-                ch_sig, cluster_p = _spatio_temporal_cluster_mask(
+                ch_sig, cluster_p, _, _ = _spatio_temporal_cluster_mask(
                     trials_by_channel_active, trials_by_channel_sham,
                     ch_names=topo_chs, info=info_topo,
-                    n_permutations=5000, adjacency=tfr_adjacency,
+                    n_permutations=5000, decim=10,  # 500Hz / 10 -> 20ms bins
+                    adjacency=tfr_adjacency,
                 )
                 sig_channels = {ch for ch, is_sig in ch_sig.items() if is_sig}
 
