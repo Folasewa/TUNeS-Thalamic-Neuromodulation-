@@ -410,12 +410,29 @@ def _cluster_permutation_tfr_2samp(power_a, power_b, n_permutations=5000,
     return sig_mask, sig_clusters
 
 def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
-                                   ch_names, info, n_permutations=5000, seed=42):
+                                   ch_names, info, n_permutations=5000, seed=42,
+                                   n_jobs=-1, decim=1, adjacency=None):
     """
     Spatio-temporal cluster test (active vs sham) across channels AND time,
     used to decide which channels get a significance marker on a topomap.
  
     trials_by_channel_a/b : dict[ch] -> array (n_trials, n_times)
+    n_jobs : passed to spatio_temporal_cluster_test. -1 uses all available
+        cores. Set to 1 if you're already parallelizing at a higher level
+        (e.g. running multiple sessions concurrently) to avoid oversubscribing.
+    decim : int, downsample the time axis by averaging non-overlapping bins
+        of this many samples before running the test. Cluster-finding cost
+        scales with n_times * n_channels * n_permutations, and testing at
+        raw sample resolution (e.g. 2500 samples for a 5s window at 500Hz)
+        is both far finer than meaningful for a cluster test and the main
+        driver of slow runtimes at high permutation counts. E.g. decim=25
+        at 500 Hz -> 50ms bins. decim=1 (default) disables binning, i.e.
+        the original sample-by-sample behavior.
+    adjacency : optional, a precomputed channel adjacency (as returned by
+        find_ch_adjacency). Pass this in when calling this function
+        repeatedly with the same `info` (e.g. once per band in a loop) so
+        the adjacency graph isn't rebuilt from scratch every call. If None
+        (default), it's computed internally as before.
     Returns:
         ch_sig : dict[ch] -> bool (True if that channel falls inside >=1
             significant spatio-temporal cluster at any time point).
@@ -436,16 +453,29 @@ def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
     n_b = min(len(trials_by_channel_b[ch]) for ch in common)
     if n_a < 3 or n_b < 3:
         return {ch: False for ch in ch_names}, None
- 
+
+    def _bin_time(arr, decim):
+        """Average non-overlapping bins of `decim` samples along axis=1."""
+        if decim <= 1:
+            return arr
+        n_t = arr.shape[1]
+        n_bins = n_t // decim
+        if n_bins < 1:
+            return arr
+        trimmed = arr[:, :n_bins * decim]
+        return trimmed.reshape(arr.shape[0], n_bins, decim).mean(axis=2)
+
     # shape needed by spatio_temporal_cluster_test: (n_trials, n_times, n_channels)
-    Xa = np.stack([trials_by_channel_a[ch][:n_a] for ch in common], axis=-1)
-    Xb = np.stack([trials_by_channel_b[ch][:n_b] for ch in common], axis=-1)
+    Xa = np.stack([_bin_time(trials_by_channel_a[ch][:n_a], decim) for ch in common], axis=-1)
+    Xb = np.stack([_bin_time(trials_by_channel_b[ch][:n_b], decim) for ch in common], axis=-1)
  
     try:
-        adjacency, _ = find_ch_adjacency(info, ch_type='eeg')
+        if adjacency is None:
+            adjacency, _ = find_ch_adjacency(info, ch_type='eeg')
         _, clusters, cluster_pv, _ = spatio_temporal_cluster_test(
             [Xa, Xb], n_permutations=n_permutations, tail=0,
             adjacency=adjacency, seed=seed, out_type='mask', verbose=False,
+            n_jobs=n_jobs,
         )
     except Exception as exc:
         print(f'    Spatio-temporal cluster test failed: {exc}')
@@ -460,6 +490,58 @@ def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
                     ch_sig[ch] = True
     min_p = float(np.min(cluster_pv)) if len(cluster_pv) else None
     return ch_sig, min_p
+
+# def _spatio_temporal_cluster_mask(trials_by_channel_a, trials_by_channel_b,
+#                                    ch_names, info, n_permutations=5000, seed=42):
+#     """
+#     Spatio-temporal cluster test (active vs sham) across channels AND time,
+#     used to decide which channels get a significance marker on a topomap.
+ 
+#     trials_by_channel_a/b : dict[ch] -> array (n_trials, n_times)
+#     Returns:
+#         ch_sig : dict[ch] -> bool (True if that channel falls inside >=1
+#             significant spatio-temporal cluster at any time point).
+#         min_p  : float or None. The smallest cluster p-value observed
+#             (regardless of whether it cleared the 0.05 threshold), so
+#             captions can report the actual statistic rather than just a
+#             channel count. None if the test couldn't be run at all (too
+#             few channels/trials, or the test raised an exception).
+#     """
+
+ 
+#     common = [ch for ch in ch_names
+#               if ch in trials_by_channel_a and ch in trials_by_channel_b]
+#     if len(common) < 3:
+#         return {ch: False for ch in ch_names}, None
+ 
+#     n_a = min(len(trials_by_channel_a[ch]) for ch in common)
+#     n_b = min(len(trials_by_channel_b[ch]) for ch in common)
+#     if n_a < 3 or n_b < 3:
+#         return {ch: False for ch in ch_names}, None
+ 
+#     # shape needed by spatio_temporal_cluster_test: (n_trials, n_times, n_channels)
+#     Xa = np.stack([trials_by_channel_a[ch][:n_a] for ch in common], axis=-1)
+#     Xb = np.stack([trials_by_channel_b[ch][:n_b] for ch in common], axis=-1)
+ 
+#     try:
+#         adjacency, _ = find_ch_adjacency(info, ch_type='eeg')
+#         _, clusters, cluster_pv, _ = spatio_temporal_cluster_test(
+#             [Xa, Xb], n_permutations=n_permutations, tail=0,
+#             adjacency=adjacency, seed=seed, out_type='mask', verbose=False,
+#         )
+#     except Exception as exc:
+#         print(f'    Spatio-temporal cluster test failed: {exc}')
+#         return {ch: False for ch in ch_names}, None
+ 
+#     ch_sig = {ch: False for ch in ch_names}
+#     for c, p in zip(clusters, cluster_pv):
+#         if p < 0.05:
+#             ch_mask_any_time = c.any(axis=0)  # (n_channels,)
+#             for ch, is_sig in zip(common, ch_mask_any_time):
+#                 if is_sig:
+#                     ch_sig[ch] = True
+#     min_p = float(np.min(cluster_pv)) if len(cluster_pv) else None
+#     return ch_sig, min_p
 
 def _shade_significant_clusters(ax, times, clusters, color='#F1C40F', alpha=0.18):
     """Shade [start,end] windows returned by _cluster_permutation_1d, and
@@ -4699,7 +4781,16 @@ def plot_tfrs(
             # ── This is the inferential figure. Uses per-trial, per-timepoint ──
             # ── band power within the habituation window (not the ──
             # ── time-collapsed mean), so the cluster test has temporal ──
-            # ── structure to work with.                                     ──
+            # ── structure to work with.  
+            # The adjacency graph only depends on the channel layout
+            # (info_topo), not on band or trial data, so it's computed once
+            # here rather than being rebuilt inside _spatio_temporal_cluster_mask
+            # on every band iteration.
+            try:
+                tfr_adjacency, _ = find_ch_adjacency(info_topo, ch_type='eeg')  
+            except Exception as exc:
+                print(f'    find_ch_adjacency failed: {exc}')
+                tfr_adjacency = None                                 
             for band_name, (b_low, b_high) in TFR_BANDS.items():
                 freq_mask = (freqs >= b_low) & (freqs <= b_high)
                 if not freq_mask.any():
@@ -4739,7 +4830,7 @@ def plot_tfrs(
                 ch_sig, cluster_p = _spatio_temporal_cluster_mask(
                     trials_by_channel_active, trials_by_channel_sham,
                     ch_names=topo_chs, info=info_topo,
-                    n_permutations=5000,
+                    n_permutations=5000, adjacency=tfr_adjacency,
                 )
                 sig_channels = {ch for ch, is_sig in ch_sig.items() if is_sig}
 
