@@ -7293,7 +7293,7 @@ if __name__ == '__main__':
             example_sessions.append((subj, best_session))
 
         plot_group_effect_lollipop_raincloud(
-            summary_df, trials_df, example_sessions,
+            summary_df, trials_df, EXAMPLE_SUBJECT_IDS,
             Path(OUTPUT_DIR) / 'group_lollipop_raincloud.png',
         )
         measures = [
